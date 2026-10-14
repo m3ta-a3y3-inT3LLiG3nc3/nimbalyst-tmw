@@ -240,7 +240,9 @@ export function AccountInspectorPopover({
               size={20}
               className={`shrink-0 ${SYNC_TONE_CLASS[sync.tone]}`}
             />
-            <span className="min-w-0 flex-1 truncate text-sm font-medium">Mobile Sync</span>
+            <span className="min-w-0 flex-1 text-sm font-medium">
+              Mobile Sync
+            </span>
             <span className={`min-w-0 shrink truncate text-xs ${SYNC_TONE_CLASS[sync.tone]}`}>
               {sync.detail}
             </span>

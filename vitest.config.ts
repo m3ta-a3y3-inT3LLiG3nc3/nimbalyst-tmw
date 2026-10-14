@@ -26,8 +26,24 @@ const electronLogStub = path.resolve(__dirname, './test-utils/electronLogStub.ts
 
 const alias = [
   {
+    find: '@nimbalyst/tracker-engine',
+    replacement: path.resolve(__dirname, './packages/tracker-engine/src'),
+  },
+  {
+    find: '@nimbalyst/tracker-schema',
+    replacement: path.resolve(__dirname, './packages/tracker-schema/src'),
+  },
+  {
     find: '@nimbalyst/tracker-core',
     replacement: path.resolve(__dirname, './packages/tracker-core/src'),
+  },
+  {
+    find: /^@nimbalyst\/local-wiki$/,
+    replacement: path.resolve(__dirname, './packages/local-wiki/src/index.ts'),
+  },
+  {
+    find: '@nimbalyst/collab-protocol',
+    replacement: path.resolve(__dirname, './packages/collab-protocol/src'),
   },
   {
     find: '@nimbalyst/runtime',
@@ -104,7 +120,7 @@ const include = [
 // its files never reach CI. Collecting them locally means a scratch probe --
 // often written to fail on purpose so it prints a value -- blocks the pre-push
 // gate for unrelated work.
-const baseExclude = ['node_modules', 'dist', 'build', '.idea', '.git', '.cache', '**/temptests/**'];
+const baseExclude = ['**/node_modules/**', 'dist', 'build', '.idea', '.git', '.cache', '**/temptests/**'];
 
 // Paths that must run under the node environment (vitest 4 removed
 // `environmentMatchGlobs`; expressed with `test.projects` instead).
@@ -112,14 +128,18 @@ const baseExclude = ['node_modules', 'dist', 'build', '.idea', '.git', '.cache',
 // diff-model test is routed here rather than the whole directory.
 const nodeOnly = [
   'packages/electron/src/main/**',
-  // Pure property-contract modules with no DOM. Their `// @vitest-environment
-  // node` pragmas were inert once vitest 4 replaced `environmentMatchGlobs`
-  // with projects, so they were paying for jsdom while claiming not to.
+  // Pure property contracts default to Node here. Per-file environment pragmas
+  // also work in Vitest 4 projects; this routing protects files without one.
   'packages/electron/src/shared/analytics/**',
   'packages/runtime/src/ai/**',
+  // The host capability contract is two methods over `process`; it exists
+  // precisely so runtime can run where there is no DOM and no Electron.
+  'packages/runtime/src/host/**',
   'packages/runtime/src/ui/git/__tests__/unifiedDiffModel.test.ts',
   // The recovery planner is a pure function over three numbers.
-  'packages/runtime/src/sync/__tests__/trackerIdentityRecovery.test.ts',
+  'packages/tracker-engine/src/__tests__/trackerIdentityRecovery.test.ts',
+  // Key-derivation vectors are WebCrypto over fixed bytes; no DOM involved.
+  'packages/runtime/src/sync/__tests__/encryptionKey.test.ts',
   // `feedback-ui` is otherwise React components; only the pure scroll-carry
   // arithmetic is routed here, for the same reason as the diff model above.
   'packages/collab-client/src/feedback-ui/__tests__/artifactScrollCarry.test.ts',
@@ -138,6 +158,15 @@ const nodeOnly = [
   // include, paying an environment they cannot use.
   'packages/cli/src/**',
   'packages/tracker-core/src/**',
+  'packages/tracker-schema/src/**',
+  // The headless node host is a terminal process with no Electron and no DOM;
+  // that is the entire point of the package.
+  'packages/node/src/**',
+  'packages/cloudflare-sandbox/**',
+  // The memory engine is host-agnostic with zero app imports, so nothing under
+  // it can reach a DOM. The explicit project default complements per-file
+  // pragmas. The extension's own `src/` is excluded because it is React.
+  'packages/extensions/nimbalyst-memory/engine/src/**',
 ];
 
 // The node project's `include` and the jsdom project's `exclude` must describe
@@ -202,7 +231,7 @@ export default defineConfig({
           silent: SILENT,
           globals: true,
           environment: 'node',
-          setupFiles,
+          setupFiles: [...setupFiles, './test-utils/setup-ai.ts'],
           include: nodeOnlyInclude,
           exclude: baseExclude,
           server: { deps: { inline: [/y-monaco/] } },

@@ -1,10 +1,15 @@
 import * as path from 'path';
-import { globalRegistry } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/TrackerDataModel';
+import { globalRegistry } from '@nimbalyst/tracker-schema';
 import type {
   TrackerDataModel,
   TrackerSchemaPatch,
 } from '@nimbalyst/runtime/plugins/TrackerPlugin/models';
-import { resolveTrackerSchemaChangeGate } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerSchemaChangeClassifier';
+import {
+  resolveTrackerSchemaChangeGate,
+  validateTrackerTypePredicateDeclarations,
+  type PredicateDeclaringType,
+  type PredicateDefinition,
+} from '@nimbalyst/tracker-schema';
 import { getCurrentIdentity } from '../../services/TrackerIdentityService';
 import {
   deleteWorkspaceTrackerSchema,
@@ -29,6 +34,7 @@ import {
   materializeTrackerTypeDef,
   removeTrackerTypeDef,
 } from '../../services/tracker/trackerTypeDefStore';
+import { applyPredicateRegistryArgs } from './trackerVocabularyArgs';
 import { getDocumentServiceForWorkspace } from './trackerToolItemAccess';
 import {
   destructiveSchemaChangeToolResult,
@@ -120,6 +126,8 @@ function buildTrackerSchemaFromArgs(args: any): any {
     fileName: _fileName,
     overwrite: _overwrite,
     promoteExistingItems: _promoteExistingItems,
+    predicates: _predicates,
+    removePredicates: _removePredicates,
     ...rest
   } = args ?? {};
   return rest;
@@ -159,7 +167,11 @@ export async function handleTrackerListTypes(
     const includeCustom = args?.includeCustom !== false;
     const search = typeof args?.search === 'string' ? args.search.trim().toLowerCase() : '';
 
-    const items = getAllTrackerSchemas()
+    const allSchemas = getAllTrackerSchemas();
+    const registeredTypes = new Set(allSchemas.map((model) => model.type));
+    const items = allSchemas
+      // Same rule as `globalRegistry.getListed()`: a type waiting on another is not offered.
+      .filter((model) => !model.hiddenUntilType || registeredTypes.has(model.hiddenUntilType))
       .filter((model) => {
         const builtin = isBuiltinTrackerSchema(model.type);
         if (builtin && !includeBuiltin) return false;
@@ -233,6 +245,25 @@ export async function handleTrackerDefineType(
   args: any,
   workspacePath: string | undefined,
 ): Promise<McpToolResult> {
+  const vocabularySummaries: string[] = [];
+  const result = await defineTrackerType(args, workspacePath, vocabularySummaries);
+  if (!result.isError || vocabularySummaries.length === 0) return result;
+  // Vocabulary is written before the type is checked, and is not rolled back.
+  // Without this the caller sees only the type error, retries, and is told the
+  // registry is "unchanged" by a call that never wrote anything.
+  const note = `\n\nAlready applied before this error:\n${vocabularySummaries.join('\n')}`;
+  return {
+    ...result,
+    content: result.content.map((part, index) =>
+      index === 0 && part.type === 'text' ? { ...part, text: `${part.text ?? ''}${note}` } : part),
+  };
+}
+
+async function defineTrackerType(
+  args: any,
+  workspacePath: string | undefined,
+  vocabularySummaries: string[],
+): Promise<McpToolResult> {
   try {
     if (!workspacePath) {
       return {
@@ -244,6 +275,42 @@ export async function handleTrackerDefineType(
     // Load existing custom types so a redefine collides with the right file and
     // an agent doesn't think the type is missing (NIM-760).
     ensureWorkspaceTrackerSchemasLoaded(workspacePath);
+
+    // The earlier knowledge graph's label registry is no longer authored here.
+    // Refuse rather than ignore, so an older skill sees why nothing changed.
+    if (args?.labels !== undefined) {
+      return {
+        content: [{ type: 'text', text: 'Error: `labels` is no longer supported. Give a page a tracker type and use `predicates` for named relations. An existing .nimbalyst/labels.yaml still loads unchanged.' }],
+        isError: true,
+      };
+    }
+
+    // Vocabulary first: a type declaring `predicate:` on a field needs the verb
+    // to exist before the declaration below is checked against the registry.
+    let appliedPredicates: PredicateDefinition[] | null = null;
+    if (Array.isArray(args?.predicates) || Array.isArray(args?.removePredicates)) {
+      const outcome = await applyPredicateRegistryArgs(workspacePath, args);
+      if ('error' in outcome) return outcome.error;
+      appliedPredicates = outcome.applied;
+      vocabularySummaries.push(outcome.summary);
+    }
+    const vocabularySummary = vocabularySummaries.join('\n');
+    // A vocabulary-only call is complete here.
+    if (vocabularySummaries.length > 0 && !args?.schema && !args?.patch && typeof args?.type !== 'string') {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            structured: {
+              action: 'defined-vocabulary' as const,
+              ...(appliedPredicates ? { count: appliedPredicates.length, predicates: appliedPredicates } : {}),
+            },
+            summary: vocabularySummary,
+          }),
+        }],
+        isError: false,
+      };
+    }
 
     const requestedDefinition = args?.patch ?? (
       args?.schema && typeof args.schema === 'object' && !Array.isArray(args.schema)
@@ -357,6 +424,30 @@ export async function handleTrackerDefineType(
         isError: true,
       };
     }
+    // A field's `predicate:` is checked against the registry HERE, not at the
+    // first item write: the defect is in the schema, and reporting it when
+    // someone later tries to save an item points the wrong person at the wrong
+    // thing. `validate()` still reports the same codes at write time, for a
+    // registry that moved after the type was authored.
+    const predicateIssues = Array.isArray(schema.fields)
+      ? validateTrackerTypePredicateDeclarations(
+          schema as PredicateDeclaringType,
+          (id) => globalRegistry.getPredicate(id),
+          (type) => globalRegistry.get(type)?.extends,
+        )
+      : [];
+    if (predicateIssues.length > 0) {
+      return {
+        content: [{
+          type: 'text',
+          text: `Error: tracker type '${schema.type}' declares predicates this project does not support.\n${predicateIssues
+            .map(issue => `- ${issue.code} at '${issue.path}': ${issue.message}`)
+            .join('\n')}`,
+        }],
+        isError: true,
+      };
+    }
+
     const { model: writtenModel, filePath, backupPath } = await upsertWorkspaceTrackerSchema(workspacePath, schema, {
       fileName: args?.fileName,
       overwrite: args?.overwrite === true,

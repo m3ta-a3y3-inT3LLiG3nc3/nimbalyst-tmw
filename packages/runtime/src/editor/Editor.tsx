@@ -9,14 +9,12 @@
 import type { JSX } from 'react';
 import React, { Suspense, useEffect, useMemo, useRef, useState } from 'react';
 
-import { ClickableLinkPlugin } from '@lexical/react/LexicalClickableLinkPlugin';
 import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext';
 import { LexicalErrorBoundary } from '@lexical/react/LexicalErrorBoundary';
 import { HashtagPlugin } from '@lexical/react/LexicalHashtagPlugin';
 import { PlainTextPlugin } from '@lexical/react/LexicalPlainTextPlugin';
 import { RichTextPlugin } from '@lexical/react/LexicalRichTextPlugin';
 import { TablePlugin } from '@lexical/react/LexicalTablePlugin';
-import { useLexicalEditable } from '@lexical/react/useLexicalEditable';
 import { CAN_USE_DOM } from '@lexical/utils';
 import type { LexicalEditor } from 'lexical';
 
@@ -32,12 +30,13 @@ import DraggableBlockPlugin from './plugins/DraggableBlockPlugin';
 import EmojiPickerPlugin from './plugins/EmojiPickerPlugin';
 import FloatingLinkEditorPlugin from './plugins/FloatingLinkEditorPlugin';
 import FloatingTextFormatToolbarPlugin from './plugins/FloatingTextFormatToolbarPlugin';
-import { setImagePluginCallbacks } from './plugins/ImagesPlugin';
+import { getImagePluginCallbacks, setImagePluginCallbacks } from './plugins/ImagesPlugin';
 import { KanbanBoardPlugin } from './plugins/KanbanBoardPlugin';
 import MarkdownShortcutPlugin from './plugins/MarkdownShortcutPlugin';
 import ShortcutsPlugin from './plugins/ShortcutsPlugin';
 import SpeechToTextPlugin from './plugins/SpeechToTextPlugin';
 import TableCellActionMenuPlugin from './plugins/TableActionMenuPlugin';
+import TableCardLayoutPlugin from './plugins/TableCardLayoutPlugin';
 import TableCellResizer from './plugins/TableCellResizer';
 import TableHoverActionsPlugin from './plugins/TableHoverActionsPlugin';
 import ToolbarPlugin from './plugins/ToolbarPlugin';
@@ -49,10 +48,10 @@ import type { CommentsConfig } from './commenting/types';
 import type { FloatingTextToolbarAction } from './plugins/FloatingTextFormatToolbarPlugin/types';
 import { SelectionAlwaysOnDisplay } from './plugins/SelectionAlwaysOnDisplayPlugin';
 import ListEnterFormatClearPlugin from './plugins/ListEnterFormatClearPlugin';
+import PageMarkEditorPlugin, { getPageMarkToolbarActions } from './plugins/PageMarkPlugin/PageMarkEditorPlugin';
+import { CitationSourcesLine } from './plugins/CitationPlugin/CitationSourcesLine';
 import ContentEditable from './ui/ContentEditable';
 import { AnchorProvider } from './context/AnchorContext';
-import { FrontmatterProvider } from './context/FrontmatterContext';
-import { $getFrontmatter, $setFrontmatter } from './markdown/FrontmatterUtils';
 import { useRuntimeSettings } from './context/RuntimeSettingsContext';
 import CodeHighlightPlugin from './plugins/CodeHighlightPlugin';
 import { useExtensionEditorComponents } from './extensions/extensionEditorComponentsStore';
@@ -109,7 +108,6 @@ export default function Editor({ config = DEFAULT_EDITOR_CONFIG }: EditorProps):
     forceFloatingToolbar = false,
   } = config;
 
-  const isEditable = useLexicalEditable();
   const placeholder = isRichText ? 'Enter some rich text...' : 'Enter some plain text...';
 
   const [floatingAnchorElem, setFloatingAnchorElem] = useState<HTMLDivElement | null>(null);
@@ -124,30 +122,27 @@ export default function Editor({ config = DEFAULT_EDITOR_CONFIG }: EditorProps):
   );
 
   // Image plugin uses module-level callback slots so the headless
-  // ImagesExtension command handler doesn't need props.
+  // ImagesExtension command handler doesn't need props. An editor mounted over
+  // another (a popup with its own upload target) hands the slot back on unmount
+  // so the editor underneath does not keep resolving through it.
   useEffect(() => {
-    setImagePluginCallbacks({
+    const previous = getImagePluginCallbacks();
+    const mine = {
       onImageDoubleClick: config.onImageDoubleClick,
       onImageDragStart: config.onImageDragStart,
       onUploadAsset: config.onUploadAsset,
       resolveImageSrc: config.resolveImageSrc,
-    });
+    };
+    setImagePluginCallbacks(mine);
+    return () => {
+      if (getImagePluginCallbacks() === mine) setImagePluginCallbacks(previous);
+    };
   }, [
     config.onImageDoubleClick,
     config.onImageDragStart,
     config.onUploadAsset,
     config.resolveImageSrc,
   ]);
-
-  const frontmatterUtils = useMemo(
-    () => ({
-      $getFrontmatter: () => $getFrontmatter(),
-      $setFrontmatter: (data: unknown) => {
-        $setFrontmatter(data as Parameters<typeof $setFrontmatter>[0]);
-      },
-    }),
-    [],
-  );
 
   // Expose markdown content getter
   useEffect(() => {
@@ -234,7 +229,11 @@ export default function Editor({ config = DEFAULT_EDITOR_CONFIG }: EditorProps):
   // AIChatIntegrationPlugin, TrackerPlugin, etc.). Each is registered via
   // `registerExtensionEditorComponent` at app startup.
   const extensionEditorComponents = useExtensionEditorComponents();
-  const floatingTextToolbarActions = useCommentToolbarActions(config.comments, editor);
+  const commentToolbarActions = useCommentToolbarActions(config.comments, editor);
+  const floatingTextToolbarActions = useMemo(
+    () => [...commentToolbarActions, ...getPageMarkToolbarActions(editor)],
+    [commentToolbarActions, editor],
+  );
 
   return (
     <>
@@ -288,6 +287,7 @@ export default function Editor({ config = DEFAULT_EDITOR_CONFIG }: EditorProps):
                   {config.documentHeader}
                   <div className="editor">
                     <ContentEditable placeholder={placeholder} />
+                    {config.showCitationSourcesLine !== false && <CitationSourcesLine />}
                     {config.collaboration && (
                       <div
                         ref={cursorsContainerRef as React.RefObject<HTMLDivElement>}
@@ -301,6 +301,7 @@ export default function Editor({ config = DEFAULT_EDITOR_CONFIG }: EditorProps):
             />
             <MarkdownShortcutPlugin />
             <ListEnterFormatClearPlugin />
+            <PageMarkEditorPlugin />
             {isCodeHighlighted && (
               <Suspense fallback={null}>
                 <CodeHighlightPlugin />
@@ -309,10 +310,15 @@ export default function Editor({ config = DEFAULT_EDITOR_CONFIG }: EditorProps):
             <TablePlugin
               hasCellMerge={false}
               hasCellBackgroundColor={false}
-              hasHorizontalScroll={false}
+              hasHorizontalScroll={true}
             />
+            <TableCardLayoutPlugin />
             <TableCellResizer />
-            <ClickableLinkPlugin disabled={isEditable} />
+            {/* Owns link clicks too: a click opens the link, editing lives in its hover card. */}
+            <FloatingLinkEditorPlugin
+              isLinkEditMode={isLinkEditMode}
+              setIsLinkEditMode={setIsLinkEditMode}
+            />
             <KanbanBoardPlugin />
 
             {/*
@@ -323,23 +329,14 @@ export default function Editor({ config = DEFAULT_EDITOR_CONFIG }: EditorProps):
               components that genuinely need a React tree -- typeahead
               menus, dialog hosts, host-context-aware effect plugins.
             */}
-            <FrontmatterProvider value={frontmatterUtils}>
-              <AnchorProvider value={floatingAnchorElem}>
-                {extensionEditorComponents.map(({ name, Component }) => (
-                  <Component key={name} />
-                ))}
-              </AnchorProvider>
-            </FrontmatterProvider>
+            <AnchorProvider value={floatingAnchorElem}>
+              {extensionEditorComponents.map(({ name, Component }) => (
+                <Component key={name} />
+              ))}
+            </AnchorProvider>
 
             {floatingAnchorElem && (
-              <>
-                <FloatingLinkEditorPlugin
-                  anchorElem={floatingAnchorElem}
-                  isLinkEditMode={isLinkEditMode}
-                  setIsLinkEditMode={setIsLinkEditMode}
-                />
-                <TableCellActionMenuPlugin anchorElem={floatingAnchorElem} cellMerge={true} />
-              </>
+              <TableCellActionMenuPlugin anchorElem={floatingAnchorElem} cellMerge={true} />
             )}
             {floatingAnchorElem && (forceFloatingToolbar || !isSmallWidthViewport) && (
               <>

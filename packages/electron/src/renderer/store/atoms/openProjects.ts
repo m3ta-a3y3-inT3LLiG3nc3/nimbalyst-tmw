@@ -18,6 +18,7 @@ import { store } from '@nimbalyst/runtime/store';
 import { clearWorkspaceActivityAtom } from './sessionActivity';
 import { activeSessionIdAtom, selectedWorkstreamAtom } from './sessions';
 import { workstreamActiveChildAtom } from './workstreamState';
+import { settingAtom } from './settingAtomFamily';
 
 type JotaiStore = ReturnType<typeof createStore>;
 
@@ -44,7 +45,7 @@ interface ResolveInitialOpenProjectsInput {
   windowState: InitialWorkspaceWindowState | null;
 }
 
-const MAX_OPEN_PROJECTS = 8;
+export const allowUnlimitedProjectsAtom = settingAtom('projects.allowUnlimited');
 
 /**
  * Path of the workspace currently visible in this window.
@@ -75,9 +76,9 @@ export const multiProjectModeAtom = atom<boolean>(false);
 export const restorePreviousProjectsAtom = atom<boolean>(false);
 
 /**
- * Ordered list of open projects in the rail. First entry is leftmost.
+ * Ordered list of open projects in the rail, from top to bottom.
  *
- * Capped at `MAX_OPEN_PROJECTS` to bound memory of warm projects.
+ * New additions respect the configured limit. Restored projects are preserved.
  */
 export const openProjectsAtom = atom<OpenProject[]>([]);
 
@@ -95,7 +96,7 @@ export const activeOpenProjectAtom = atom((get) => {
  * the "+" button and show a hint to close a project first.
  */
 export const isOpenProjectsAtCapAtom = atom((get) => {
-  return get(openProjectsAtom).length >= MAX_OPEN_PROJECTS;
+  return !get(allowUnlimitedProjectsAtom) && get(openProjectsAtom).length >= 8;
 });
 
 /**
@@ -113,17 +114,41 @@ export const addOpenProjectAtom = atom(
     const existing = current.find((p) => p.path === project.path);
     if (existing) {
       set(activeWorkspacePathAtom, existing.path);
-      return;
+      return true;
     }
 
-    if (current.length >= MAX_OPEN_PROJECTS) {
-      return;
+    if (get(isOpenProjectsAtCapAtom)) {
+      return false;
     }
 
     set(openProjectsAtom, [...current, project]);
     set(activeWorkspacePathAtom, project.path);
+    return true;
   }
 );
+
+/** Move by identity so a project closed during a drag cannot move another one. */
+export const moveOpenProjectAtom = atom(
+  null,
+  (get, set, { path, beforePath }: { path: string; beforePath: string | null }) => {
+    const current = get(openProjectsAtom);
+    const project = current.find(project => project.path === path);
+    if (!project || path === beforePath) return;
+    if (beforePath !== null && !current.some(project => project.path === beforePath)) return;
+    const next = current.filter(project => project.path !== path);
+    const index = beforePath === null ? next.length : next.findIndex(project => project.path === beforePath);
+    next.splice(index, 0, project);
+    if (next.some((project, index) => project !== current[index])) set(openProjectsAtom, next);
+  },
+);
+
+/** Arrange once; subsequent additions and manual moves retain their own order. */
+export const sortOpenProjectsAtom = atom(null, (get, set) => {
+  const current = get(openProjectsAtom);
+  const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+  const next = [...current].sort((a, b) => collator.compare(a.name, b.name));
+  if (next.some((project, index) => project !== current[index])) set(openProjectsAtom, next);
+});
 
 /**
  * Remove a project from the rail. If the closed project was active, the
@@ -177,7 +202,6 @@ function normalizeProjectPaths(paths: unknown): string[] {
     if (typeof path !== 'string' || path.length === 0 || seen.has(path)) continue;
     seen.add(path);
     normalized.push(path);
-    if (normalized.length >= MAX_OPEN_PROJECTS) break;
   }
   return normalized;
 }
@@ -252,7 +276,6 @@ export function resolveInitialOpenProjectsState({
 }
 
 let initialized = false;
-let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let unsubscribers: Array<() => void> = [];
 
 /**
@@ -319,6 +342,9 @@ export async function initOpenProjects(): Promise<void> {
         );
       }
 
+      // Keep the restored display order in this window's reload snapshot too.
+      await window.electronAPI.invoke('app:set-open-projects', initialPaths);
+
       if (initialActivePath && initialPaths.includes(initialActivePath)) {
         store.set(activeWorkspacePathAtom, initialActivePath);
       } else if (projects.length > 0) {
@@ -329,7 +355,7 @@ export async function initOpenProjects(): Promise<void> {
     console.error('[openProjects] Failed to load multi-project state:', err);
   }
 
-  // Subscribe for debounced writes back to disk.
+  // List edits commit only on drop or a menu action, so persist immediately.
   unsubscribers.push(
     store.sub(multiProjectModeAtom, () => {
       const mode = store.get(multiProjectModeAtom);
@@ -343,13 +369,17 @@ export async function initOpenProjects(): Promise<void> {
         console.error('[openProjects] Failed to persist restorePreviousProjects:', err);
       });
     }),
-    store.sub(openProjectsAtom, () => schedulePersistOpenProjects()),
+    store.sub(openProjectsAtom, () => persistOpenProjects()),
     store.sub(activeWorkspacePathAtom, () => {
       schedulePersistActivePath();
       notifyMainSetActive();
     }),
     attachWorkspaceSwitchCleanup(store),
   );
+
+  // Initial hydration happens before the subscriptions above. Bring the main
+  // process onto the restored project too, even if the user never clicks it.
+  if (store.get(multiProjectModeAtom)) notifyMainSetActive();
 }
 
 /**
@@ -400,16 +430,11 @@ function notifyMainSetActive(): void {
   });
 }
 
-function schedulePersistOpenProjects(): void {
-  if (persistTimer) clearTimeout(persistTimer);
-  persistTimer = setTimeout(() => {
-    persistTimer = null;
-    const projects = store.get(openProjectsAtom);
-    const paths = projects.map((p) => p.path);
-    window.electronAPI?.invoke?.('app:set-open-projects', paths).catch((err: unknown) => {
-      console.error('[openProjects] Failed to persist openProjects:', err);
-    });
-  }, 300);
+function persistOpenProjects(): void {
+  const paths = store.get(openProjectsAtom).map(project => project.path);
+  window.electronAPI?.invoke?.('app:set-open-projects', paths).catch((err: unknown) => {
+    console.error('[openProjects] Failed to persist openProjects:', err);
+  });
 }
 
 function schedulePersistActivePath(): void {
@@ -427,9 +452,5 @@ function schedulePersistActivePath(): void {
 export function teardownOpenProjects(): void {
   unsubscribers.forEach((unsub) => unsub());
   unsubscribers = [];
-  if (persistTimer) {
-    clearTimeout(persistTimer);
-    persistTimer = null;
-  }
   initialized = false;
 }

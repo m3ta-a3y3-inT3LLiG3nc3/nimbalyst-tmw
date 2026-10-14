@@ -11,6 +11,8 @@ import { database, legacyPgliteDatabase } from './PGLiteDatabaseWorker';
 import { CORRUPTED_METADATA_WIPE_SQL } from './corruptedMetadataWipe';
 import { commitFreshInstallSqlite, resolveBackend } from './sqlite/BackendSelector';
 import { reconcileCutoverOnStartup } from './sqlite/cutoverReconciler';
+import { verifyPendingCutover } from './sqlite/cutoverStartup';
+import { emitMigrationOutcome } from './sqlite/migrationEventMapper';
 import { dirSizeBytes } from './sqlite/dirSize';
 import { findRecoveryArtifacts, largestDirBytes } from './sqlite/recoveryArtifacts';
 import { createMigrationControl } from './sqlite/migrationControl';
@@ -23,7 +25,9 @@ import type { SessionStore } from '@nimbalyst/runtime';
 import { repositoryManager } from '../services/RepositoryManager';
 import { DatabaseBackupService } from '../services/database/DatabaseBackupService';
 import { SQLiteBackupService } from '../services/database/SQLiteBackupService';
-import { checkWorktreeArchiveConsistency, createWorktreeStore } from '../services/WorktreeStore';
+import { createWorktreeStore } from '../services/WorktreeStore';
+import { createSuperLoopStore } from '../services/SuperLoopStore';
+import { createWorktreeArchiveCleanup, recoverWorktreeArchivesOnStartup } from '../services/worktreeArchiveCleanup';
 import { archiveProgressManager } from '../services/ArchiveProgressManager';
 import { GitWorktreeService } from '../services/GitWorktreeService';
 import { timeStartupPhase } from '../utils/startupTiming';
@@ -101,12 +105,17 @@ export async function getMigrationProxy(): Promise<SQLiteDatabaseProxy> {
     migrationProxy = new SQLiteDatabaseProxy({ dbDir: sqliteDir, schemaDir });
     migrationProxy.setPgliteReader({
       queryReadOnly: <T>(sql: string, params?: unknown[], timeoutMs?: number) =>
-        database.queryReadOnly<T>(sql, params as any[] | undefined, timeoutMs),
+        legacyPgliteDatabase.queryForMigration<T>(sql, params, timeoutMs),
+      assertAvailable: () => legacyPgliteDatabase.assertMigrationAvailable(),
     });
     migrationProxy.setMigrationControl(createMigrationControl({
       // A close that rejects aborts the cutover before anything is renamed.
       // See `migrationControl.ts` for why this is not inline any more.
-      closePglite: () => database.close(),
+      closePglite: async () => {
+        stopPeriodicBackupTimer();
+        if (backupService instanceof DatabaseBackupService) await backupService.waitForCurrentBackup();
+        await database.close();
+      },
       log: (level, msg, meta) => logger.main[level](msg, meta),
       onCutoverSuccess: async () => {
         // The renderer's existing "Continue" button asks the user to relaunch
@@ -156,8 +165,6 @@ export async function initializeDatabase(): Promise<SessionStore> {
     // <userData>/database-backend.json if present, otherwise infers from disk:
     //   - pglite-db/ exists  -> stay on PGLite (no flag written)
     //   - fresh install      -> SQLite (set by the migration flow)
-    // For now the boot path always opens PGLite; the actual switchover is
-    // a follow-up step in the migration plan (see service-layer audit).
     let backendChoice = resolveBackend({ userDataPath });
     logger.main.info(
       `[Database] Backend selector resolved to '${backendChoice.backend}' (reason: ${backendChoice.reason})`,
@@ -200,6 +207,20 @@ export async function initializeDatabase(): Promise<SessionStore> {
       });
     } catch (heartbeatErr) {
       logger.main.warn('[Database] backend heartbeat failed', heartbeatErr);
+    }
+
+    if (cutover.outcome === 'held') {
+      // `journal_unreadable` holds without touching any data: the reconciler
+      // only refuses to create a store on top of a stranded sibling, and a
+      // healthy install trips none of that and boots. Failing startup on it
+      // would send those installs to the recovery dialog over a file we
+      // merely could not parse. Every other held reason is an unfinished
+      // cutover, where continuing is what makes the loss permanent.
+      if (cutover.reasonCode === 'journal_unreadable') {
+        logger.main.warn('[Database] cutover journal unreadable; continuing startup and leaving every copy in place');
+      } else {
+        throw new Error(`Database cutover requires recovery: ${cutover.reasonCode}`);
+      }
     }
 
     // Heartbeats for leftover PGLite directories, from one scan of userData.
@@ -253,8 +274,7 @@ export async function initializeDatabase(): Promise<SessionStore> {
         throw new Error(
           '[Database] Refusing to open SQLite: an interrupted database operation left this '
           + `install's database preserved elsewhere and startup could not restore it (${cutover.reasonCode}`
-          + `${cutover.error ? `: ${cutover.error}` : ''}). No data has been lost; every copy is `
-          + 'still on disk. Settings -> Database can restore it.',
+          + `${cutover.error ? `: ${cutover.error}` : ''}). Existing database copies have been retained for startup recovery.`,
         );
       }
       const schemaDir = resolveSchemaDir();
@@ -281,8 +301,7 @@ export async function initializeDatabase(): Promise<SessionStore> {
         throw new Error(
           '[Database] Refusing to open PGLite: an interrupted cutover left this install\'s '
           + `database preserved elsewhere and startup could not restore it (${cutover.reasonCode}`
-          + `${cutover.error ? `: ${cutover.error}` : ''}). No data has been lost; every copy is `
-          + 'still on disk. Settings -> Database can restore it.',
+          + `${cutover.error ? `: ${cutover.error}` : ''}). Existing database copies have been retained for startup recovery.`,
         );
       }
       if (!fs.existsSync(dbPath)) {
@@ -325,6 +344,21 @@ export async function initializeDatabase(): Promise<SessionStore> {
         }
       }
     }
+
+    const acknowledgeCutover = await verifyPendingCutover({
+      userDataPath,
+      backend: backendChoice.backend,
+      warn: (message, detail) => logger.main.warn(message, { detail }),
+      verify: async receipt => {
+        if (sqliteDatabase) await sqliteDatabase.verifyCutover(receipt);
+        else {
+          for (const table of ['ai_sessions', 'ai_agent_messages', 'document_history']) {
+            await database.queryReadOnly(`SELECT id FROM "${table}" LIMIT 1`);
+          }
+        }
+      },
+      emitOutcome: emitMigrationOutcome,
+    });
 
     logger.main.info('[Database] Backup service initialized', {
       backend: backendChoice.backend,
@@ -391,64 +425,26 @@ export async function initializeDatabase(): Promise<SessionStore> {
     await timeStartupPhase('RepositoryManager.initialize', () => repositoryManager.initialize());
     const sessionStore = repositoryManager.getSessionStore();
     logger.main.info('[Database] All repositories initialized');
+    acknowledgeCutover();
 
-    // Run worktree archive consistency check
-    // This handles cases where the app crashed between archiving sessions and marking worktree as archived
-    try {
-      const consistencyResults = await checkWorktreeArchiveConsistency(database);
-      if (consistencyResults.length > 0) {
-        logger.main.warn('[Database] Worktree archive consistency issues resolved:', consistencyResults);
-      }
-    } catch (consistencyError) {
-      // Don't fail startup if consistency check fails
-      logger.main.error('[Database] Worktree archive consistency check failed:', consistencyError);
-    }
-
-    // Load persisted archive queue tasks
-    // This handles cases where the app crashed while processing archive cleanup
-    try {
-      const gitWorktreeService = new GitWorktreeService();
-      const worktreeStore = createWorktreeStore(database);
-
-      const { recovered, failed } = await archiveProgressManager.loadPersistedTasks(
-        async (worktreeId: string, worktreeName: string) => {
-          // Look up the worktree to get necessary context
-          const worktree = await worktreeStore.get(worktreeId);
-          if (!worktree) {
-            logger.main.warn('[Database] Worktree not found for persisted archive task', { worktreeId });
-            return null;
-          }
-
-          // If worktree is already archived, no callback needed
-          if (worktree.isArchived) {
-            logger.main.info('[Database] Worktree already archived, skipping persisted task', { worktreeId });
-            return null;
-          }
-
-          // Create cleanup callback that mirrors the original archive flow
-          return async () => {
-            archiveProgressManager.updateTaskStatus(worktreeId, 'removing-worktree');
-
-            // Delete the worktree from disk
-            await gitWorktreeService.deleteWorktree(worktree.path, worktree.projectPath);
-
-            logger.main.info('[Database] Recovered archive task cleanup completed', { worktreeId });
-
-            // Mark as archived in database
-            await worktreeStore.updateArchived(worktreeId, true);
-
-            logger.main.info('[Database] Recovered archive task marked as archived', { worktreeId });
-          };
-        }
-      );
-
-      if (recovered > 0 || failed > 0) {
-        logger.main.info('[Database] Archive queue recovery completed', { recovered, failed });
-      }
-    } catch (archiveQueueError) {
-      // Don't fail startup if archive queue recovery fails
-      logger.main.error('[Database] Archive queue recovery failed:', archiveQueueError);
-    }
+    // Finish worktree archives an earlier run left incomplete: the archive
+    // consistency check, then the persisted archive queue replay. Both log
+    // and swallow their own failures, so startup never fails here.
+    const worktreeStore = createWorktreeStore(database);
+    const gitWorktreeService = new GitWorktreeService();
+    await recoverWorktreeArchivesOnStartup({
+      db: database,
+      archiveQueue: archiveProgressManager,
+      worktreeStore,
+      cleanup: createWorktreeArchiveCleanup({
+        deleteWorktree: (worktreePath, repoPath) => gitWorktreeService.deleteWorktree(worktreePath, repoPath),
+        worktreeStore,
+        superLoopStore: createSuperLoopStore(database),
+        archiveQueue: archiveProgressManager,
+        unarchiveSession: (sessionId) => sessionStore.updateMetadata(sessionId, { isArchived: false }),
+        pathExists: fs.existsSync,
+      }),
+    });
 
     // Get database stats
     const stats = await timeStartupPhase('Database.getStats', () => database.getStats());

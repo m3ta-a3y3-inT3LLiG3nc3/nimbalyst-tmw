@@ -6,7 +6,8 @@ import { render, cleanup, act } from '@testing-library/react';
 // Keep the component isolated, same setup as the sibling SessionListItem tests:
 // jotai atom reads return defaults, the store atom families are callable stubs,
 // and heavy children are stubbed so importing them has no side effects.
-vi.mock('jotai', () => ({
+vi.mock('jotai', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('jotai')>()),
   useAtomValue: () => undefined,
   useSetAtom: () => () => {},
 }));
@@ -27,6 +28,7 @@ vi.mock('../../../store/atoms/teamInbox', () => ({ sessionAgentWakePendingAtom: 
 vi.mock('../SessionContextMenu', () => ({ SessionContextMenu: () => null }));
 
 import { SessionListItem } from '../SessionListItem';
+import { SessionRelativeTime } from '../SessionRelativeTime';
 
 const baseProps = {
   id: 's1',
@@ -59,5 +61,23 @@ describe('SessionListItem - relative time keeps ticking on an idle session (#120
       vi.advanceTimersByTime(60_000);
     });
     expect(label()).toBe('1 min ago');
+  });
+
+  // Workstream, blitz, and meta-agent child rows render their label through
+  // SessionRelativeTime rather than SessionListItem, so they need the same tick.
+  it('SessionRelativeTime advances without new activity', () => {
+    vi.useFakeTimers();
+    const base = 1_700_000_000_000;
+    vi.setSystemTime(base);
+
+    const { container } = render(
+      <SessionRelativeTime sessionId="s1" fallbackTimestamp={base - 30_000} />,
+    );
+    expect(container.textContent).toBe('Just now');
+
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(container.textContent).toBe('1 min ago');
   });
 });

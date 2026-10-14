@@ -3,6 +3,36 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+vi.mock('../../externalSessions/ExternalSessionService', () => ({
+  claimExternalSessionForLocalExecution: vi.fn(async () => undefined),
+}));
+
+// Test singleton coordination without initializing the host's file, auth,
+// extension, or auto-naming services through their runtime barrel imports.
+vi.mock('../HooklessAgentFileWatcher', () => ({
+  HooklessAgentFileWatcher: class {
+    ensureForSession = vi.fn(async () => undefined);
+    stopForSession = vi.fn(async () => undefined);
+    scheduleStop = vi.fn();
+  },
+}));
+vi.mock('../claudeCliSessionAutoNameSingleton', () => ({
+  maybeAutoNameClaudeCliSessionProduction: vi.fn(async () => undefined),
+}));
+// #1465: the CLI's `--plugin-dir` inputs come from `getClaudeProviderPluginPaths`
+// (extension + generated plugins), NOT from the picker's discovery aggregate.
+const injectedPluginPaths: Array<{ type: 'local'; path: string }> = [];
+vi.mock('../../AgentWorkflowService', () => ({
+  getAgentWorkflowService: () => ({ getClaudeProviderPluginPaths: async () => injectedPluginPaths }),
+}));
+vi.mock('../../PermissionService', () => ({
+  getPermissionService: () => ({ getPermissionMode: () => 'default' }),
+}));
+vi.mock('../../../utils/store', () => ({ getDefaultEffortLevel: () => undefined }));
+vi.mock('../../attachments/attachmentStagingRoot', () => ({
+  resolveAttachmentStagingAllowDirectories: () => [],
+}));
+
 describe('claudeCliLauncherSingleton', () => {
   beforeEach(() => {
     vi.resetModules();
@@ -41,7 +71,7 @@ describe('claudeCliLauncherSingleton', () => {
       }),
       configureMcpServers: vi.fn(),
     }));
-    vi.doMock('../../CLIManager', () => ({
+    vi.doMock('../../shellEnvironment', () => ({
       getEnhancedPath: () => '/bin',
       getShellEnvironment: () => ({}),
     }));
@@ -59,9 +89,11 @@ describe('claudeCliLauncherSingleton', () => {
     vi.doMock('../claudeCliQueueFlushSingleton', () => ({
       flushNextClaudeCliQueuedPromptForSession: vi.fn(async () => false),
     }));
+    const launcherOptions: { current?: { loadPluginDirs?: (workspacePath: string) => Promise<string[]> } } = {};
     vi.doMock('../ClaudeCliSessionLauncher', () => ({
       ClaudeCliSessionLauncher: class {
-        constructor() {
+        constructor(options: any) {
+          launcherOptions.current = options;
           (this as any).launch = launch;
         }
       },
@@ -79,18 +111,14 @@ describe('claudeCliLauncherSingleton', () => {
         get: vi.fn(async (id: string) => (worktree && worktree.id === id ? { path: worktree.path } : null)),
       }),
     }));
-    vi.doMock('../../database/initialize', () => ({
+    vi.doMock('../../../database/initialize', () => ({
       getDatabase: () => ({}),
     }));
 
     const mod = await import('../claudeCliLauncherSingleton');
-    return { ...mod, manager, stateManager, launch };
+    return { ...mod, manager, stateManager, launch, launcherOptions };
   }
 
-  // loadHarness() dynamically imports the real launcher module after
-  // vi.resetModules(), which cold-loads electron/analytics/store + the runtime
-  // MCP config chain (~4s). That's fine solo but crosses the 5s default under
-  // full-suite parallel CPU contention, so give these a generous timeout.
   it('coalesces concurrent ensure calls for the same session', async () => {
     const h = await loadHarness();
     let releaseLaunch: (() => void) | undefined;
@@ -104,10 +132,9 @@ describe('claudeCliLauncherSingleton', () => {
     const first = h.ensureClaudeCliSession(input);
     const second = h.ensureClaudeCliSession(input);
     // Launch now runs after the async worktree-cwd resolution (dynamic imports),
-    // so flush until it's invoked rather than a single microtask.
-    for (let i = 0; i < 20 && h.launch.mock.calls.length === 0; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    }
+    // so wait until it's invoked. A fixed count of event-loop turns ran out
+    // under full-suite load, when those imports resolve slowly.
+    await vi.waitFor(() => expect(h.launch).toHaveBeenCalled(), { timeout: 10000 });
 
     // Coalescing: two concurrent ensure calls → exactly one startSession + launch.
     expect(h.stateManager.startSession).toHaveBeenCalledTimes(1);
@@ -161,6 +188,29 @@ describe('claudeCliLauncherSingleton', () => {
       workspacePath: '/project',
       cwd: worktreePath,
     });
+  }, 20000);
+
+  // #1465: `--plugin-dir` carries the injection set (extension + generated
+  // plugins) as bare directory paths. The user's own `/plugin`-installed plugins
+  // are loaded by the CLI itself and must not appear here.
+  it('adapts the injected plugin set to bare --plugin-dir paths', async () => {
+    injectedPluginPaths.length = 0;
+    injectedPluginPaths.push(
+      { type: 'local', path: '/ext/feedback/claude-plugin' },
+      { type: 'local', path: '/work/.claude/plugins/.nimbalyst-generated/repair-tools' },
+    );
+
+    const h = await loadHarness();
+    await h.ensureClaudeCliSession({ sessionId: 'session-1', workspacePath: '/work' });
+
+    const loadPluginDirs = h.launcherOptions.current?.loadPluginDirs;
+    expect(loadPluginDirs).toBeInstanceOf(Function);
+    await expect(loadPluginDirs!('/work')).resolves.toEqual([
+      '/ext/feedback/claude-plugin',
+      '/work/.claude/plugins/.nimbalyst-generated/repair-tools',
+    ]);
+
+    injectedPluginPaths.length = 0;
   }, 20000);
 
   it('leaves the requested cwd unchanged for a non-worktree session', async () => {

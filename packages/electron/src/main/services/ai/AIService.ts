@@ -1,3 +1,8 @@
+import { reservePromptAnswer } from './PromptAnswerReservation';
+import { sessionInbox } from './sessionInboxService';
+import { resolveProviderApiKey } from './resolveProviderApiKey';
+import { SAVED_CREDENTIAL, withoutProviderConfigCredentials } from '../../../shared/providerCredentials';
+import { getProviderCredentials } from '../credentials/providerCredentials';
 /**
  * Main AI service that coordinates providers and sessions
  */
@@ -5,7 +10,7 @@
 import { BrowserWindow, ipcMain } from 'electron';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import Store from 'electron-store';
+import Store from '../../utils/privateSettingsStore';
 import {
   isExtensionAgentProvider,
 } from './providerResolution';
@@ -51,6 +56,7 @@ import {
 import { getAIProviderOverridesWithWorktreeFallback } from '../../utils/aiSettingsMerge';
 import { DocumentContextService } from '@nimbalyst/runtime';
 import { getSyncProvider } from '../SyncManager';
+import { publishContextUsage } from './publishContextUsage';
 import { normalizeCodexProviderConfig, stripTransientProviderFields } from '@nimbalyst/runtime/ai/server/utils/modelConfigUtils';
 import { resolveProjectPath } from '../../utils/workspaceDetection';
 import { inferWorktreePathFromFilePath, inferWorktreePathFromCommand } from './worktreeInference';
@@ -82,11 +88,13 @@ import {
 } from './QueueDriveService';
 import { createWorkspaceWindowResolver } from './resolveWorkspaceWindow';
 import { runQueueDriveAttempt } from './queueDriveAttempt';
+import { wakeParentAfterChildSettle } from './wakeParentAfterChildSettle';
 import { clearStuckRunningState } from './clearStuckRunningState';
 import { publishQueuedPromptsToSync } from './queuedPromptSyncPublisher';
 import { onWorkspaceWindowAvailable } from '../../window/workspaceWindowAvailability';
 import { dispatchQueuedPromptToClaudeCli } from './claudeCliQueueDispatch';
 import { publishQueuedPromptClaim } from './queuedPromptClaimEvents';
+import { canDispatchIntoDrain, isLeadTurnPending } from './drainFollowUp';
 import { ensureClaudeCliSession } from './claudeCliLauncherSingleton';
 import {
   resolveProviderWorkflowCatalog,
@@ -241,6 +249,11 @@ export class AIService {
       return (this.getSettingsStore().get('customClaudeCodePath', '') as string) || '';
     });
 
+    // Read fresh each query so the Agent Features toggle applies on the next turn.
+    ClaudeCodeProvider.setPromptSuggestionsEnabledLoader(
+      () => this.getSettingsStore().get('promptSuggestionsEnabled', true) !== false,
+    );
+
     // API keys must be explicitly set by the user in settings.
     // NEVER auto-import keys from process.env. A user's .env file with
     // ANTHROPIC_API_KEY was silently picked up, persisted into settings,
@@ -279,6 +292,13 @@ export class AIService {
       attachments,
       documentContext: queuedDocumentContext,
     });
+    // A Claude Code turn that has answered but is draining a background task
+    // takes this prompt on its live query now (drainFollowUp.ts). Covers
+    // send_prompt, mentions and extension sessions, which queue through here.
+    const liveWorkspacePath = getSessionStateManager().getSessionState(sessionId)?.workspacePath;
+    if (liveWorkspacePath && canDispatchIntoDrain(sessionId)) {
+      this.requestQueueDrive(sessionId, liveWorkspacePath, 'drain-follow-up');
+    }
     return { id: created.id, prompt: created.prompt, createdAt: created.createdAt };
   }
 
@@ -425,6 +445,7 @@ export class AIService {
           const liveState = getSessionStateManager().getSessionState(id);
           return !!liveState && (liveState.status === 'running' || liveState.isStreaming);
         },
+        canDispatchIntoDrain,
         resolveWindow: (path, allowAutoOpen) =>
           this.queueWindowResolver.resolve(path, { allowAutoOpen }),
         failAllPending: async (id, errorMessage) => {
@@ -483,6 +504,7 @@ export class AIService {
       return { success: true, method: 'terminal-ctrl-c' };
     }
 
+    await sessionInbox.end(sessionInbox.current(sessionId), false).catch(err => logger.main.error('[AIService] Inbox retirement failed during interruption:', err));
     const provider = ProviderFactory.getProvider(session.provider as AIProviderType, sessionId);
     if (!provider) {
       return { success: false, error: 'No active provider for session' };
@@ -536,6 +558,11 @@ export class AIService {
     const session = await AISessionsRepository.get(sessionId);
     if (!session) {
       return { success: false, error: 'Session not found' };
+    }
+
+    if (promptType === 'permission_request' || promptType === 'ask_user_question_request') {
+      const answer = promptType === 'permission_request' ? response : { answers: response.answers ?? response, cancelled: response.cancelled === true };
+      if (!reservePromptAnswer(sessionId, promptType === 'permission_request' ? 'permission' : 'question', promptId, answer)) return { success: false, error: 'This prompt was already answered or delivery is unknown.' };
     }
 
     let responseContent: Record<string, unknown>;
@@ -759,59 +786,9 @@ export class AIService {
    * Project-specific API keys take precedence over global keys.
    */
   private getApiKeyForProvider(provider: string, workspacePath?: string): string | undefined {
-    const globalApiKeys = this.getSettingsStore().get('apiKeys', {}) as Record<string, string>;
-    const providerSettings = this.getNormalizedProviderSettings() as any;
-
-    // Claude Code must never use implicit keys.
-    // It only uses its dedicated key when API-key auth is explicitly selected.
-    if (provider === 'claude-code') {
-      const authMethod = providerSettings?.['claude-code']?.authMethod ?? 'login';
-      if (authMethod !== 'api-key') {
-        return undefined;
-      }
-    }
-
-    // Check for project-level API key override
-    if (workspacePath) {
-      const overrides = getAIProviderOverrides(workspacePath);
-      const overrideKey = overrides?.providers?.[provider]?.apiKey;
-      if (overrideKey) {
-        return overrideKey;
-      }
-    }
-
-    // Return the explicitly-configured global API key.
-    // NEVER fall back to process.env — users must explicitly set keys in settings.
-    // Implicit env-var usage caused a user to burn $100+ on their personal Anthropic
-    // account because Nimbalyst silently picked up ANTHROPIC_API_KEY from a .env file.
-
-    // Extension-agent providers (aiAgentProviders contributions) defer auth to
-    // the extension itself (e.g. Antigravity rides ~/.gemini OAuth). The host
-    // does not manage their API key. See providerResolution.ts for the shim
-    // until session.provider is widened to a discriminated union.
-    if (isExtensionAgentProvider(provider)) {
-      return 'not-required';
-    }
-
-    switch (provider) {
-      case 'claude':
-        return globalApiKeys['anthropic'];
-      case 'claude-code':
-        return globalApiKeys['claude-code'];
-      case 'openai':
-        return globalApiKeys['openai'];
-      case 'openai-codex':
-        return globalApiKeys['openai-codex'];
-      case 'lmstudio':
-        return 'not-required';
-      case 'antigravity-gemini-agent':
-        // Rides the user's existing Antigravity / ~/.gemini login. Nimbalyst
-        // holds no key for it, and deliberately reads no env var -- see the
-        // standing rule in CLAUDE.md.
-        return 'not-required';
-      default:
-        return globalApiKeys[provider];
-    }
+    const settings = this.getNormalizedProviderSettings() as any;
+    return resolveProviderApiKey(getProviderCredentials(), provider, workspacePath,
+      settings?.['claude-code']?.authMethod, isExtensionAgentProvider(provider));
   }
 
   /**
@@ -955,39 +932,20 @@ export class AIService {
       logError: (message, error) => logger.main.error(message, error),
       logInfo: (message) => logger.main.info(message),
       resolveLiveWindow: findWindowByWorkspace,
+      canBypassChainGuard: () => canDispatchIntoDrain(sessionId),
+      isLeadTurnPending: () => isLeadTurnPending(sessionId),
       onAfterSettled: async () => {
         try {
           const { AISessionsRepository } = await import('@nimbalyst/runtime/storage/repositories/AISessionsRepository');
-          const childSession = await AISessionsRepository.get(sessionId);
-          if (!childSession?.createdBySessionId) return;
-
-          // Honor fire-and-forget. spawn_session sets metadata.notifyParent=false
-          // on the child for /launch-new-session-style hand-offs where the parent
-          // does not want to be re-driven when the child settles. Without this
-          // guard, every child settle wakes the parent unconditionally, which
-          // re-drives the meta-agent in a loop. Matches the guard in
-          // MetaAgentService.handleChildSessionEvent.
-          const childMetadata = (childSession.metadata as Record<string, unknown> | undefined) ?? undefined;
-          if (childMetadata && childMetadata.notifyParent === false) return;
-
-          // Do not re-drive the parent when the child chain just settled in
-          // 'error'. A failed child (e.g. an antigravity 429) has no result to
-          // deliver, and waking the parent on every such settle is the meta-agent
-          // spin loop. Native children settle 'completed', so this is a no-op for
-          // them. settledChildErrored is captured in onChainSettled before
-          // endSession evicts the child's in-memory state.
-          if (settledChildErrored) return;
-
-          const metaSession = await AISessionsRepository.get(childSession.createdBySessionId);
-          if (!metaSession?.workspacePath) return;
-
-          const stateManager = getSessionStateManager();
-          const metaState = stateManager.getSessionState(metaSession.id);
-          const metaStatus = metaState?.status || 'idle';
-          if (metaStatus === 'idle' || metaStatus === 'error') {
-            logger.main.info(`[AIService] ${source}: waking meta-agent ${metaSession.id} after child ${sessionId} completed`);
-            this.requestQueueDrive(metaSession.id, metaSession.workspacePath, 'meta-agent');
-          }
+          await wakeParentAfterChildSettle({
+            childSessionId: sessionId,
+            source,
+            settledChildErrored,
+            getSession: (id) => AISessionsRepository.get(id),
+            getSessionStatus: (id) => getSessionStateManager().getSessionState(id)?.status,
+            requestQueueDrive: (id, path) => this.requestQueueDrive(id, path, 'meta-agent'),
+            logInfo: (message) => logger.main.info(message),
+          });
         } catch (metaErr) {
           logger.main.error(`[AIService] ${source}: error checking meta-agent wakeup:`, metaErr);
         }
@@ -1208,12 +1166,9 @@ export class AIService {
             };
 
             // Store /context data in currentContext (snapshot of context window)
-            // Preserve cumulative input/output tokens from modelUsage
+            // Preserve every cumulative counter (tokens, cache, cost, baselines)
             const tokenUsage = {
-              inputTokens: currentUsage.inputTokens,
-              outputTokens: currentUsage.outputTokens,
-              totalTokens: currentUsage.totalTokens,
-              costUSD: currentUsage.costUSD,
+              ...currentUsage,
               // Legacy fields for backward compatibility
               contextWindow: parsedUsage.contextWindow,
               categories: parsedUsage.categories,
@@ -1232,15 +1187,7 @@ export class AIService {
             // Push context usage to mobile sync
             const syncProvider = getSyncProvider();
             if (syncProvider) {
-              syncProvider.pushChange(session.id, {
-                type: 'metadata_updated',
-                metadata: {
-                  currentContext: {
-                    tokens: parsedUsage.totalTokens,
-                    contextWindow: parsedUsage.contextWindow,
-                  },
-                } as any,
-              });
+              await publishContextUsage(syncProvider, session.id, { tokens: parsedUsage.totalTokens, contextWindow: parsedUsage.contextWindow });
             }
 
             // Also send IPC event to update UI immediately
@@ -1370,8 +1317,8 @@ export class AIService {
     if (normalized !== providerSettings) {
       this.getSettingsStore().set('providerSettings', normalized);
     }
-    this.cachedNormalizedProviderSettings = normalized;
-    return normalized;
+    this.cachedNormalizedProviderSettings = withoutProviderConfigCredentials(normalized);
+    return this.cachedNormalizedProviderSettings;
   }
 
   private normalizeProviderSettings(providerSettings: Record<string, any>): Record<string, any> {
@@ -1386,14 +1333,13 @@ export class AIService {
   }
 
   private maskApiKey(key: string): string {
-    if (!key || key.length <= 20) return key;
-    return `${key.substring(0, 10)}...${key.substring(key.length - 4)}`;
+    return key ? SAVED_CREDENTIAL : '';
   }
 
   private maskApiKeys(keys: Record<string, string>): Record<string, string> {
     const masked: Record<string, string> = {};
     for (const [provider, key] of Object.entries(keys)) {
-      masked[provider] = this.maskApiKey(key);
+      masked[provider] = provider === 'lmstudio_url' ? key : this.maskApiKey(key);
     }
     return masked;
   }

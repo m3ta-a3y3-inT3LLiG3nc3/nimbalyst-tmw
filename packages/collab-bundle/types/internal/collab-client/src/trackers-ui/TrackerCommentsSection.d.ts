@@ -18,7 +18,7 @@
  */
 import React from 'react';
 import type { TrackerIdentity } from '../../../runtime/src/core/DocumentService';
-import type { TrackerCommentEntry } from '../../../runtime/src/sync/trackerProtocol';
+import type { TrackerCommentEntry } from '@nimbalyst/tracker-engine';
 import type { TrackerMutationRejection } from '../trackers/index';
 export type TrackerCommentMutation = {
     kind: 'add';
@@ -42,5 +42,8 @@ export interface TrackerCommentsSectionProps {
     readOnly?: boolean;
     /** Lets an asynchronous server refusal retire the matching optimistic row. */
     mutationRejection?: TrackerMutationRejection | null;
+    collapsedComposer?: boolean;
+    draft?: string;
+    onDraftChange?: (text: string) => void;
 }
 export declare const TrackerCommentsSection: React.FC<TrackerCommentsSectionProps>;

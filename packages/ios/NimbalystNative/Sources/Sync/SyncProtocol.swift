@@ -18,51 +18,6 @@ struct IndexSyncResponse: Codable, @unchecked Sendable {
     let since: Int?
 }
 
-/// A session entry as received from the server (encrypted fields).
-struct ServerSessionEntry: Codable {
-    let sessionId: String
-    let encryptedProjectId: String
-    let projectIdIv: String
-    let encryptedTitle: String?
-    let titleIv: String?
-    let provider: String?
-    let model: String?
-    let mode: String?
-    /// Structural type: "session", "workstream", or "blitz"
-    let sessionType: String?
-    /// Parent session ID for workstream/worktree hierarchy
-    let parentSessionId: String?
-    /// Agent role marker (e.g. "meta-agent"); gates meta-agent powers on desktop
-    let agentRole: String?
-    /// Session ID of the meta-agent that spawned this sub-agent (child link)
-    let createdBySessionId: String?
-    /// Worktree ID for git worktree association
-    let worktreeId: String?
-    /// Stable ID of the desktop or headless host that owns execution
-    let hostDeviceId: String?
-    /// Whether this session is archived
-    let isArchived: Bool?
-    /// Whether this session is pinned
-    let isPinned: Bool?
-    /// Session ID this was branched/forked from
-    let branchedFromSessionId: String?
-    /// Message sequence number where the branch occurred
-    let branchPointMessageId: Int?
-    /// Timestamp when the branch was created
-    let branchedAt: Int?
-    let messageCount: Int?
-    let lastMessageAt: Int?
-    let createdAt: Int
-    let updatedAt: Int
-    let pendingExecution: PendingExecution?
-    let isExecuting: Bool?
-    let queuedPromptCount: Int?
-    let encryptedQueuedPrompts: [EncryptedQueuedPrompt]?
-    let hasPendingPrompt: Bool?
-    let encryptedClientMetadata: String?
-    let clientMetadataIv: String?
-    let lastReadAt: Int?
-}
 
 struct PendingExecution: Codable {
     let messageId: String
@@ -78,6 +33,23 @@ struct EncryptedQueuedPrompt: Codable {
     let source: String?
     /// Encrypted image attachments (each independently encrypted).
     var encryptedAttachments: [WireEncryptedAttachment]?
+    /// Turn options the sender pinned for this prompt (mode, model, effort).
+    /// Declared last so the memberwise initializer keeps its existing shape.
+    var options: RemoteTurnOptions?
+}
+
+/// Per-turn options carried alongside a queued prompt.
+///
+/// Mirrors `RemoteTurnOptions` in `packages/runtime/src/sync/types.ts`. Every
+/// field is optional there, and a shipped phone must keep decoding a prompt from
+/// a desktop that pins none of them.
+struct RemoteTurnOptions: Codable {
+    /// "agent" or "planning".
+    let mode: String?
+    let model: String?
+    /// Reasoning effort label; a free-form string so a new level from a newer
+    /// desktop still decodes.
+    let effortLevel: String?
 }
 
 /// An encrypted image attachment on the wire. Desktop decrypts and writes to temp file.
@@ -113,6 +85,9 @@ struct ClientMetadata: Codable {
     let draftInput: String?
     /// Epoch ms when draftInput was last updated by the sending device
     let draftUpdatedAt: Int?
+    /// Whether the session has been given a real title, as opposed to still
+    /// carrying its placeholder one.
+    var hasBeenNamed: Bool?
 }
 
 /// A project entry as received from the server (encrypted fields).
@@ -138,6 +113,116 @@ struct ServerProjectEntry: Codable {
 struct ProjectConfig: Codable {
     let commands: [SyncedSlashCommand]
     let lastCommandsUpdate: Int
+    /// Absent on desktops that predate action sync.
+    let actions: [SyncedActionPrompt]?
+    let lastActionsUpdate: Int?
+    /// Carried in the blob by the desktop; the phone reads it from the plaintext entry field instead.
+    let gitRemoteHash: String?
+    /// Absent when the project has no Local wiki or the desktop predates wiki sync.
+    let localWiki: LocalWikiConfig?
+}
+
+/// Where the project's Local wiki lives, relative to the project root, and
+/// the wiki's type definitions (their YAML does not sync as files).
+struct LocalWikiConfig: Codable {
+    let folder: String
+    let types: [SyncedWikiType]?
+}
+
+/// A wiki type definition from the desktop (`.nimbalyst/trackers/<type>.yaml`
+/// with `storage:`), as `loadTypeDefs` in `packages/local-wiki` reads it.
+public struct SyncedWikiType: Codable, Hashable, Sendable {
+    public let typeId: String
+    public let displayName: String
+    public let displayNamePlural: String
+    /// "pages" or "table".
+    public let storage: String
+    /// Field holding the item title.
+    public let titleField: String
+    public let fields: [SyncedWikiField]
+}
+
+public struct SyncedWikiField: Codable, Hashable, Sendable {
+    public let name: String
+    /// Tracker field type: string, text, number, select, multiselect, relationship, ...
+    public let type: String
+    public let itemType: String?
+    public let multiValue: Bool?
+}
+
+/// The parts of the project config blob that get stored on `Project`.
+///
+/// Each is nil when the blob carried nothing for it, which is distinct from an
+/// empty list only in that we avoid writing "[]" over a column needlessly.
+struct DecodedProjectConfig {
+    let commandsJson: String?
+    let actionsJson: String?
+    let localWikiFolder: String?
+    /// Raw JSON text of `localWiki.types`; nil without a wiki or without types.
+    let localWikiTypesJSON: String?
+
+    static let empty = DecodedProjectConfig(commandsJson: nil, actionsJson: nil, localWikiFolder: nil, localWikiTypesJSON: nil)
+}
+
+/// `localWiki.types` re-serialized from the raw blob rather than from
+/// `SyncedWikiType`, so a field a newer desktop adds survives to the reader.
+private func rawLocalWikiTypes(_ configData: Data) -> String? {
+    guard let root = try? JSONSerialization.jsonObject(with: configData) as? [String: Any],
+          let wiki = root["localWiki"] as? [String: Any],
+          let types = wiki["types"] as? [Any],
+          let data = try? JSONSerialization.data(withJSONObject: types, options: [.sortedKeys]) else {
+        return nil
+    }
+    return String(data: data, encoding: .utf8)
+}
+
+/// Accept a wiki folder only if it is a relative path inside the project.
+///
+/// The desktop sends `/`-separated paths with no trailing slash; anything
+/// absolute or climbing out with `..` is dropped rather than trusted, since
+/// views join it onto synced document paths.
+func normalizeLocalWikiFolder(_ raw: String?) -> String? {
+    guard var folder = raw?.trimmingCharacters(in: .whitespaces) else { return nil }
+    while folder.hasSuffix("/") { folder.removeLast() }
+    guard !folder.isEmpty, !folder.hasPrefix("/") else { return nil }
+    let segments = folder.split(separator: "/", omittingEmptySubsequences: false)
+    guard !segments.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }) else { return nil }
+    return folder
+}
+
+/// Project a decrypted project-config JSON string onto the columns `Project`
+/// stores.
+///
+/// Free function rather than inline at the call sites because the blob is
+/// decoded in two places (index sync response and project broadcast) that must
+/// not drift, and because this way it is testable without crypto or a socket.
+func decodeProjectConfig(fromJson configJson: String) -> DecodedProjectConfig {
+    guard let configData = configJson.data(using: .utf8),
+          let config = try? JSONDecoder().decode(ProjectConfig.self, from: configData) else {
+        return .empty
+    }
+
+    var commandsJson: String? = nil
+    if let encoded = try? JSONEncoder().encode(config.commands),
+       let jsonStr = String(data: encoded, encoding: .utf8) {
+        commandsJson = jsonStr
+    }
+
+    var actionsJson: String? = nil
+    if let actions = config.actions,
+       !actions.isEmpty,
+       let encoded = try? JSONEncoder().encode(actions),
+       let jsonStr = String(data: encoded, encoding: .utf8) {
+        actionsJson = jsonStr
+    }
+
+    let localWikiFolder = normalizeLocalWikiFolder(config.localWiki?.folder)
+    return DecodedProjectConfig(
+        commandsJson: commandsJson,
+        actionsJson: actionsJson,
+        localWikiFolder: localWikiFolder,
+        localWikiTypesJSON: localWikiFolder == nil ? nil : rawLocalWikiTypes(configData)
+    )
 }
 
 /// Lightweight slash command manifest synced from desktop.
@@ -146,6 +231,57 @@ public struct SyncedSlashCommand: Codable, Identifiable {
     public let description: String?
     public let source: String  // "builtin" | "project" | "user" | "plugin"
     public var id: String { name }
+}
+
+/// An action prompt from the desktop workspace's ai-actions.md.
+///
+/// Unlike `SyncedSlashCommand` this carries the prompt `body`: the desktop
+/// pastes it into its composer for the user to edit before sending, and the
+/// phone cannot reproduce that from a name alone.
+///
+/// Every field past `body` is optional because same-session actions -- the
+/// common case -- send none of them, and because older desktops send a subset.
+public struct SyncedActionPrompt: Codable, Identifiable {
+    /// kebab-case slug of the heading; stable across edits to the body.
+    public let id: String
+    public let label: String
+    public let body: String
+    /// Set when the desktop cut the body to fit the payload budget.
+    public let truncated: Bool?
+    /// "new-session" for launcher actions; absent for same-session actions.
+    public let launch: String?
+    /// provider:variant the action pins, when it declares one.
+    public let model: String?
+    public let autoSubmit: Bool?
+    public let worktree: Bool?
+
+    public init(
+        id: String,
+        label: String,
+        body: String,
+        truncated: Bool? = nil,
+        launch: String? = nil,
+        model: String? = nil,
+        autoSubmit: Bool? = nil,
+        worktree: Bool? = nil
+    ) {
+        self.id = id
+        self.label = label
+        self.body = body
+        self.truncated = truncated
+        self.launch = launch
+        self.model = model
+        self.autoSubmit = autoSubmit
+        self.worktree = worktree
+    }
+
+    /// Whether picking this action should open a new session rather than
+    /// prefill the current composer.
+    public var launchesNewSession: Bool { launch == "new-session" }
+
+    /// Worktree launches need a worktree created first, which the phone cannot
+    /// drive yet. Such actions are shown but not offered as launchers.
+    public var isSupportedOnMobile: Bool { !(worktree ?? false) }
 }
 
 /// Session broadcast from index room.
@@ -171,6 +307,8 @@ struct ProjectBroadcast: Codable {
 
 /// Device info for presence.
 public struct DeviceInfo: Codable {
+    /// Personal inventory visibility; does not affect execution ownership.
+    public var inventoryHidden: Bool?
     public let deviceId: String
     public let name: String
     // Intentionally a String rather than a closed enum so shipped clients keep
@@ -182,12 +320,50 @@ public struct DeviceInfo: Codable {
     public let lastActiveAt: Int
     public let isFocused: Bool?
     public let status: String?    // "active" | "idle" | "away"
+    /// Set by the server, never by a client, so it stays absent on the announce
+    /// this device sends. `var` keeps the memberwise initializer's existing shape.
+    public var isOnline: Bool?
+    /// Epoch ms the server last saw this device; server-set, same as above.
+    public var lastSeenAt: Int?
+}
+
+/// The room's current device roster.
+struct DevicesListMessage: Codable {
+    let type: String
+    let devices: [DeviceInfo]
+}
+
+struct DeviceJoinedMessage: Codable {
+    let type: String
+    let device: DeviceInfo
+}
+
+struct DeviceLeftMessage: Codable {
+    let type: String
+    let deviceId: String
 }
 
 /// Create session response.
 struct CreateSessionResponseBroadcast: Codable {
     let type: String
     let response: CreateSessionResponse
+    let fromConnectionId: String?
+}
+
+/// The desktop-to-server leg of the same answer, before the server fans it out.
+///
+/// Declared for the fixture contract: the phone never sends one, but an envelope
+/// with no Swift type is an envelope whose shape nothing checks.
+struct CreateSessionResponseMessage: Codable {
+    var type: String = "createSessionResponse"
+    let response: CreateSessionResponse
+}
+
+/// The server's fan-out of a phone's session request to the desktops.
+struct CreateSessionRequestBroadcast: Codable {
+    let type: String
+    let request: EncryptedCreateSessionRequest
+    let targetDeviceId: String?
     let fromConnectionId: String?
 }
 
@@ -203,12 +379,27 @@ struct ServerError: Codable {
     let type: String
     let code: String
     let message: String
+    /// Echoed back when the failure answers a specific request.
+    let requestId: String?
 }
 
 /// Voice-tool response broadcast (desktop -> mobile) for a proxied voice tool.
 struct VoiceToolResponseBroadcast: Codable {
     let type: String
     let response: EncryptedVoiceToolResponse
+    let fromConnectionId: String?
+}
+
+/// The desktop-to-server leg of the voice-tool answer.
+struct VoiceToolResponseMessage: Codable {
+    var type: String = "voiceToolResponse"
+    let response: EncryptedVoiceToolResponse
+}
+
+/// The server's fan-out of a phone's voice-tool request to the desktops.
+struct VoiceToolRequestBroadcast: Codable {
+    let type: String
+    let request: EncryptedVoiceToolRequest
     let fromConnectionId: String?
 }
 
@@ -231,11 +422,42 @@ struct EncryptedSettingsPayload: Codable {
     let version: Int
 }
 
+/// The desktop-to-server leg of a settings publish.
+struct SettingsSyncMessage: Codable {
+    var type: String = "settingsSync"
+    let settings: EncryptedSettingsPayload
+}
+
 /// Settings sync broadcast from server (desktop -> mobile).
 struct SettingsSyncBroadcast: Codable {
     let type: String
     let settings: EncryptedSettingsPayload
     let fromConnectionId: String?
+}
+
+/// The desktop-to-server leg of live context usage. iOS never sends it; the
+/// mirror exists so the wire fixture pins its shape.
+struct SessionContextUpdateMessage: Codable {
+    var type: String = "sessionContextUpdate"
+    let update: LiveSessionContext
+}
+
+/// Live context-window usage relayed by the server (desktop -> mobile) and
+/// never stored. The index row still carries the turn-boundary value.
+struct SessionContextBroadcast: Codable {
+    let type: String
+    let update: LiveSessionContext
+    let fromConnectionId: String?
+}
+
+/// `encryptedContext` decrypts to client-metadata JSON holding only
+/// `currentContext`, so it decodes as `ClientMetadata`.
+struct LiveSessionContext: Codable {
+    let sessionId: String
+    let encryptedContext: String
+    let contextIv: String
+    /// Epoch ms on the sending desktop; orders frames per session.
+    let at: Int
 }
 
 /// Decrypted settings received from desktop.
@@ -255,6 +477,9 @@ public struct SyncedSettings: Codable {
 
 /// Voice mode settings synced from desktop.
 public struct SyncedVoiceModeSettings: Codable {
+    public var engine: String? = nil
+    public var liveVoice: String? = nil
+    public var liveControllerModel: String? = nil
     public let voice: String?
     public let submitDelayMs: Int?
 }
@@ -268,15 +493,15 @@ public struct SyncedAvailableModel: Codable, Identifiable, Equatable {
 
 // MARK: - Client -> Server Messages
 
-struct IndexSyncRequest: Encodable {
-    let type = "indexSyncRequest"
+struct IndexSyncRequest: Codable {
+    var type: String = "indexSyncRequest"
     let projectId: String?
     /// When set, server returns only entries updated after this timestamp (Unix ms).
     let since: Int?
 }
 
-struct DeviceAnnounceMessage: Encodable {
-    let type = "deviceAnnounce"
+struct DeviceAnnounceMessage: Codable {
+    var type: String = "deviceAnnounce"
     let device: DeviceInfo
 }
 
@@ -312,11 +537,13 @@ public struct UnregisterLiveActivityTokenMessage: Encodable {
     let type = "unregisterLiveActivityToken"
     public let deviceId: String
     public let kind: String?
+    public var token: String? = nil
 }
 
-struct CreateSessionRequestMessage: Encodable {
-    let type = "createSessionRequest"
+struct CreateSessionRequestMessage: Codable {
+    var type: String = "createSessionRequest"
     let request: EncryptedCreateSessionRequest
+    var targetDeviceId: String? = nil
 }
 
 struct EncryptedCreateSessionRequest: Codable {
@@ -331,13 +558,25 @@ struct EncryptedCreateSessionRequest: Codable {
     let model: String?
     let agentRole: String?
     let timestamp: Int
+    var targetDeviceId: String? = nil
 }
 
 // MARK: - Worktree Creation Request
 
-struct CreateWorktreeRequestMessage: Encodable {
-    let type = "createWorktreeRequest"
+struct CreateWorktreeRequestMessage: Codable {
+    var type: String = "createWorktreeRequest"
     let request: CreateWorktreeRequest
+    /// Routes the request to the desktop that owns the project. Absent means
+    /// broadcast, which is what a project with no known host has always done.
+    var targetDeviceId: String? = nil
+}
+
+/// The server's fan-out of a worktree request to the desktops.
+struct CreateWorktreeRequestBroadcast: Codable {
+    let type: String
+    let request: CreateWorktreeRequest
+    let targetDeviceId: String?
+    let fromConnectionId: String?
 }
 
 struct CreateWorktreeRequest: Codable {
@@ -347,10 +586,33 @@ struct CreateWorktreeRequest: Codable {
     let timestamp: Int
 }
 
+/// Desktop's answer to a worktree creation request.
+///
+/// Declared but not yet consumed: `SyncManager` still reads the broadcast as
+/// untyped JSON. The type exists so the fixture contract covers the shape, and
+/// so the pending-request registry has something to decode into.
+struct CreateWorktreeResponse: Codable {
+    let requestId: String
+    let success: Bool
+    let error: String?
+}
+
+struct CreateWorktreeResponseBroadcast: Codable {
+    let type: String
+    let response: CreateWorktreeResponse
+    let fromConnectionId: String?
+}
+
+/// The desktop-to-server leg of the worktree answer.
+struct CreateWorktreeResponseMessage: Codable {
+    var type: String = "createWorktreeResponse"
+    let response: CreateWorktreeResponse
+}
+
 // MARK: - Voice Tool Request (mobile -> desktop)
 
-struct VoiceToolRequestMessage: Encodable {
-    let type = "voiceToolRequest"
+struct VoiceToolRequestMessage: Codable {
+    var type: String = "voiceToolRequest"
     let request: EncryptedVoiceToolRequest
 }
 
@@ -367,14 +629,20 @@ struct EncryptedVoiceToolRequest: Codable {
 }
 
 /// Send an indexUpdate to notify desktop of queued prompts or metadata changes.
-struct IndexUpdateMessage: Encodable {
-    let type = "indexUpdate"
+struct IndexUpdateMessage: Codable {
+    var type: String = "indexUpdate"
     let session: IndexUpdateEntry
 }
 
 /// Session entry for indexUpdate messages (client -> server).
 /// Extra fields like encryptedQueuedPrompts pass through the server broadcast
 /// even though the server doesn't persist them.
+///
+/// This is the outbound mirror of `ServerSessionEntry` and must carry every
+/// field the inbound side understands: a field the phone can receive but not
+/// send is a change the phone can only make locally. The hierarchy and state
+/// fields below are the ones that gap covered, and `WireFixtureTests` pins the
+/// shape against `indexUpdate.mobile.json`.
 struct IndexUpdateEntry: Codable {
     let sessionId: String
     let encryptedProjectId: String
@@ -384,7 +652,9 @@ struct IndexUpdateEntry: Codable {
     let provider: String?
     let model: String?
     let mode: String?
-    let messageCount: Int
+    /// Omitted when the sender does not know the count; the server COALESCEs an
+    /// absent count with the stored one rather than writing a synthetic zero.
+    let messageCount: Int?
     let lastMessageAt: Int
     let createdAt: Int
     let updatedAt: Int
@@ -394,11 +664,57 @@ struct IndexUpdateEntry: Codable {
     /// Encrypted client metadata blob (context, draft, phase, tags, etc.)
     var encryptedClientMetadata: String?
     var clientMetadataIv: String?
+    /// Structural type: "session", "workstream", or "blitz"
+    var sessionType: String?
+    /// Parent session ID for workstream/worktree hierarchy
+    var parentSessionId: String?
+    /// Worktree ID for git worktree association
+    var worktreeId: String?
+    /// Stable ID of the desktop or headless host that owns execution
+    var hostDeviceId: String?
+    /// Agent role marker (e.g. "meta-agent")
+    var agentRole: String?
+    /// Session ID of the meta-agent that spawned this sub-agent
+    var createdBySessionId: String?
+    var isArchived: Bool?
+    var isPinned: Bool?
+    var branchedFromSessionId: String?
+    var branchPointMessageId: Int?
+    var branchedAt: Int?
+    var pendingExecution: PendingExecution?
+    var hasPendingPrompt: Bool?
+    var lastReadAt: Int?
 }
 
-struct SessionControlMessage: Encodable {
-    let type = "sessionControl"
+/// Patch just the client-metadata columns of an index row, without republishing
+/// the whole session entry.
+///
+/// Declared for the fixture contract; the phone still publishes whole entries.
+struct IndexClientMetadataPatchMessage: Codable {
+    var type: String = "indexClientMetadataPatch"
+    let patch: IndexClientMetadataPatch
+}
+
+struct IndexClientMetadataPatch: Codable {
+    let sessionId: String
+    /// Optional, as in TypeScript: a patch may carry only `isExecuting` or
+    /// `lastReadAt` and touch no metadata blob at all.
+    let encryptedClientMetadata: String?
+    let clientMetadataIv: String?
+    let isExecuting: Bool?
+    let lastReadAt: Int?
+}
+
+struct SessionControlMessage: Codable {
+    var type: String = "sessionControl"
     let message: SessionControlPayload
+}
+
+/// The server's fan-out of a session control message to the other side.
+struct SessionControlBroadcast: Codable {
+    let type: String
+    let message: SessionControlPayload
+    let fromConnectionId: String?
 }
 
 struct SessionControlPayload: Codable {
@@ -417,14 +733,18 @@ struct SessionControlPayload: Codable {
 // MARK: - Session Room Messages (Client -> Server)
 
 /// Request messages for a session room.
-struct SessionSyncRequest: Encodable {
-    let type = "syncRequest"
+struct SessionSyncRequest: Codable {
+    var sinceRevision: Int? = nil
+    var type: String = "syncRequest"
+    /// Message id cursor; the server accepts either this or `sinceSeq`.
+    var sinceId: String? = nil
     let sinceSeq: Int?
 }
 
 /// Append a message to the session.
-struct AppendMessageRequest: Encodable {
-    let type = "appendMessage"
+struct AppendMessageRequest: Codable {
+    var expectedRevision: Int? = nil
+    var type: String = "appendMessage"
     let message: ServerMessageEntry
 }
 
@@ -432,6 +752,7 @@ struct AppendMessageRequest: Encodable {
 
 /// Sync response with paginated messages.
 struct SessionSyncResponse: Codable {
+    var revisionCursor: Int? = nil
     let type: String
     let messages: [ServerMessageEntry]
     let metadata: SessionRoomMetadata?
@@ -441,6 +762,9 @@ struct SessionSyncResponse: Codable {
 
 /// A message entry from the session room.
 struct ServerMessageEntry: Codable {
+    var projectionVersion: Int? = nil
+    var revision: Int? = nil
+    var payload: SessionPayloadReference? = nil
     let id: String
     let sequence: Int
     let createdAt: Int
@@ -471,6 +795,11 @@ struct SessionRoomMetadata: Codable {
     let projectIdIv: String?
     let encryptedClientMetadata: String?
     let clientMetadataIv: String?
+    /// The in-flight turn, when the room has one.
+    let pendingExecution: PendingExecution?
+    /// Queued prompts ride along on a metadata broadcast so a phone that is
+    /// only in the session room still sees the queue change.
+    let encryptedQueuedPrompts: [EncryptedQueuedPrompt]?
 }
 
 /// Real-time message broadcast in a session room.
@@ -572,7 +901,14 @@ struct FileYjsCompactMessage: Encodable {
 
 /// Response to projectSyncRequest.
 struct ProjectSyncResponse: Codable {
+    enum CodingKeys: String, CodingKey {
+        case type, transferId, batchIndex, isLastBatch
+        case updatedFiles, newFiles, yjsUpdates, needFromClient, deletedSyncIds
+    }
     let type: String
+    var transferId: String? = nil
+    var batchIndex: Int? = nil
+    var isLastBatch: Bool? = nil
     /// Files the client is missing or has stale content for.
     let updatedFiles: [ProjectSyncFileEntry]
     /// Yjs updates the client hasn't seen.

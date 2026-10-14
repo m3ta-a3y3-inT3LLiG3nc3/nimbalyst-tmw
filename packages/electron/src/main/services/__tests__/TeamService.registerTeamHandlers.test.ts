@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { readFile } from 'fs/promises';
 import { resolve } from 'path';
 import { createHash } from 'crypto';
@@ -29,7 +30,7 @@ const { accountsMock, fetchMock, safeHandleMock, handlers } = vi.hoisted(() => {
 });
 
 vi.mock('electron', () => ({
-  BrowserWindow: class {},
+  BrowserWindow: class { static getAllWindows() { return []; } },
   net: { fetch: fetchMock },
 }));
 
@@ -93,6 +94,7 @@ vi.mock('../StytchAuthService', () => ({
   updateSessionTokenForAccount: vi.fn(),
   getStytchUserId: vi.fn(() => 'user-1'),
   getUserEmail: vi.fn(() => 'user@test.com'),
+  getSyncAccount: vi.fn(() => null),
   getPersonalOrgId: vi.fn(() => 'personal-1'),
   getPersonalUserId: vi.fn(() => 'user-1'),
 }));
@@ -116,10 +118,12 @@ vi.mock('../CollabBackupService', () => ({}));
 vi.mock('../TeamAuthBootstrap', () => ({ createTeamAuthBootstrap: (fn: unknown) => fn }));
 
 import {
+  canListProjectAccess,
   invalidateListTeamsCache,
   pendingInviteForEmail,
   registerTeamHandlers,
 } from '../TeamService';
+import { getPersonalSessionJwtForAccount } from '../StytchAuthService';
 import type { TeamDetails } from '../TeamService';
 import { registerTeamCustodyHandlers } from '../TeamCustodyService';
 import { registerOrgProjectWalkHandlers } from '../OrgProjectWalkService';
@@ -326,6 +330,53 @@ describe('team:create handler', () => {
 });
 
 /**
+ * A project added with a remote used to be sent with `name: null`, and the web
+ * console then labeled it by its UUID. The repository name is the default.
+ */
+describe('team:add-project handler', () => {
+  beforeEach(() => {
+    handlers.clear();
+    safeHandleMock.mockClear();
+    fetchMock.mockReset();
+    gitRemoteFnMock.mockReset();
+    registerTeamHandlers();
+  });
+
+  async function captureAddProjectRequest(rawRemote: string, name?: string): Promise<Record<string, unknown>> {
+    gitRemoteFnMock.mockResolvedValue(rawRemote);
+    fetchMock.mockImplementation(async (url: string) => ({
+      ok: true,
+      status: 200,
+      json: async () => (String(url).endsWith('/projects')
+        ? { projectId: 'p-1', teamProjectId: 'tp-1' }
+        : { sessionJwt: 'team-jwt', sessionToken: 'team-session' }),
+    }));
+
+    const result = await handlers.get('team:add-project')!({}, 'org-1', '/work/checkout-dir', name);
+    expect(result).toEqual({ success: true, project: { projectId: 'p-1', teamProjectId: 'tp-1' } });
+
+    const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/api/teams/org-1/projects'));
+    return JSON.parse(String((call?.[1] as { body?: string } | undefined)?.body));
+  }
+
+  it.each([
+    ['https://github.com/acme/Widgets.git', 'Widgets'],
+    ['git@github.com:acme/nimbalyst-namenym.git', 'nimbalyst-namenym'],
+    ['ssh://git@github.com/acme/widgets/', 'widgets'],
+    ['https://gitlab.com/group/sub/deep-repo', 'deep-repo'],
+  ])('names a project with a remote after its repository: %s', async (rawRemote, expectedName) => {
+    const body = await captureAddProjectRequest(rawRemote);
+
+    expect(body.name).toBe(expectedName);
+    expect(body.gitRemoteHash).toEqual(expect.any(String));
+  });
+
+  it('keeps an explicit name over the repository name', async () => {
+    expect((await captureAddProjectRequest('https://github.com/acme/widgets.git', 'Widgets App')).name).toBe('Widgets App');
+  });
+});
+
+/**
  * The wizard's invitation branch is only as good as the channel behind it, and
  * the matcher above is one of four things the handler does: it also validates
  * the argument, refuses an email the signed-in accounts do not own, and turns a
@@ -418,5 +469,51 @@ describe('team:find-pending-invite-for-email handler', () => {
 
     await expect(invokeHandler('member@example.com'))
       .resolves.toEqual({ success: true, invitation: null });
+  });
+});
+
+
+describe('team:list completeness', () => {
+  beforeEach(() => {
+    accountsMock.mockReturnValue([{ personalOrgId: 'personal-1', email: 'a@example.com', sessionStatus: 'active' }]);
+    vi.mocked(getPersonalSessionJwtForAccount).mockReturnValue('personal-jwt' as never);
+    fetchMock.mockReset().mockResolvedValue({ ok: true, status: 200, json: async () => ({ teams: [] }) });
+    invalidateListTeamsCache();
+    registerTeamHandlers();
+  });
+
+  it('does not report an empty success before the personal JWT is restored, and recovers on the next read', async () => {
+    vi.mocked(getPersonalSessionJwtForAccount).mockReturnValueOnce(null);
+    const list = handlers.get('team:list')!;
+    await expect(list({})).resolves.toMatchObject({ success: false, complete: false, teams: [], retryable: true });
+    expect(fetchMock).not.toHaveBeenCalled();
+    await expect(list({})).resolves.toMatchObject({ success: true, complete: true, teams: [] });
+  });
+
+  it('does not turn an authenticated zero-account snapshot into a conclusive empty list', async () => {
+    accountsMock.mockReturnValue([]);
+    await expect(handlers.get('team:list')!({})).resolves.toMatchObject({ success: false, complete: false });
+  });
+
+  it('returns healthy-account rows but never declares a partial multi-account directory complete', async () => {
+    accountsMock.mockReturnValue([
+      { personalOrgId: 'personal-1', email: 'a@example.com', sessionStatus: 'active' },
+      { personalOrgId: 'personal-2', email: 'b@example.com', sessionStatus: 'active' },
+    ]);
+    vi.mocked(getPersonalSessionJwtForAccount).mockReturnValueOnce(null);
+    fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ teams: [{ orgId: 'org-b', name: 'Beta', role: 'owner' }] }) });
+    const result = await handlers.get('team:list')!({});
+    expect(result).toMatchObject({ success: false, complete: false, teams: [{ orgId: 'org-b' }] });
+  });
+
+});
+
+describe('projection sync project-access listing', () => {
+  it('only asks the admin-only endpoint for teams where the caller is an owner or admin', () => {
+    expect(canListProjectAccess({ teamProjectId: 'p', role: 'admin' })).toBe(true);
+    expect(canListProjectAccess({ teamProjectId: 'p', role: 'owner' })).toBe(true);
+    // A member gets a 403 on every sync; the role-derived projection stands instead.
+    expect(canListProjectAccess({ teamProjectId: 'p', role: 'member' })).toBe(false);
+    expect(canListProjectAccess({ teamProjectId: null, role: 'admin' })).toBe(false);
   });
 });

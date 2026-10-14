@@ -41,6 +41,17 @@ function baseOptions(overrides: Partial<EditorHostOptions> = {}): EditorHostOpti
 }
 
 describe('createEditorHost visibility', () => {
+  it('reports reload APIs to the owning host without crossing same-file editor instances', () => {
+    const first = vi.fn(), second = vi.fn();
+    const a = createEditorHost(baseOptions({ onEditorAPIChange: first }));
+    const b = createEditorHost(baseOptions({ onEditorAPIChange: second }));
+    const apiA = { getContent: () => 'a' }, apiB = { getContent: () => 'b' };
+    a.registerEditorAPI(apiA);
+    b.registerEditorAPI(apiB);
+    a.registerEditorAPI(null);
+    expect(first.mock.calls).toEqual([[apiA], [null]]);
+    expect(second.mock.calls).toEqual([[apiB]]);
+  });
   it('exposes live visibility from getVisible', () => {
     let visible = true;
     const host = createEditorHost(baseOptions({ getVisible: () => visible }));
@@ -74,5 +85,26 @@ describe('createEditorHost visibility', () => {
 
     unsubscribe();
     expect(callbacks.size).toBe(0);
+  });
+});
+
+describe('createEditorHost getAssetUrl', () => {
+  it('encodes the file path so an editor element can load it same-origin', () => {
+    const host = createEditorHost(baseOptions({ filePath: '/tmp/clip.mp4' }));
+
+    const url = host.getAssetUrl!();
+
+    // The path must survive as an opaque segment -- a raw path here would break
+    // on the first space or non-ASCII character in a filename.
+    expect(url).toBe(`nim-asset://local/${Buffer.from('/tmp/clip.mp4').toString('base64url')}`);
+  });
+
+  it('returns null for a virtual tab rather than a URL to nothing', () => {
+    // Virtual tabs have no file behind them. Handing back a well-formed URL
+    // that 404s would make an editor render a broken player instead of its
+    // "unavailable" state.
+    const host = createEditorHost(baseOptions({ filePath: 'virtual://shared-home' }));
+
+    expect(host.getAssetUrl!()).toBeNull();
   });
 });

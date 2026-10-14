@@ -30,12 +30,12 @@ _Coming soon_
    ```bash
    git clone https://github.com/nimbalyst/nimbalyst.git
    cd nimbalyst
-   npm install
+   pnpm install
    ```
 
 2. Build the transcript web bundle:
    ```bash
-   npm run ios:build:transcript
+   pnpm run ios:build:transcript
    ```
 
 3. Generate and open the Xcode project:
@@ -96,7 +96,7 @@ Desktop TrayManager -> fleetActivityUpdate (WebSocket) -> IndexRoom -> APNs -> p
 - Rows rank by what to deal with first, which is deliberately *not* the menu bar's announcement urgency — a crashed session is dead rather than blocking, so failures rank below anything actually waiting.
 - Tapping a row opens `nimbalyst://session/<id>`, the same route a notification tap uses.
 - Settings > **Session Fleet Live Activity** turns it off; the toggle is independent of push notification permission, since a Live Activity needs none.
-- **The card stands down while you are at the Mac.** macOS mirrors an iPhone Live Activity into the Mac menu bar when the phone is nearby, so the fleet strip and the card would otherwise render the same counts inches apart. Suppression needs both halves: the desktop reports whether its strip is switched on, and the server decides whether that desktop is actually present (`isPresent` — online, active within two minutes). Someone who has turned the strip off keeps the phone card, because it is their only ambient surface. A live card is *ended* rather than left to dim.
+- **The phone card stays visible while you use the Mac.** Mac presence and fleet-strip visibility do not suppress it. macOS mirroring may also show the card alongside the desktop strip. Each phone or tablet has its own delivery lifecycle; expired update tokens are retired so the next eligible fleet snapshot can start a replacement.
 
 **Live Activity content is not end-to-end encrypted.** APNs has to hand the payload to the system for rendering, so the session titles on the card travel in plaintext — the same exposure the existing push notification titles already have. Everything on the normal sync path stays encrypted.
 
@@ -104,10 +104,10 @@ Desktop TrayManager -> fleetActivityUpdate (WebSocket) -> IndexRoom -> APNs -> p
 
 ```bash
 # Run the Swift test suite
-npm run ios:test:swift
+pnpm run ios:test:swift
 
 # Build transcript bundle
-npm run ios:build:transcript
+pnpm run ios:build:transcript
 
 # Regenerate Xcode project after changing project.yml
 cd NimbalystApp && xcodegen generate

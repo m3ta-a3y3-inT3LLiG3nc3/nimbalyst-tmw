@@ -36,6 +36,9 @@ vi.mock('../../../store', async () => {
   return { historyDialogFileAtom: atom<string | null>(null) };
 });
 
+vi.mock('@nimbalyst/runtime/utils/clipboard', () => ({ copyToClipboard }));
+vi.mock('../DocumentSessionControl', () => ({ DocumentSessionControl: () => null }));
+
 vi.mock('../../../store/atoms/collabDocuments', async () => {
   const { atom } = await import('jotai');
   return {
@@ -112,6 +115,7 @@ afterEach(() => {
   localLinkState.refresh.mockClear();
   localLinkState.pullFromSharedDoc.mockClear();
   localLinkState.reuploadToSharedDoc.mockClear();
+  vi.unstubAllGlobals();
 });
 
 const lexicalEditor = {
@@ -122,6 +126,34 @@ const lexicalEditor = {
 };
 
 describe('UnifiedEditorHeaderBar shared document link', () => {
+  it.each([true, false])('opens the document’s own project in the browser (markdown: %s)', async (isMarkdown) => {
+    // openExternal routes console links back into the app (reopening this
+    // doc), so the action must use the browser-only path.
+    const openExternal = vi.fn().mockResolvedValue(undefined);
+    const openInBrowser = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal('electronAPI', { openExternal, openInBrowser });
+    render(
+      <UnifiedEditorHeaderBar
+        filePath="collab://org:team%20one:doc:doc/one"
+        fileName="Shared doc"
+        workspaceId="/workspace"
+        isMarkdown={isMarkdown}
+        lexicalEditor={isMarkdown ? lexicalEditor : undefined}
+        showShareLinkButton={false}
+        showSharedDocButton={false}
+        showCommonFileActions={false}
+        sharedDocumentLinkTarget={{ documentId: 'doc/one', orgId: 'team one', teamProjectId: 'project/one' }}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('More actions'));
+    fireEvent.click(screen.getByRole('button', { name: 'Open in browser' }));
+    await waitFor(() => expect(openInBrowser).toHaveBeenCalledWith(
+      'https://console.nimbalyst.com/org/team%20one/project/project%2Fone/document/doc%2Fone',
+    ));
+    expect(openExternal).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: 'Open in browser' })).toBeNull();
+  });
+
   it('shows and copies the canonical deep link for an open collaborative document', async () => {
     render(
       <UnifiedEditorHeaderBar
@@ -170,6 +202,7 @@ describe('UnifiedEditorHeaderBar shared document link', () => {
     fireEvent.click(screen.getByTitle('More actions'));
 
     expect(screen.queryByRole('button', { name: 'Copy link' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Open in browser' })).toBeNull();
     screen.getByRole('button', { name: 'Copy as Markdown' });
   });
 

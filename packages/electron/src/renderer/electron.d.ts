@@ -1,3 +1,4 @@
+type OrganizationDirectoryResult = import('../shared/organizationDirectory').OrganizationDirectoryResult;
 /** Mirrors the main-process `git:status-changed` payload. */
 interface GitStatusChangedPayload {
   workspacePath: string;
@@ -22,6 +23,7 @@ interface FileTreeItem {
   path: string;
   type: 'file' | 'directory';
   children?: FileTreeItem[];
+  childrenTruncated?: boolean;
 }
 
 interface ClaudeForWindowsInstallation {
@@ -180,6 +182,7 @@ interface SemanticSearchResult {
 
 interface ElectronAPI {
   team: {
+    list: (options?: { forceRefresh?: boolean }) => Promise<OrganizationDirectoryResult>;
     getKeyCustodyStatus: (orgId: string) => Promise<{ success: boolean; mode?: 'server-managed' | 'unmigrated'; error?: string }>;
     openManagementWindow: (target?: TeamManagementWindowTarget) => Promise<{ success: boolean }>;
     resolveOrgProjectsLocalState: (orgId: string) => Promise<{
@@ -205,7 +208,7 @@ interface ElectronAPI {
     [method: string]: any;
   };
   organization: {
-    list: () => Promise<any>;
+    list: () => Promise<OrganizationDirectoryResult>;
     get: (orgId: string) => Promise<any>;
     rename: (
       orgId: string,
@@ -397,7 +400,7 @@ interface ElectronAPI {
   listShares: () => Promise<{ success: boolean; shares?: Array<{ shareId: string; sessionId: string; title: string; sizeBytes: number; createdAt: string; expiresAt: string | null; viewCount: number; owningPersonalOrgId: string }>; error?: string }>;
   deleteShare: (options: { shareId: string; sessionId?: string; owningPersonalOrgId?: string }) => Promise<{ success: boolean; error?: string }>;
   getShareKeys: () => Promise<Record<string, string>>;
-  shareFileAsLink: (options: { filePath: string; expirationDays?: number; personalOrgId?: string }) => Promise<{ success: boolean; url?: string; shareId?: string; isUpdate?: boolean; encryptionKey?: string; owningPersonalOrgId?: string; error?: string }>;
+  shareFileAsLink: (options: { filePath: string; expirationDays?: number; personalOrgId?: string; mermaidSvgs?: Record<string, string> }) => Promise<{ success: boolean; url?: string; shareId?: string; isUpdate?: boolean; encryptionKey?: string; owningPersonalOrgId?: string; error?: string }>;
   getShareExpirationPreference: () => Promise<number>;
   setShareExpirationPreference: (days: number) => Promise<void>;
 
@@ -594,7 +597,7 @@ interface ElectronAPI {
   onMcpApplyDiff: (callback: (data: { replacements: any[], resultChannel: string, targetFilePath?: string, workspacePath?: string, agent?: { sessionId: string; sessionName: string } }) => void) => () => void;
   onMcpStreamContent: (callback: (data: { streamId: string, content: string, position: string, insertAfter?: string, mode?: string, targetFilePath?: string, resultChannel: string }) => void) => () => void;
   onMcpNavigateTo: (callback: (data: { line: number, column: number }) => void) => () => void;
-  onMcpReadCollabDoc: (callback: (data: { targetFilePath: string, resultChannel: string, workspacePath?: string }) => void) => () => void;
+  onMcpReadCollabDoc: (callback: (data: { targetFilePath: string, resultChannel: string, workspacePath?: string, includeDecisionState?: boolean }) => void) => () => void;
   onMcpReadCollabDocComments: (callback: (data: {
     targetFilePath: string;
     input: any;
@@ -617,7 +620,7 @@ interface ElectronAPI {
   }) => void) => () => void;
   sendMcpApplyDiffResult: (resultChannel: string, result: any) => void;
   sendMcpStreamContentResult: (resultChannel: string, result: any) => void;
-  sendMcpReadCollabDocResult: (resultChannel: string, result: { success: boolean; content?: string; error?: string; code?: string }) => void;
+  sendMcpReadCollabDocResult: (resultChannel: string, result: { success: boolean; content?: string; title?: string; documentType?: string; decisionState?: unknown; error?: string; code?: string }) => void;
   sendMcpCollabDocCommentResult: (
     resultChannel: string,
     result: { success: boolean; result?: unknown; code?: string; error?: string },
@@ -730,6 +733,13 @@ interface ElectronAPI {
     }>;
     setArchived: (payload: { workspacePath: string; type: string; archived: boolean }) =>
       Promise<{ success: boolean; error?: string }>;
+    defineType: (payload: { workspacePath: string; schema: Record<string, unknown> }) => Promise<{
+      success: boolean;
+      type?: string;
+      scope?: 'team' | 'personal';
+      status?: 'created' | 'syncing';
+      error?: string;
+    }>;
   };
 
   // Document Service
@@ -750,6 +760,7 @@ interface ElectronAPI {
       priority: string;
       workspace: string;
       description?: string;
+      creationRequestId?: string;
       owner?: string;
       tags?: string[];
       customFields?: Record<string, any>;
@@ -758,7 +769,11 @@ interface ElectronAPI {
       content?: any;
       source?: string;
       sourceRef?: string;
-    }) => Promise<{ success: boolean; item?: any; error?: string }>;
+    }) => Promise<{ success: boolean; item?: any; error?: string; publication?: import("@nimbalyst/runtime/core/trackerCreation").TrackerCreationPublication }>;
+    publishTrackerCreation: (payload: { workspacePath: string; itemId: string }) => Promise<import('@nimbalyst/runtime/core/trackerCreation').TrackerCreationPublication>;
+    getTrackerCreationStatus: (payload: { workspacePath: string; itemId: string }) => Promise<import('@nimbalyst/runtime/core/trackerCreation').TrackerCreationPublication | null>;
+    listPendingTrackerCreations: (workspacePath: string) => Promise<string[]>;
+    stageTrackerImage: (payload: { workspacePath: string; bytes: ArrayBuffer; mimeType: string }) => Promise<{ relativePath: string }>;
     updateTrackerItem: (payload: {
       itemId: string;
       updates: Record<string, any>;
@@ -799,7 +814,9 @@ interface ElectronAPI {
     updateTrackerItemContent: (payload: {
       itemId: string;
       content: any;
-    }) => Promise<{ success: boolean; error?: string }>;
+      /** Write only if the stored body is still at this version; otherwise answer `conflict`. */
+      expectedBodyVersion?: number;
+    }) => Promise<{ success: boolean; conflict?: boolean; bodyVersion?: number; error?: string }>;
     getTrackerItemContent: (payload: {
       itemId: string;
     }) => Promise<{ success: boolean; content?: any; error?: string }>;
@@ -1941,6 +1958,8 @@ interface ElectronAPI {
 
   // Open external links
   openExternal: (url: string) => Promise<void>;
+  /** Always the browser; skips the in-app routing `openExternal` applies to console links. */
+  openInBrowser: (url: string) => Promise<void>;
   openThirdPartyNotices: () => Promise<{ success: boolean; error?: string }>;
 
   // Image operations

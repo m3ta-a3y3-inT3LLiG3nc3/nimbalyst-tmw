@@ -1,3 +1,4 @@
+import type { DocumentFeedbackIndexClientState } from './DocumentFeedbackIndexClient';
 /**
  * Types for TeamSync -- client-side team state sync layer.
  *
@@ -15,8 +16,12 @@ import type {
   TeamState as ProtocolTeamState,
   EncryptedDocIndexEntry as ProtocolEncryptedDocIndexEntry,
   EncryptedFolderNode as ProtocolEncryptedFolderNode,
+  PageFields,
+  PageParentKind,
 } from '@nimbalyst/collab-protocol';
 import type { TeamJwt, TeamMemberId } from '../auth/jwtScopes';
+import type { TypePlacementCallbacks } from './teamTypePlacements';
+import type { ItemPlacementCallbacks } from './teamItemPlacements';
 
 export type {
   TeamClientMessage,
@@ -31,13 +36,34 @@ export type {
   TeamFolderIndexSyncResponseMessage,
   TeamFolderBroadcastMessage,
   TeamFolderRemoveBroadcastMessage,
+  TeamTypePlacementIndexSyncResponseMessage,
+  TeamTypePlacementBroadcastMessage,
+  TeamTypePlacementRemoveBroadcastMessage,
+  TypePlacementNode,
+  TeamItemPlacementIndexSyncResponseMessage,
+  TeamItemPlacementBroadcastMessage,
+  TeamItemPlacementRemoveBroadcastMessage,
+  ItemPlacementNode,
   TeamProjectAccessChangedMessage,
   TeamDocumentCommentNotifyMessage,
   TeamDocumentCommentNotifyAckMessage,
   TeamErrorMessage,
   FeedbackIndexSyncResponseMessage,
   FeedbackIndexBroadcastMessage,
+  PageParentKind,
 } from '@nimbalyst/collab-protocol';
+
+/**
+ * Where a registered or moved document sits among the page tree. `parentKind`
+ * names what the parent id is (absent = a page); a number `sortOrder` positions
+ * it among its siblings. On a move, absent `sortOrder` keeps the order when the
+ * parent is unchanged and clears it on a new parent; on a register it leaves a
+ * stored row's order alone.
+ */
+export interface DocumentPlacementOptions {
+  parentKind?: PageParentKind;
+  sortOrder?: number | null;
+}
 
 /** Re-export wire types under client-side names. */
 export type MemberInfo = ProtocolMemberInfo;
@@ -50,7 +76,7 @@ export type ServerTeamState = ProtocolTeamState;
 // Configuration
 // ============================================================================
 
-export interface TeamSyncConfig {
+export interface TeamSyncConfig extends TypePlacementCallbacks, ItemPlacementCallbacks {
   /** WebSocket server URL (e.g., wss://sync.nimbalyst.com) */
   serverUrl: string;
 
@@ -96,6 +122,8 @@ export interface TeamSyncConfig {
   ) => void;
 
   /** Called with the full participant-filtered feedback index snapshot. */
+  onDocumentFeedbackIndex?: (state: DocumentFeedbackIndexClientState) => void;
+
   onFeedbackIndexLoaded?: (entries: FeedbackRequestIndexEntry[]) => void;
 
   /** Called when one participant-filtered feedback index entry changes. */
@@ -130,6 +158,13 @@ export interface TeamSyncConfig {
    * document id that was deleted so the host can prune its tree and links.
    */
   onFoldersRemoved?: (folderIds: string[], documentIds: string[]) => void;
+
+  /**
+   * The server refused a write sent with a `requestId` (`moveDocument`,
+   * `removeDocument`, `removeFolder`). Writes it accepts are confirmed by
+   * their echo through the callbacks above, when `echoesAuthorWrites()`.
+   */
+  onWriteRefused?: (requestId: string, error: { code: string; message: string }) => void;
 
   /**
    * Called when a member's project-scoped access changed (Epic H1). `projectRole`
@@ -209,8 +244,16 @@ export interface DocIndexEntry {
    * root level (also legacy rows, whose path still lives in the title).
    */
   parentFolderId?: string | null;
+  /** What `parentFolderId` names. TeamSync always fills it (`'page'` from older servers). */
+  parentKind?: PageParentKind;
+  /** Position among siblings; null = never reordered. TeamSync always fills it. */
+  sortOrder?: number | null;
   /** Millisecond epoch when moved to Trash; null/undefined means active. */
   trashedAt?: number | null;
+  /** False until the body is first edited; absent from older servers (= true). */
+  hasContent?: boolean;
+  /** A plain page's own fields; absent when none are set or the server keeps none. */
+  fields?: PageFields;
   /**
    * True when the server returned a doc index entry whose encrypted title
    * could not be decrypted with the current org key. Preserved in the list

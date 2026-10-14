@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
 import { globalRegistry } from '../../models';
-import type { TrackerDataModel } from '../../models/TrackerDataModel';
+import type { TrackerDataModel } from '@nimbalyst/tracker-schema';
 import {
   getTrackerChipFieldSections,
   getTrackerTagsField,
@@ -46,6 +46,40 @@ describe('getTrackerChipFieldSections', () => {
     // read-only value the layout drops still have to go somewhere.
     expect(overflowFields.map((field) => field.name))
       .toEqual(['agentSessions', 'payload', 'externalId']);
+  });
+
+  it('keeps lists by default (StatusBar, classic detail) and drops them only for a page header', () => {
+    globalRegistry.register({
+      ...model,
+      type: 'chipFieldPageSpec',
+      fields: [
+        { name: 'title', type: 'string', required: true },
+        { name: 'number', type: 'number' },
+        { name: 'areas', type: 'multiselect', options: [{ value: 'a', label: 'A' }] },
+        { name: 'buyer', type: 'relationship', targetTrackerTypes: ['persona'] },
+        { name: 'labels', type: 'label-ref' },
+        { name: 'competitors', type: 'relationship', multiValue: true, targetTrackerTypes: '*' },
+        { name: 'supports', type: 'relationship', predicate: 'supports' },
+        { name: 'evidence', type: 'citation' },
+        { name: 'mvp', type: 'select', options: [{ value: 'in', label: 'In' }] },
+        { name: 'state', type: 'select', options: [{ value: 'draft', label: 'Draft' }] },
+      ],
+      roles: { title: 'title', workflowStatus: 'state' },
+    });
+
+    // Label properties are filtered by the same rule as the type's own fields.
+    const labelFields = [
+      { name: 'segment', type: 'string' as const },
+      { name: 'segments', type: 'array' as const, itemType: 'string' as const },
+    ];
+    // Off by default: tags, label refs and multi-valued links stay chips. (A
+    // multiselect never was one; the base layout has no compact form for it.)
+    expect(getTrackerChipFieldSections('chipFieldPageSpec', [], labelFields).chipFields.map((field) => field.name))
+      .toEqual(['state', 'tags', 'number', 'buyer', 'labels', 'competitors', 'supports', 'evidence', 'mvp', 'segment', 'segments']);
+    const page = getTrackerChipFieldSections('chipFieldPageSpec', [], labelFields, { singleValuedOnly: true });
+    expect(page.chipFields.map((field) => field.name)).toEqual(['state', 'number', 'buyer', 'mvp', 'segment']);
+    expect(page.overflowFields.map((field) => field.name))
+      .toEqual(expect.arrayContaining(['tags', 'areas', 'labels', 'competitors', 'supports', 'evidence', 'segments']));
   });
 
   it('keeps an excluded field out of both sections for a surface that renders it', () => {

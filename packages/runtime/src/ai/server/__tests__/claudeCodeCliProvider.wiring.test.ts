@@ -67,11 +67,17 @@ describe('claude-code-cli provider wiring (Phase 0)', () => {
 
   describe('resolveClaudeCodeModelVariant accepts claude-code-cli', () => {
     it('resolves a plain variant', () => {
-      expect(resolveClaudeCodeModelVariant('claude-code-cli:opus', 'opus')).toBe('opus');
+      expect(resolveClaudeCodeModelVariant('claude-code-cli:opus', 'opus')).toBe('claude-opus-5-5');
     });
 
     it('appends the [1m] beta marker for extended context', () => {
-      expect(resolveClaudeCodeModelVariant('claude-code-cli:sonnet-1m', 'opus')).toBe('sonnet[1m]');
+      expect(resolveClaudeCodeModelVariant('claude-code-cli:sonnet-1m', 'opus')).toBe('claude-sonnet-5-5[1m]');
+    });
+
+    it('passes custom gateway models through verbatim and still rejects unknown ids', () => {
+      expect(resolveClaudeCodeModelVariant('claude-code:custom/Fast', 'opus')).toBe('Fast');
+      expect(resolveClaudeCodeModelVariant('claude-code:custom/opus-1m', 'opus')).toBe('opus-1m');
+      expect(() => resolveClaudeCodeModelVariant('claude-code:Fast', 'opus')).toThrow(/Unsupported Claude Agent model/);
     });
   });
 

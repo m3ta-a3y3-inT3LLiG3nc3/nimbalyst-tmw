@@ -1,5 +1,7 @@
 import { getPatternDisplayName } from '../../types';
 import { buildToolDescription, generateToolPattern } from '../../permissions/toolPermissionHelpers';
+import { constrainPermissionResponse, permissionPromptHints, type PermissionPromptHints } from '../../permissions/permissionPromptPolicy';
+import { hasShellChainingOperators, splitOnShellOperators, stripHeredocs } from '../../permissions/BashCommandAnalyzer';
 
 export type ToolAuthorizationDecision = {
   behavior: 'allow' | 'deny';
@@ -7,7 +9,7 @@ export type ToolAuthorizationDecision = {
   message?: string;
 };
 
-interface ToolPermissionOptions {
+export interface ToolPermissionOptions extends PermissionPromptHints {
   signal: AbortSignal;
   suggestions?: any[];
   toolUseID?: string;
@@ -16,7 +18,7 @@ interface ToolPermissionOptions {
 interface ServicePermissionDeps {
   logSecurity: (message: string, data?: Record<string, unknown>) => void;
   logAgentMessage: (sessionId: string, content: string) => Promise<void>;
-  requestToolPermission: (options: {
+  requestToolPermission: (options: PermissionPromptHints & {
     requestId: string;
     sessionId: string;
     workspacePath: string;
@@ -41,6 +43,85 @@ interface ServicePermissionParams {
   workspacePath: string;
   permissionsPath: string | undefined;
   teammateName: string | undefined;
+  warnings?: string[];
+}
+
+export const COMPOUND_PART_WARNING = 'This is part of a compound command - each part is checked separately';
+
+interface CompoundBashDeps {
+  /** True when the sub-command's pattern is approved this session or in settings */
+  isPartPreApproved: (pattern: string) => Promise<boolean>;
+  /** Run the normal permission prompt for one sub-command */
+  authorizePart: (partInput: any, warnings: string[]) => Promise<ToolAuthorizationDecision>;
+  logSecurity: (message: string, data?: Record<string, unknown>) => void;
+}
+
+/**
+ * Build the pre-approval check for compound sub-commands. Session approvals
+ * live in more than one place: the fallback prompt records them on the
+ * provider, ToolPermissionService records them on itself. Both must count,
+ * or a part approved for the session prompts again on the next command.
+ */
+export function createCompoundPartPreApprovalCheck(
+  getSessionApprovedPatternSets: () => Array<Set<string> | undefined>,
+  settingsChecker: ((workspacePath: string, pattern: string) => Promise<boolean>) | undefined,
+  workspacePath: string | undefined
+): (pattern: string) => Promise<boolean> {
+  return async (pattern) =>
+    getSessionApprovedPatternSets().some(set => set?.has(pattern)) ||
+    (!!workspacePath && !!settingsChecker && await settingsChecker(workspacePath, pattern));
+}
+
+/**
+ * Authorize a compound Bash command (&&, ||, ;) one sub-command at a time.
+ *
+ * This runs from canUseTool, which the SDK calls only after it has combined
+ * every PreToolUse hook's decision and applied its own allow rules (which
+ * already match each sub-command independently). A command that a user's
+ * PreToolUse hook allowed therefore never gets here. It used to run inside
+ * Nimbalyst's own PreToolUse hook, where it prompted in parallel with, and
+ * regardless of, the user's hooks.
+ *
+ * Sub-commands approved this session or in settings pass silently; each
+ * remaining one gets its own prompt, so "Session"/"Always" save a rule for
+ * that sub-command rather than for the whole compound string.
+ *
+ * Returns null when the command is not compound, or when it has a newline
+ * outside a heredoc (shell-quote reads newlines as whitespace, so splitting
+ * would glue two commands together); the caller then prompts for the whole
+ * command.
+ */
+export async function authorizeCompoundBashCommand(
+  deps: CompoundBashDeps,
+  input: any
+): Promise<ToolAuthorizationDecision | null> {
+  const command = typeof input?.command === 'string' ? input.command : '';
+  if (!hasShellChainingOperators(command)) {
+    return null;
+  }
+  if (stripHeredocs(command).trim().includes('\n')) {
+    deps.logSecurity('[canUseTool] Multi-line compound command, prompting for the whole command');
+    return null;
+  }
+
+  for (const subCommand of splitOnShellOperators(command)) {
+    const pattern = generateToolPattern('Bash', { command: subCommand });
+    if (await deps.isPartPreApproved(pattern)) {
+      deps.logSecurity('[canUseTool] Compound sub-command already approved:', { subCommand: subCommand.slice(0, 50), pattern });
+      continue;
+    }
+
+    deps.logSecurity('[canUseTool] Compound sub-command needs approval:', { subCommand: subCommand.slice(0, 50), pattern });
+    const decision = await deps.authorizePart({ ...input, command: subCommand }, [COMPOUND_PART_WARNING]);
+    if (decision.behavior !== 'allow') {
+      return {
+        behavior: 'deny',
+        message: decision.message || `Command denied: ${subCommand.slice(0, 50)}`
+      };
+    }
+  }
+
+  return { behavior: 'allow', updatedInput: input };
 }
 
 export async function handleToolPermissionWithService(
@@ -54,7 +135,8 @@ export async function handleToolPermissionWithService(
     sessionId,
     workspacePath,
     permissionsPath,
-    teammateName
+    teammateName,
+    warnings = []
   } = params;
 
   try {
@@ -77,13 +159,14 @@ export async function handleToolPermissionWithService(
         id: requestId,
         name: 'ToolPermission',
         input: {
+          ...permissionPromptHints(options),
           requestId,
           toolName,
           rawCommand: toolName === 'Bash' ? input?.command || '' : toolDescription,
           pattern,
           patternDisplayName: patternDisplay,
           isDestructive,
-          warnings: [],
+          warnings,
           workspacePath,
           ...(teammateName && { teammateName }),
         }
@@ -91,6 +174,7 @@ export async function handleToolPermissionWithService(
     );
 
     const response = await deps.requestToolPermission({
+      ...permissionPromptHints(options),
       requestId,
       sessionId,
       workspacePath,
@@ -101,7 +185,7 @@ export async function handleToolPermissionWithService(
       patternDisplayName: patternDisplay,
       toolDescription,
       isDestructive,
-      warnings: [],
+      warnings,
       signal: options.signal,
       teammateName,
     });
@@ -151,13 +235,14 @@ interface FallbackPermissionParams {
   options: ToolPermissionOptions;
   sessionId: string | undefined;
   workspacePath: string | undefined;
+  warnings?: string[];
 }
 
 export async function handleToolPermissionFallback(
   deps: FallbackPermissionDeps,
   params: FallbackPermissionParams
 ): Promise<ToolAuthorizationDecision> {
-  const { toolName, input, options, sessionId, workspacePath } = params;
+  const { toolName, input, options, sessionId, workspacePath, warnings = [] } = params;
 
   const pattern = generateToolPattern(toolName, input);
   if (deps.permissions.sessionApprovedPatterns.has(pattern)) {
@@ -189,13 +274,14 @@ export async function handleToolPermissionFallback(
         id: requestId,
         name: 'ToolPermission',
         input: {
+          ...permissionPromptHints(options),
           requestId,
           toolName,
           rawCommand,
           pattern,
           patternDisplayName: patternDisplay,
           isDestructive,
-          warnings: [],
+          warnings,
           workspacePath,
         }
       })
@@ -203,6 +289,7 @@ export async function handleToolPermissionFallback(
   }
 
   const request = {
+    ...permissionPromptHints(options),
     id: requestId,
     toolName,
     rawCommand,
@@ -219,7 +306,7 @@ export async function handleToolPermissionFallback(
       reason: 'Tool requires user approval',
       isDestructive,
       isRisky: toolName === 'Bash',
-      warnings: [],
+      warnings,
       outsidePaths: [],
       sensitivePaths: [],
     }],
@@ -255,7 +342,7 @@ export async function handleToolPermissionFallback(
   });
 
   try {
-    const response = await responsePromise;
+    const response = constrainPermissionResponse(await responsePromise, options);
 
     deps.logSecurity('[canUseTool] User response received (fallback):', {
       toolName,

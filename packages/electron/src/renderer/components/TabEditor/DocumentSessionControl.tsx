@@ -11,12 +11,14 @@
  *   caret. Clicking the chip opens that session; only the caret opens the menu,
  *   matching how the chip behaves everywhere else.
  *
- * The list loads on mount rather than on first open, because the chip has to
- * know the last session before the user clicks anything. That is one query per
- * open editor tab; the main-process handler caches, and tab counts are small.
+ * Visible headers load eagerly; hidden editors wait until shown. File-scoped
+ * invalidation and shared in-flight reads avoid workspace-wide refresh storms.
  */
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useAtomValue } from 'jotai';
+import { fileSessionLinkKey, fileSessionLinksRevisionAtom } from '../../store/atoms/fileSessionLinks';
+import { loadFileSessions } from '../../services/fileSessionsLoader';
 import { ProviderIcon } from '@nimbalyst/runtime/ui/icons/ProviderIcons';
 import { SessionReferenceChip } from '@nimbalyst/runtime/ui/AgentTranscript/session/SessionReferenceChip';
 import { useFloatingMenu, FloatingPortal } from '../../hooks/useFloatingMenu';
@@ -33,6 +35,8 @@ export interface FileSession {
   messageCount: number;
   worktreeId?: string | null;
   isCurrentWorkspace?: boolean;
+  lastFileEditAt?: number;
+  fileAttribution?: 'inferred' | 'recorded';
 }
 
 /**
@@ -95,7 +99,12 @@ const SessionRow: React.FC<{
         Current
       </span>
     )}
-    <div className="document-session-row-time text-xs text-[var(--nim-text-faint)] shrink-0">{formatRelativeTime(session.updatedAt)}</div>
+    {session.fileAttribution === 'inferred' && (
+      <span className="text-xs text-[var(--nim-text-faint)]" title="Inferred from a shell command and a file change during its execution. Other external writers may not be detected.">
+        Inferred edit
+      </span>
+    )}
+    <div className="document-session-row-time text-xs text-[var(--nim-text-faint)] shrink-0">{formatRelativeTime(session.lastFileEditAt ?? session.updatedAt)}</div>
     {onOpenInAgentMode && (
       <button
         className="shrink-0 w-6 h-6 flex items-center justify-center rounded text-[var(--nim-text-faint)] hover:text-[var(--nim-text)] hover:bg-[var(--nim-bg-tertiary)] transition-colors duration-150 bg-transparent border-none cursor-pointer"
@@ -122,17 +131,27 @@ export const DocumentSessionControl: React.FC<DocumentSessionControlProps> = ({
 
   const [sessions, setSessions] = useState<FileSession[]>([]);
   const [loading, setLoading] = useState(false);
+  const fileLinksRevision = useAtomValue(fileSessionLinksRevisionAtom(fileSessionLinkKey(workspaceId ?? '', filePath)));
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [visible, setVisible] = useState(() => typeof IntersectionObserver === 'undefined');
+
+  useEffect(() => {
+    if (!containerRef.current || typeof IntersectionObserver === 'undefined') return;
+    const observer = new IntersectionObserver(([entry]) => setVisible(entry.isIntersecting));
+    observer.observe(containerRef.current);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     if (!filePath || !workspaceId || !window.electronAPI) {
       setSessions([]);
       return;
     }
+    if (!visible) return;
 
     let cancelled = false;
     setLoading(true);
-    window.electronAPI
-      .invoke('sessions:get-by-file', workspaceId, filePath)
+    loadFileSessions(workspaceId, filePath, fileLinksRevision)
       .then((result: FileSession[]) => {
         if (cancelled) return;
         setSessions(Array.isArray(result) ? result : []);
@@ -147,14 +166,14 @@ export const DocumentSessionControl: React.FC<DocumentSessionControlProps> = ({
       });
 
     return () => { cancelled = true; };
-  }, [filePath, workspaceId]);
+  }, [filePath, workspaceId, fileLinksRevision, visible]);
 
   // The pill is "the last session that touched this file". The handler already
   // sorts current-workspace sessions first, which is not the same as most
   // recent, so pick by timestamp explicitly.
   const primarySession = useMemo(
     () => sessions.reduce<FileSession | undefined>(
-      (latest, s) => (!latest || s.updatedAt > latest.updatedAt ? s : latest),
+      (latest, s) => (!latest || (s.lastFileEditAt ?? s.updatedAt) > (latest.lastFileEditAt ?? latest.updatedAt) ? s : latest),
       undefined,
     ),
     [sessions],
@@ -246,7 +265,7 @@ export const DocumentSessionControl: React.FC<DocumentSessionControlProps> = ({
   );
 
   return (
-    <div className="document-session-control relative flex items-center" data-testid="document-session-control">
+    <div ref={containerRef} className="document-session-control relative flex items-center" data-testid="document-session-control">
       {trigger}
 
       {isOpen && (

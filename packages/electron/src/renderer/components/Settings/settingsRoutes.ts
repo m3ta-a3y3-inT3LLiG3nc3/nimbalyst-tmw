@@ -1,12 +1,14 @@
 export type SettingsScope = 'application' | 'account' | 'project';
 
 export type ApplicationSettingsCategory =
+  | 'provider-credentials'
   | 'notifications'
   | 'themes'
   | 'voice-mode'
   | 'advanced'
   | 'database'
   | 'agent-features'
+  | 'cloudflare-sandboxes'
   | 'beta-features'
   | 'claude-code'
   | 'claude'
@@ -52,6 +54,7 @@ export type OrganizationSettingsCategory =
   | 'organization-danger';
 
 export type ProjectSettingsCategory =
+  | 'project-appearance'
   | 'project-sharing'
   | 'project-agent-permissions'
   | 'project-trackers'
@@ -139,9 +142,11 @@ const builtinSettingsRouteDefinitions: readonly Omit<BuiltinSettingsRoute, 'sour
   { id: 'themes', scope: 'application', group: 'Application', label: 'Themes', icon: 'palette' },
   { id: 'voice-mode', scope: 'application', group: 'Application', label: 'Voice Mode', icon: 'mic', isAlpha: true },
   { id: 'agent-features', scope: 'application', group: 'Application', label: 'Agent Features', icon: 'science', isAlpha: true },
+  { id: 'cloudflare-sandboxes', scope: 'application', group: 'Application', label: 'Cloudflare Sandboxes', icon: 'cloud', isAlpha: true, isAvailable: developerOnly },
   { id: 'advanced', scope: 'application', group: 'Application', label: 'Advanced', icon: 'settings' },
   { id: 'database', scope: 'application', group: 'Application', label: 'Database', icon: 'database', isAlpha: true, isAvailable: developerOnly },
   { id: 'beta-features', scope: 'application', group: 'Application', label: 'Beta Features', icon: 'biotech', isAvailable: () => false },
+  { id: 'provider-credentials', scope: 'application', group: 'Agent Providers', label: 'Saved API keys', icon: 'key' },
   { id: 'claude-code', scope: 'application', group: 'Agent Providers', label: 'Claude Agent', icon: 'smart_toy' },
   { id: 'openai-codex', scope: 'application', group: 'Agent Providers', label: 'OpenAI Codex', icon: 'smart_toy' },
   { id: 'opencode', scope: 'application', group: 'Agent Providers', label: 'OpenCode', icon: 'terminal', isAlpha: true },
@@ -164,6 +169,7 @@ const builtinSettingsRouteDefinitions: readonly Omit<BuiltinSettingsRoute, 'sour
   { id: 'account-devices', scope: 'account', group: 'Account', label: 'Devices', icon: 'devices' },
   { id: 'account-shared-links', scope: 'account', group: 'Account', label: 'Shared Links', icon: 'link' },
 
+  { id: 'project-appearance', scope: 'project', group: 'Project', label: 'Appearance', icon: 'palette' },
   { id: 'project-sharing', scope: 'project', group: 'Project', label: 'Sharing', icon: 'group', isAlpha: true, isAvailable: teamsVisible },
   { id: 'project-agent-permissions', scope: 'project', group: 'Project', label: 'Agent Permissions', icon: 'shield' },
   { id: 'project-trackers', scope: 'project', group: 'Project', label: 'Trackers', icon: 'assignment' },
@@ -296,6 +302,9 @@ export function normalizeSettingsDestination(link: LegacySettingsLink): Settings
     if (!target) return null;
     if (legacyCategory && isExtensionSettingsRouteId(legacyCategory)) {
       return { scope: 'project', category: legacyCategory, target };
+    }
+    if (settingsRoutes.some(route => route.id === legacyCategory && route.scope === 'project')) {
+      return { scope: 'project', category: legacyCategory as ProjectSettingsCategory, target };
     }
     const category: ProjectSettingsCategory = legacyCategory === 'tracker-config'
       ? 'project-trackers'

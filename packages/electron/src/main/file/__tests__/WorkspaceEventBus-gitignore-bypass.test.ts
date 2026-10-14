@@ -141,9 +141,11 @@ import {
   unsubscribe,
   addGitignoreBypass,
   removeGitignoreBypass,
+  clearGitignoreBypasses,
   hasGitignoreBypass,
   resetBus,
   setGitignoreChangeHandler,
+  drainWorkspaceEvents,
 } from '../WorkspaceEventBus';
 import type { WorkspaceEventListener } from '../WorkspaceEventBus';
 
@@ -206,6 +208,21 @@ describe('WorkspaceEventBus gitignore bypass', () => {
   });
 
   describe('bypass set management', () => {
+    it('keeps an open-file bypass when legacy/session ownership is cleared', async () => {
+      await subscribe(WORKSPACE, 'window', createListener());
+      const file = `${WORKSPACE}/temp/custom.mockup.html`;
+      addGitignoreBypass(WORKSPACE, file);
+      addGitignoreBypass(WORKSPACE, file, 'open:window:one');
+      addGitignoreBypass(WORKSPACE, file, 'open:window:two');
+      clearGitignoreBypasses(WORKSPACE);
+      removeGitignoreBypass(WORKSPACE, file);
+      expect(hasGitignoreBypass(WORKSPACE, file)).toBe(true);
+      removeGitignoreBypass(WORKSPACE, file, 'open:window:one');
+      expect(hasGitignoreBypass(WORKSPACE, file)).toBe(true);
+      removeGitignoreBypass(WORKSPACE, file, 'open:window:two');
+      expect(hasGitignoreBypass(WORKSPACE, file)).toBe(false);
+    });
+
     it('adds and removes bypass paths', async () => {
       const listener = createListener();
       await subscribe(WORKSPACE, 'test-sub', listener);
@@ -246,13 +263,17 @@ describe('WorkspaceEventBus gitignore bypass', () => {
       await subscribe(WORKSPACE, 'test-sub', listener);
 
       fireWatchEvent('change', 'temp/bundle.js');
+      await drainWorkspaceEvents(WORKSPACE);
       expect(listener.onChange).toHaveBeenLastCalledWith(
         `${WORKSPACE}/temp/bundle.js`,
         undefined,
       );
 
       fireWatchEvent('change', '.gitignore');
+      // Native delivery can yield after its 4ms budget, including under suite load.
+      await drainWorkspaceEvents(WORKSPACE);
       fireWatchEvent('change', 'temp/bundle.js');
+      await drainWorkspaceEvents(WORKSPACE);
 
       expect(onGitignoreChange).toHaveBeenCalledWith(WORKSPACE);
       expect(listener.changes.filter((change) => change.path.endsWith('temp/bundle.js'))).toHaveLength(1);
@@ -351,8 +372,8 @@ describe('WorkspaceEventBus gitignore bypass', () => {
       addGitignoreBypass(WORKSPACE, `${WORKSPACE}/temp/output.js`);
 
       mockFsAccess
-        .mockRejectedValueOnce(new Error('not yet visible'))
-        .mockRejectedValueOnce(new Error('still not visible'))
+        .mockRejectedValueOnce(Object.assign(new Error('not yet visible'), { code: 'ENOENT' }))
+        .mockRejectedValueOnce(Object.assign(new Error('still not visible'), { code: 'ENOENT' }))
         .mockResolvedValueOnce(undefined);
 
       fireWatchEvent('rename', 'temp/output.js');
@@ -462,7 +483,7 @@ describe('WorkspaceEventBus gitignore bypass', () => {
       await subscribe(WORKSPACE, 'ai-sub', aiListener);
 
       // The path no longer exists on disk -> unlink.
-      mockFsAccess.mockRejectedValue(new Error('ENOENT'));
+      mockFsAccess.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
       fireWatchEvent('rename', 'temp');
 
       await vi.waitFor(() => {

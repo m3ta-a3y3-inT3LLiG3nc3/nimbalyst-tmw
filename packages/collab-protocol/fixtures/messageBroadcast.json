@@ -1,0 +1,20 @@
+{
+  "type": "messageBroadcast",
+  "message": {
+    "id": "message-fixture-id",
+    "sequence": 31,
+    "createdAt": 1789232401000,
+    "source": "user",
+    "direction": "input",
+    "encryptedContent": "c3ludGhldGljLWVuY3J5cHRlZENvbnRlbnQ=",
+    "iv": "40ZkrbQDSwQbXgfw",
+    "metadata": {},
+    "projectionVersion": 1,
+    "revision": 32,
+    "payload": {
+      "transferId": "0123456789abcdef0123456789abcdef",
+      "count": 2
+    }
+  },
+  "fromConnectionId": "message-connection"
+}

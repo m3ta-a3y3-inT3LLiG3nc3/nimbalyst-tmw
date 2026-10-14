@@ -68,6 +68,7 @@ export {
 // Session atoms (Electron IPC)
 export {
   sessionListAtom,
+  sessionRemoteHostAtom,
   activeSessionIdAtom,
   sessionProcessingAtom,
   sessionUnreadAtom,
@@ -392,7 +393,7 @@ export {
   isTrackerResourceId,
   fileResource,
   trackerResource,
-  convertToWorkstreamAtom,
+  transferSessionStateToWrapperAtom,
   cleanupWorkstreamAtom,
   initWorkstreamState,
   loadWorkstreamStates,

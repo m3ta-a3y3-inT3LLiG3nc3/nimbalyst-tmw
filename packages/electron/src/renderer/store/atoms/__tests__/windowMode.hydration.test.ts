@@ -3,8 +3,16 @@ import { store } from '@nimbalyst/runtime/store';
 import {
   initWindowMode,
   resetWindowMode,
+  setWindowModeAtom,
   windowModeAtom,
+  type ContentMode,
 } from '../windowMode';
+import { activeExtensionPanelAtom, activeExtensionBottomPanelAtom } from '../extensionPanels';
+import { activeWorkspacePathAtom } from '../openProjects';
+
+vi.mock('../../../services/document-model/DocumentModelRegistry', () => ({
+  DocumentModelRegistry: { flushAll: vi.fn(async () => undefined) },
+}));
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -21,8 +29,62 @@ describe('window mode hydration', () => {
 
   afterEach(() => {
     resetWindowMode();
+    store.set(activeExtensionPanelAtom, null);
+    store.set(activeExtensionBottomPanelAtom, null);
+    store.set(activeWorkspacePathAtom, null);
     vi.unstubAllGlobals();
   });
+
+  it.each(['before', 'during'])('keeps a deep-link mode selected %s workspace hydration', async (when) => {
+    const state = deferred<{ activeMode: 'files' }>();
+    vi.stubGlobal('window', { electronAPI: { invoke: vi.fn(() => state.promise) } });
+    store.set(activeWorkspacePathAtom, '/workspace-link');
+    if (when === 'before') store.set(setWindowModeAtom, 'agent');
+    const loading = initWindowMode('/workspace-link');
+    if (when === 'during') store.set(setWindowModeAtom, 'agent');
+    state.resolve({ activeMode: 'files' });
+    await loading;
+    expect(store.get(windowModeAtom)).toBe('agent');
+  });
+
+  it('falls back to files for a saved mode that no longer exists and writes the fallback back once', async () => {
+    // Wiki mode was removed; a workspace saved while it was open must still load,
+    // and main (which reads the persisted mode for Cmd+N) must see the fallback.
+    const invoke = vi.fn(async (channel: string) => (channel === 'workspace:get-state' ? { activeMode: 'wiki' } : undefined));
+    vi.stubGlobal('window', { electronAPI: { invoke } });
+    store.set(activeWorkspacePathAtom, '/workspace-removed-mode');
+    await initWindowMode('/workspace-removed-mode');
+    expect(store.get(windowModeAtom)).toBe('files');
+    expect(invoke.mock.calls.filter(([channel]) => channel === 'workspace:update-state'))
+      .toEqual([['workspace:update-state', '/workspace-removed-mode', { activeMode: 'files' }]]);
+
+    // A valid saved mode is not rewritten.
+    resetWindowMode();
+    invoke.mockClear();
+    invoke.mockImplementation(async (channel: string) => (channel === 'workspace:get-state' ? { activeMode: 'tracker' } : undefined));
+    store.set(activeWorkspacePathAtom, '/workspace-valid-mode');
+    await initWindowMode('/workspace-valid-mode');
+    expect(store.get(windowModeAtom)).toBe('tracker');
+    expect(invoke.mock.calls.some(([channel]) => channel === 'workspace:update-state')).toBe(false);
+  });
+
+  it.each<ContentMode>(['files', 'agent', 'tracker', 'collab', 'org', 'pr-review', 'settings'])(
+    'reveals %s through fullscreen, sidebar, and bottom panels even when already selected',
+    (mode) => {
+      vi.stubGlobal('window', { electronAPI: { featureUsage: { record: vi.fn(async () => undefined) } } });
+      for (const previousMode of ['files', mode] as ContentMode[]) {
+        for (const panelId of ['com.nimbalyst.project-graph.graph', 'extension.sidebar']) {
+          store.set(windowModeAtom, previousMode);
+          store.set(activeExtensionPanelAtom, panelId);
+          store.set(activeExtensionBottomPanelAtom, 'extension.bottom');
+          store.set(setWindowModeAtom, mode);
+          expect(store.get(windowModeAtom)).toBe(mode);
+          expect(store.get(activeExtensionPanelAtom)).toBeNull();
+          expect(store.get(activeExtensionBottomPanelAtom)).toBeNull();
+        }
+      }
+    },
+  );
 
   it('does not let a stale workspace response replace the active workspace mode', async () => {
     const workspaceA = deferred<{ activeMode: 'agent' }>();

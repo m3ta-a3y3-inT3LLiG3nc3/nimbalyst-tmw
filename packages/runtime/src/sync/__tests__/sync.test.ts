@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { createSyncedSessionStore } from '../SyncedSessionStore';
+import { createMessageSyncHandler, createSyncedSessionStore } from '../SyncedSessionStore';
+import { resetPushOutcomeWarnings } from '../pushOutcome';
 import type { SessionStore } from '../../ai/adapters/sessionStore';
 import type { SyncProvider, SessionChange
  } from '../types';
@@ -11,6 +12,7 @@ describe('SyncedSessionStore', () => {
   let capturedChanges: { sessionId: string; change: SessionChange }[];
 
   beforeEach(() => {
+    resetPushOutcomeWarnings();
     capturedChanges = [];
 
     mockBaseStore = {
@@ -36,6 +38,26 @@ describe('SyncedSessionStore', () => {
         capturedChanges.push({ sessionId, change });
       }),
     };
+  });
+
+  it('forwards provider identity lookup with its receiver without connecting or publishing', async () => {
+    const session = { id: 'local', provider: 'claude-code', workspacePath: '/workspace', messages: [] };
+    mockBaseStore.findByProviderSessionId = vi.fn(function (this: SessionStore) {
+      expect(this).toBe(mockBaseStore);
+      return Promise.resolve(session as any);
+    });
+    const store = createSyncedSessionStore(mockBaseStore, mockSyncProvider);
+    expect(await store.findByProviderSessionId!('claude-code', 'external', '/workspace')).toBe(session);
+    expect(mockBaseStore.findByProviderSessionId).toHaveBeenCalledWith('claude-code', 'external', '/workspace');
+    expect(mockSyncProvider.connect).not.toHaveBeenCalled();
+    expect(mockSyncProvider.pushChange).not.toHaveBeenCalled();
+    vi.mocked(mockBaseStore.findByProviderSessionId).mockRejectedValueOnce(new Error('Ambiguous identity'));
+    await expect(store.findByProviderSessionId!('claude-code', 'external', '/workspace')).rejects.toThrow('Ambiguous identity');
+  });
+
+  it('preserves an unavailable provider lookup capability on stores without it', () => {
+    const store = createSyncedSessionStore(mockBaseStore, mockSyncProvider);
+    expect(store.findByProviderSessionId).toBeUndefined();
   });
 
   it('should pass title and provider when creating a session', async () => {
@@ -73,6 +95,96 @@ describe('SyncedSessionStore', () => {
       expect(metadata.provider).toBe('claude-code');
       expect(metadata.model).toBe('claude-3-opus');
       expect(metadata.mode).toBe('agent');
+    }
+  });
+
+  it('warns for an unsent message and holds its timestamp back, then warns separately for an unpublished timestamp', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const outcome = { published: false, reason: 'message disconnected' };
+      mockSyncProvider.pushChange = vi.fn().mockResolvedValueOnce(outcome);
+      const message = { sessionId: 's1', source: 'claude-code', direction: 'output' as const, content: 'hello' };
+      const handler = createMessageSyncHandler(mockSyncProvider);
+      await expect(handler.onMessageCreated(message, 123)).resolves.toEqual(outcome);
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/s1.*message disconnected/));
+      expect(mockSyncProvider.pushChange).toHaveBeenCalledTimes(1);
+
+      mockSyncProvider.pushChange = vi.fn().mockResolvedValueOnce({ published: true })
+        .mockResolvedValueOnce({ published: false, reason: 'index disconnected' });
+      await handler.onMessageCreated({ ...message, sessionId: 's2' }, 124);
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/s2.*index disconnected/));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('publishes nothing, and queues nothing, for a session the filter excludes (NIM-7479)', async () => {
+    mockSyncProvider.isConnected = vi.fn().mockReturnValue(false);
+    mockSyncProvider.sendSessionMessages = vi.fn();
+    const handler = createMessageSyncHandler(mockSyncProvider, {
+      outbox: { coalesceMs: 1 },
+      shouldSync: async (sessionId) => sessionId === 'enabled',
+    });
+    const message = { sessionId: 'not-enabled', source: 'claude-code', direction: 'output' as const, content: 'private' };
+    await expect(handler.onMessageCreated(message, 1)).resolves.toMatchObject({ published: false, retryable: false });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(mockSyncProvider.connect).not.toHaveBeenCalled();
+    expect(mockSyncProvider.pushChange).not.toHaveBeenCalled();
+    expect(mockSyncProvider.sendSessionMessages).not.toHaveBeenCalled();
+    await handler.onMessageCreated({ ...message, sessionId: 'enabled' }, 2);
+    expect(mockSyncProvider.pushChange).toHaveBeenCalledWith('enabled', expect.objectContaining({ type: 'message_added' }));
+  });
+
+  it('delivers messages refused at the session connection cap, then publishes their timestamp', async () => {
+    const events: string[] = [];
+    const capRefusal = Object.assign(new Error('at the session connection cap'), { code: 'SESSION_CONNECTION_CAP' });
+    mockSyncProvider.isConnected = vi.fn().mockReturnValue(false);
+    mockSyncProvider.connect = vi.fn().mockRejectedValue(capRefusal);
+    mockSyncProvider.pushChange = vi.fn(async (sessionId: string, change: SessionChange) => {
+      events.push(`${change.type}:${sessionId}`);
+      return change.type === 'message_added'
+        ? { published: false, reason: 'not connected', retryable: true }
+        : { published: true };
+    });
+    mockSyncProvider.sendSessionMessages = vi.fn(async (sessionId: string, messages: { content: string }[]) => {
+      events.push(`sent:${sessionId}:${messages.map(m => m.content).join(',')}`);
+      return { published: true };
+    });
+    const handler = createMessageSyncHandler(mockSyncProvider, { outbox: { coalesceMs: 20 } });
+    const prompt = { sessionId: 's11', source: 'claude-code', direction: 'input' as const, content: 'prompt', createdAt: new Date() };
+    const reply = { ...prompt, direction: 'output' as const, content: 'reply' };
+    try {
+      await expect(handler.onMessageCreated(prompt, 100)).resolves.toMatchObject({ published: false, queued: true });
+      await handler.onMessageCreated(reply, 200);
+      // Until the rows are out, the index must not claim the session is current.
+      expect(events).not.toContain('metadata_updated:s11');
+
+      await vi.waitFor(() => expect(events).toContain('metadata_updated:s11'));
+      expect(events).toEqual(['sent:s11:prompt,reply', 'metadata_updated:s11']);
+      expect(mockSyncProvider.pushChange).toHaveBeenLastCalledWith('s11', { type: 'metadata_updated', metadata: { updatedAt: 200 } });
+      // One refused connect per burst, not one per message.
+      expect(mockSyncProvider.connect).toHaveBeenCalledTimes(1);
+    } finally {
+      handler.dispose();
+    }
+  });
+
+  it('warns for unpublished metadata and catches rejected publication after local persistence', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const store = createSyncedSessionStore(mockBaseStore, mockSyncProvider);
+      mockSyncProvider.pushChange = vi.fn().mockResolvedValueOnce({ published: false, reason: 'index disconnected' });
+      await store.updateMetadata('s1', { title: 'Updated' });
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/s1.*index disconnected/));
+      const error = new Error('transport rejected');
+      // Pre-attach a handler so the pre-fix regression run cannot leak a rejection.
+      const rejection = Promise.reject(error);
+      void rejection.catch(() => {});
+      mockSyncProvider.pushChange = vi.fn().mockReturnValue(rejection);
+      await expect(store.updateMetadata('s2', { title: 'Updated again' })).resolves.toBeUndefined();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('s2'), error);
+    } finally {
+      warn.mockRestore();
     }
   });
 
@@ -116,6 +228,25 @@ describe('SyncedSessionStore', () => {
     expect(capturedChanges).toHaveLength(1);
 
     await createPromise;
+  });
+
+  it('keeps create and draft writes independent of publication, but awaits deletion before disconnecting', async () => {
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    mockSyncProvider.pushChange = vi.fn(() => pending);
+    const store = createSyncedSessionStore(mockBaseStore, mockSyncProvider);
+    let writesFinished = false;
+    const writes = (async () => {
+      await store.create({ id: 's1', provider: 'claude-code', workspaceId: '/ws' });
+      await store.updateMetadata('s1', { draftInput: 'draft' });
+      writesFinished = true;
+    })();
+    await vi.waitFor(() => expect(writesFinished).toBe(true));
+    const deletion = store.delete('s1');
+    expect(mockSyncProvider.disconnect).not.toHaveBeenCalled();
+    release();
+    await Promise.all([writes, deletion]);
+    expect(mockSyncProvider.disconnect).toHaveBeenCalledWith('s1');
   });
 
   it('should pass title when updating metadata', async () => {

@@ -8,6 +8,14 @@ export interface TrackerRelationshipValue {
   relationshipTypeKey?: string;
   direction?: "out";
   metadata?: Record<string, unknown>;
+  /**
+   * Pins the reference to one exact revision of the target (knowledge-scopes
+   * contract 4.2). A UUID; absent means the live item. Mirrored from the richer
+   * declaration in `@nimbalyst/tracker-schema`, which cannot be imported here.
+   */
+  revisionId?: string;
+  /** Room-assigned display number for `revisionId`. Advisory; never resolves. */
+  serverRevision?: number;
 }
 
 export function isRelationshipField(
@@ -28,6 +36,15 @@ export function normalizeRelationshipValue(
   return [...byId.values()];
 }
 
+/**
+ * Coerce one stored entry.
+ *
+ * This is an explicit ALLOW-LIST, not a spread, so a key it does not name is
+ * dropped -- including on the way back out, because `addRelationshipValue`
+ * normalizes the existing entries before appending. Anything added to
+ * {@link TrackerRelationshipValue} has to be named here or adding a second
+ * target to a field silently strips it from the first.
+ */
 function coerceRelationship(entry: unknown): TrackerRelationshipValue | null {
   if (typeof entry === "string") return entry ? { itemId: entry } : null;
   if (!entry || typeof entry !== "object") return null;
@@ -49,5 +66,8 @@ function coerceRelationship(entry: unknown): TrackerRelationshipValue | null {
   if (object.direction === "out") value.direction = "out";
   if (object.metadata && typeof object.metadata === "object")
     value.metadata = object.metadata as Record<string, unknown>;
+  if (typeof object.revisionId === "string") value.revisionId = object.revisionId;
+  if (typeof object.serverRevision === "number")
+    value.serverRevision = object.serverRevision;
   return value;
 }

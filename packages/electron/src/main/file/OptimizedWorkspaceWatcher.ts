@@ -1,8 +1,18 @@
 import { BrowserWindow } from 'electron';
+import { basename } from 'path';
 import { getFolderContents } from '../utils/FileTree';
 import { logger } from '../utils/logger';
 import { getWindowId, markRecentlyDeleted } from '../window/WindowManager';
+import { openFileReconciler } from './OpenFileReconciler';
 import * as workspaceEventBus from './WorkspaceEventBus';
+import { quickOpenFileNameCache } from './QuickOpenFileNameCache';
+
+interface TreeRefresh {
+    timer?: NodeJS.Timeout;
+    running: boolean;
+    dirty: boolean;
+    controller: AbortController;
+}
 
 /**
  * Optimized workspace watcher.
@@ -17,8 +27,8 @@ import * as workspaceEventBus from './WorkspaceEventBus';
  * can replace exactly that subtree.
  */
 export class OptimizedWorkspaceWatcher {
-    /** Debounce timers, keyed `${windowId}:${rootPath}` -- one per root. */
-    private updateTimers = new Map<string, NodeJS.Timeout>();
+    /** One pending refresh and at most one running scan per window/root. */
+    private refreshes = new Map<string, TreeRefresh>();
     /** Roots each window watches, in attachment order (primary first). */
     private roots = new Map<number, Set<string>>();
     private watchedPaths = new Map<number, Set<string>>();
@@ -59,80 +69,112 @@ export class OptimizedWorkspaceWatcher {
             this.watchedPaths.set(windowId, new Set([workspacePath]));
         }
 
-        // Debounced update function
-        const triggerUpdate = () => {
-            const key = this.timerKey(windowId, workspacePath);
-            const existingTimer = this.updateTimers.get(key);
-            if (existingTimer) {
-                clearTimeout(existingTimer);
-            }
+        const key = this.timerKey(windowId, workspacePath);
+        const refresh: TreeRefresh = { running: false, dirty: false, controller: new AbortController() };
+        this.refreshes.set(key, refresh);
+        const isCurrent = () => this.refreshes.get(key) === refresh && !window.isDestroyed();
 
-            const timer = setTimeout(() => {
+        const runUpdate = async () => {
+            refresh.timer = undefined;
+            if (!isCurrent() || refresh.running) return;
+            refresh.running = true;
+            refresh.dirty = false;
+            try {
                 logger.workspaceWatcher.debug('Updating file tree');
-                getFolderContents(workspacePath).then((fileTree) => {
-                    if (!window || window.isDestroyed()) {
-                        return;
-                    }
-                    // `rootPath` tells a multi-root renderer which subtree this
-                    // rebuild replaces. Single-root windows ignore it.
-                    window.webContents.send('workspace-file-tree-updated', {
-                        rootPath: workspacePath,
-                        fileTree,
-                    });
-                }).catch((error) => {
-                    logger.workspaceWatcher.error('Failed to update file tree:', error);
+                const fileTree = await getFolderContents(workspacePath, 0, refresh.controller.signal);
+                if (!isCurrent()) return;
+                window.webContents.send('workspace-file-tree-updated', {
+                    rootPath: workspacePath,
+                    fileTree,
                 });
-            }, 500);
+            } catch (error) {
+                logger.workspaceWatcher.error('Failed to update file tree:', error);
+            } finally {
+                refresh.running = false;
+                // Changes during the walk need one more pass, not another
+                // concurrent copy of a potentially enormous workspace tree.
+                if (isCurrent() && refresh.dirty) {
+                    refresh.timer = setTimeout(runUpdate, 500);
+                }
+            }
+        };
 
-            this.updateTimers.set(key, timer);
+        const triggerUpdate = () => {
+            if (!isCurrent()) return;
+            refresh.dirty = true;
+            if (refresh.running) return;
+            if (refresh.timer) clearTimeout(refresh.timer);
+            refresh.timer = setTimeout(runUpdate, 500);
         };
 
         const subscriberId = `workspace-watcher-${windowId}`;
         this.subscriberIds.set(windowId, subscriberId);
 
-        await workspaceEventBus.subscribe(workspacePath, subscriberId, {
-            onChange: (filePath: string) => {
-                // Content modification -- notify editors, do NOT rebuild file tree.
-                // We send for bypassed (gitignored-but-tracked) files too: SessionFileWatcher
-                // skips events that pass through `markEditorSave` (restore from history,
-                // manual Cmd+S, autosave), so without this branch a gitignored .md file
-                // open in the editor would never reload after the user wrote to it.
-                if (!window.isDestroyed()) {
-                    window.webContents.send('file-changed-on-disk', { path: filePath });
-                }
-            },
-            onAdd: (filePath: string, gitignoreBypassed?: boolean) => {
-                // Always refresh file tree for new files — the tree builder has its
-                // own EXCLUDED_DIRS filtering, so gitignored files in non-excluded
-                // dirs (e.g. AI-created files) will correctly appear.
-                triggerUpdate();
-                if (gitignoreBypassed) return; // SessionFileWatcher handles editor notifications
-                if (!window.isDestroyed()) {
-                    window.webContents.send('file-changed-on-disk', { path: filePath });
-                }
-            },
-            onUnlink: (filePath: string, gitignoreBypassed?: boolean) => {
-                // Always refresh file tree for deleted files
-                triggerUpdate();
-                if (gitignoreBypassed) return; // SessionFileWatcher handles editor notifications
-                // Track the deletion in the lifecycle-bound recentlyDeleted
-                // map so a stale autosave from any surviving editor cannot
-                // recreate the file with old content. Cleared by
-                // editor:released-deleted-path once the renderer has fully
-                // released the path AND observed a fresh load.
-                markRecentlyDeleted(filePath);
-                if (!window.isDestroyed()) {
-                    window.webContents.send('file-changed-on-disk', { path: filePath });
-                    window.webContents.send('file-deleted', { filePath });
-                }
-            },
-            // The file-tree builder shows gitignored paths that aren't in
-            // EXCLUDED_DIRS (e.g. `temp/`, `nimbalyst-local/`, `test-results/`),
-            // so we need refresh events for gitignored adds/unlinks too. Without
-            // this, an agent's `mkdir tmp` against a `tmp/` gitignore pattern
-            // never reaches the sidebar until the workspace reopens.
-            receiveGitignoredStructureEvents: true,
-        });
+        let recovering = false;
+        try {
+            await workspaceEventBus.subscribe(workspacePath, subscriberId, {
+                onHealthChanged: (health) => {
+                    // A restarted watcher cannot replay structure changes missed while offline.
+                    quickOpenFileNameCache.invalidate(workspacePath);
+                    if (!window.isDestroyed()) window.webContents.send('file:watch-health', { root: workspacePath, ...health });
+                    if (health.state === 'recovering') recovering = true;
+                    if (health.state === 'watching' && recovering) {
+                        recovering = false;
+                        triggerUpdate();
+                        void openFileReconciler.reconcileRoot(workspacePath);
+                    }
+                },
+                onChange: (filePath: string) => {
+                    if (['.gitignore', '.ignore', '.rgignore'].includes(basename(filePath))) {
+                        quickOpenFileNameCache.invalidate(workspacePath);
+                    }
+                    // Content modification -- notify editors, do NOT rebuild file tree.
+                    // We send for bypassed (gitignored-but-tracked) files too: SessionFileWatcher
+                    // skips events that pass through `markEditorSave` (restore from history,
+                    // manual Cmd+S, autosave), so without this branch a gitignored .md file
+                    // open in the editor would never reload after the user wrote to it.
+                    if (!window.isDestroyed()) {
+                        window.webContents.send('file-changed-on-disk', { path: filePath });
+                    }
+                },
+                onAdd: (filePath: string, gitignoreBypassed?: boolean) => {
+                    quickOpenFileNameCache.invalidate(workspacePath);
+                    // Always refresh file tree for new files — the tree builder has its
+                    // own EXCLUDED_DIRS filtering, so gitignored files in non-excluded
+                    // dirs (e.g. AI-created files) will correctly appear.
+                    triggerUpdate();
+                    if (gitignoreBypassed && !filePath.toLowerCase().endsWith('.md') && !workspaceEventBus.hasGitignoreBypass(workspacePath, filePath)) return;
+                    if (!window.isDestroyed()) {
+                        window.webContents.send('file-changed-on-disk', { path: filePath });
+                    }
+                },
+                onUnlink: (filePath: string, gitignoreBypassed?: boolean) => {
+                    quickOpenFileNameCache.invalidate(workspacePath);
+                    // Always refresh file tree for deleted files
+                    triggerUpdate();
+                    if (gitignoreBypassed && !filePath.toLowerCase().endsWith('.md') && !workspaceEventBus.hasGitignoreBypass(workspacePath, filePath)) return;
+                    // Track the deletion in the lifecycle-bound recentlyDeleted
+                    // map so a stale autosave from any surviving editor cannot
+                    // recreate the file with old content. Cleared by
+                    // editor:released-deleted-path once the renderer has fully
+                    // released the path AND observed a fresh load.
+                    markRecentlyDeleted(filePath);
+                    if (!window.isDestroyed()) {
+                        window.webContents.send('file-changed-on-disk', { path: filePath });
+                        window.webContents.send('file-deleted', { filePath });
+                    }
+                },
+                // The file-tree builder shows gitignored paths that aren't in
+                // EXCLUDED_DIRS (e.g. `temp/`, `nimbalyst-local/`, `test-results/`),
+                // so we need refresh events for gitignored adds/unlinks too. Without
+                // this, an agent's `mkdir tmp` against a `tmp/` gitignore pattern
+                // never reaches the sidebar until the workspace reopens.
+                receiveGitignoredStructureEvents: true,
+            });
+        } catch (error) {
+            this.stopRoot(windowId, workspacePath);
+            throw error;
+        }
     }
 
     // ---------------------------------------------------------------
@@ -253,10 +295,11 @@ export class OptimizedWorkspaceWatcher {
         }
 
         const key = this.timerKey(windowId, rootPath);
-        const timer = this.updateTimers.get(key);
-        if (timer) {
-            clearTimeout(timer);
-            this.updateTimers.delete(key);
+        const refresh = this.refreshes.get(key);
+        if (refresh) {
+            if (refresh.timer) clearTimeout(refresh.timer);
+            refresh.controller.abort();
+            this.refreshes.delete(key);
         }
     }
 
@@ -277,10 +320,11 @@ export class OptimizedWorkspaceWatcher {
             this.stop(windowId);
         }
 
-        for (const timer of this.updateTimers.values()) {
-            clearTimeout(timer);
+        for (const refresh of this.refreshes.values()) {
+            if (refresh.timer) clearTimeout(refresh.timer);
+            refresh.controller.abort();
         }
-        this.updateTimers.clear();
+        this.refreshes.clear();
     }
 
     getStats() {
@@ -301,7 +345,10 @@ export class OptimizedWorkspaceWatcher {
         const busStats = workspaceEventBus.getStats();
         return {
             type: busStats.type,
-            activeWorkspaces: stats.length,
+            activeWorkspaces: busStats.activeWorkspaces,
+            registeredWorkspaces: stats.length,
+            health: busStats.workspaces,
+            reconciliation: openFileReconciler.getStats(),
             workspaces: stats,
         };
     }

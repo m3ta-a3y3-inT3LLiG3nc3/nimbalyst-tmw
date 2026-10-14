@@ -12,6 +12,7 @@ import type {
   GitOperationStatus,
 } from "@nimbalyst/extension-sdk/git-operation-log";
 import { getGitSubprocessEnv } from "./gitEnv";
+import { describeGitConnectionFailure, describeSignalExit } from "./gitCommandFailure";
 
 export type {
   GitOperationExecutor,
@@ -737,9 +738,13 @@ export async function runGitCommandStreaming(
       if (settled) return;
       settled = true;
       const success = exitCode === 0 && !spawnError;
+      const connectionFailure = describeGitConnectionFailure(args, stderr);
       const error = success
         ? undefined
         : spawnError ||
+          (connectionFailure
+            ? `${connectionFailure}\n\n${stderr.trim()}`
+            : undefined) ||
           stderr.trim() ||
           stdout.trim() ||
           `Git exited with code ${exitCode}`;
@@ -761,8 +766,13 @@ export async function runGitCommandStreaming(
     child.once("error", (error) => {
       void settle(-1, error.message);
     });
-    child.once("close", (code) => {
-      void settle(code ?? -1);
+    child.once("close", (code, signal) => {
+      void settle(
+        code ?? -1,
+        code === null && signal
+          ? describeSignalExit(args, signal, stderr)
+          : undefined
+      );
     });
   });
 }

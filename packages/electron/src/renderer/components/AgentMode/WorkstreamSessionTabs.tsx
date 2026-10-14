@@ -25,8 +25,6 @@ import {
   createChildSessionAtom,
 } from '../../store';
 import { defaultAgentModelAtom } from '../../store/atoms/appSettings';
-import { convertToWorkstreamAtom } from '../../store/atoms/sessions';
-import { workstreamHasChildrenAtom } from '../../store/atoms/workstreamState';
 import { SessionContextMenu } from '../AgenticCoding/SessionContextMenu';
 import type { SerializableDocumentContext } from '../../hooks/useDocumentContext';
 
@@ -111,7 +109,7 @@ const SessionTab: React.FC<{
   }, [isRenaming]);
 
   return (
-    <div className="relative">
+    <div className="session-tab-wrapper relative shrink-0">
       <button
         className={`session-tab flex items-center gap-1.5 px-2.5 py-[5px] border-none rounded text-xs font-medium cursor-pointer whitespace-nowrap transition-colors duration-150 ${
           isActive
@@ -184,22 +182,82 @@ const SessionTabBar: React.FC<{
   onSessionUnarchive?: (sessionId: string) => void;
   onSessionRename?: (sessionId: string, newName: string) => void;
 }> = React.memo(({ sessions, activeSessionId, onSessionSelect, onNewSession, onSessionArchive, onSessionUnarchive, onSessionRename }) => {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [scrollEdges, setScrollEdges] = useState({ left: false, right: false });
+  const updateScrollEdges = useCallback(() => {
+    const scroll = scrollRef.current;
+    if (!scroll) return;
+    const left = scroll.scrollLeft > 1;
+    const right = scroll.scrollLeft + scroll.clientWidth < scroll.scrollWidth - 1;
+    setScrollEdges(previous => previous.left === left && previous.right === right ? previous : { left, right });
+  }, []);
+  // Registry updates can produce a new array without changing the tabs.
+  const sessionOrder = JSON.stringify(sessions);
+
+  useEffect(() => {
+    const scroll = scrollRef.current;
+    if (!scroll) return;
+
+    const revealActiveTab = () => {
+      updateScrollEdges();
+      const tab = scroll.querySelector<HTMLElement>('.session-tab.active');
+      if (!tab || !scroll.clientWidth) return;
+      const viewport = scroll.getBoundingClientRect();
+      const bounds = tab.getBoundingClientRect();
+      // Scroll only this strip; scrollIntoView can also move the transcript's ancestors.
+      if (bounds.left < viewport.left || bounds.right - bounds.left > scroll.clientWidth) {
+        scroll.scrollLeft += bounds.left - viewport.left;
+      } else if (bounds.right > viewport.right) {
+        scroll.scrollLeft += bounds.right - viewport.right;
+      }
+      updateScrollEdges();
+    };
+
+    revealActiveTab();
+    const observer = new ResizeObserver(revealActiveTab);
+    observer.observe(scroll);
+    return () => observer.disconnect();
+  }, [activeSessionId, sessionOrder, updateScrollEdges]);
+
+  useEffect(() => {
+    const scroll = scrollRef.current;
+    if (!scroll) return;
+    const handleWheel = (event: WheelEvent) => {
+      if (event.ctrlKey || Math.abs(event.deltaX) >= Math.abs(event.deltaY)) return;
+      const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? scroll.clientWidth : 1;
+      const next = Math.max(0, Math.min(scroll.scrollWidth - scroll.clientWidth, scroll.scrollLeft + event.deltaY * unit));
+      if (next === scroll.scrollLeft) return;
+      event.preventDefault();
+      scroll.scrollLeft = next;
+    };
+    // React wheel listeners are passive; a native listener lets us consume vertical wheels.
+    scroll.addEventListener('wheel', handleWheel, { passive: false });
+    return () => scroll.removeEventListener('wheel', handleWheel);
+  }, []);
+
   // Always show the tab bar - even for single sessions, the user should see their session tab
   return (
-    <div className="session-tab-bar flex flex-wrap items-center gap-0.5 px-3 pt-1 pb-1.5 bg-[var(--nim-bg-secondary)] border-t-[3px] border-b border-[var(--nim-border)] shrink-0">
-      {sessions.map((sessionId) => (
-        <SessionTab
-          key={sessionId}
-          sessionId={sessionId}
-          isActive={sessionId === activeSessionId}
-          onClick={() => onSessionSelect(sessionId)}
-          onArchive={onSessionArchive ? () => onSessionArchive(sessionId) : undefined}
-          onUnarchive={onSessionUnarchive ? () => onSessionUnarchive(sessionId) : undefined}
-          onRename={onSessionRename ? (newName) => onSessionRename(sessionId, newName) : undefined}
-        />
-      ))}
+    <div className="session-tab-bar flex min-w-0 items-center gap-0.5 px-3 pt-1 pb-1.5 bg-[var(--nim-bg-secondary)] border-t-[3px] border-b border-[var(--nim-border)] shrink-0">
+      <div
+        ref={scrollRef}
+        onScroll={updateScrollEdges}
+        className="session-tabs-scroll flex min-w-0 items-center gap-0.5 overflow-x-auto overscroll-x-contain [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        style={{ maskImage: `linear-gradient(to right, ${scrollEdges.left ? 'transparent' : 'black'}, black 6px, black calc(100% - 6px), ${scrollEdges.right ? 'transparent' : 'black'})` }}
+      >
+        {sessions.map((sessionId) => (
+          <SessionTab
+            key={sessionId}
+            sessionId={sessionId}
+            isActive={sessionId === activeSessionId}
+            onClick={() => onSessionSelect(sessionId)}
+            onArchive={onSessionArchive ? () => onSessionArchive(sessionId) : undefined}
+            onUnarchive={onSessionUnarchive ? () => onSessionUnarchive(sessionId) : undefined}
+            onRename={onSessionRename ? (newName) => onSessionRename(sessionId, newName) : undefined}
+          />
+        ))}
+      </div>
       <button
-        className="session-tab-new nim-btn-icon-sm text-[var(--nim-text-faint)] hover:text-[var(--nim-text-muted)] active:bg-[var(--nim-bg-tertiary)]"
+        className="session-tab-new nim-btn-icon-sm shrink-0 text-[var(--nim-text-faint)] hover:text-[var(--nim-text-muted)] active:bg-[var(--nim-bg-tertiary)]"
         onClick={onNewSession}
         title="New session in workstream"
       >
@@ -231,41 +289,13 @@ export const WorkstreamSessionTabs: React.FC<WorkstreamSessionTabsProps> = React
   getDocumentContext,
   collapseTranscript = false,
 }) => {
-  const hasChildren = useAtomValue(workstreamHasChildrenAtom(workstreamId));
   const createChildSession = useSetAtom(createChildSessionAtom);
-  const convertToWorkstream = useSetAtom(convertToWorkstreamAtom);
   const defaultModel = useAtomValue(defaultAgentModelAtom);
 
   // Handle creating a new child session
   const handleNewSession = useCallback(async () => {
-    // If this is a worktree, use the callback to add a session to it
-    if (worktreeId && onAddSessionToWorktree) {
-      await onAddSessionToWorktree(worktreeId);
-      return;
-    }
-
-    // Resolve the actual parent ID - if workstreamId is a child session, use its parent
-    const registry = store.get(sessionRegistryAtom);
-    const sessionMeta = registry.get(workstreamId);
-    const resolvedParentId = sessionMeta?.parentSessionId || workstreamId;
-
-    // Regular workstream logic
-    if (hasChildren || resolvedParentId !== workstreamId) {
-      // Already a workstream (has children, or we resolved to a parent) - create a child
-      await createChildSession({
-        parentSessionId: resolvedParentId,
-        workspacePath,
-        model: defaultModel,
-      });
-    } else {
-      // Single session - convert to workstream first
-      await convertToWorkstream({
-        sessionId: workstreamId,
-        workspacePath,
-        model: defaultModel,
-      });
-    }
-  }, [workstreamId, workspacePath, hasChildren, worktreeId, onAddSessionToWorktree, createChildSession, convertToWorkstream, defaultModel]);
+    await createChildSession({ parentSessionId: workstreamId, workspacePath, model: defaultModel });
+  }, [workstreamId, workspacePath, createChildSession, defaultModel]);
 
   if (!activeSessionId) {
     return (

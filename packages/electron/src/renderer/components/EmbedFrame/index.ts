@@ -27,13 +27,16 @@ import {
 import { setCanvasCallbacks } from '@nimbalyst/runtime/canvas';
 
 import { customEditorRegistry } from '../CustomEditors/registry';
-import { EmbedFrame } from './EmbedFrame';
+import { DesktopEmbedRenderer } from './DesktopEmbedRenderer';
+import { registerPlacedViewCommands } from './placedViewCommands';
 import { CanvasCardHost } from './CanvasCardHost';
+import { CanvasCardPreview } from './CanvasCardPreview';
 import { canvasCardCommentCounts } from './canvasCardCommentCounts';
 import { canvasCardRevisions } from './canvasCardRevisions';
 import { dispatchCanvasAgentThread } from './canvasAgentDispatch';
 import { pickCanvasCardReference } from './pickCanvasCardReference';
 import { canvasDropSource } from './canvasDropSource';
+import { openFileInTab, workspaceAbsolutePath } from './embeddedFileIo';
 
 export { EmbedFrame } from './EmbedFrame';
 export { createEmbeddedFileHost } from './createEmbeddedFileHost';
@@ -44,12 +47,20 @@ function syncEmbeddableExtensions(): void {
 }
 
 export function registerEmbedFrame(): void {
-  setEmbedPluginCallbacks({ renderEmbed: EmbedFrame });
+  // A placed view (`parsePlacedViewUrl`) draws live; anything else is a file or shared document.
+  setEmbedPluginCallbacks({ renderEmbed: DesktopEmbedRenderer });
+  // Slash entries that place a view of a type, or a list of decisions, in the page.
+  registerPlacedViewCommands();
   // The canvas's card slot, filled from the same place and for the same reason:
   // one renderer-side module owns "how a reference becomes a mounted editor,"
   // whether the surface arranging those references is a document or a board.
   setCanvasCallbacks({
     renderCard: CanvasCardHost,
+    renderCardPreview: CanvasCardPreview,
+    openScreenshotSource: path => {
+      const absolutePath = workspaceAbsolutePath(path);
+      if (absolutePath) openFileInTab(absolutePath);
+    },
     // The other half of a card's dual comment count: threads inside the card's
     // own document, which live in that document's room and never merge with the
     // board's own threads.

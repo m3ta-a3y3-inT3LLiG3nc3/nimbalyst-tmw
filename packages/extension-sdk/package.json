@@ -1,6 +1,6 @@
 {
   "name": "@nimbalyst/extension-sdk",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "SDK for building Nimbalyst extensions",
   "repository": {
     "type": "git",
@@ -17,7 +17,7 @@
     "./dist/validate.js": "./dist/validate.browser.js"
   },
   "nimbalyst": {
-    "minAppVersion": "0.75.5"
+    "minAppVersion": "0.79.0"
   },
   "publishConfig": {
     "access": "public"
@@ -32,6 +32,14 @@
     "./collab": {
       "types": "./dist/collab/index.d.ts",
       "import": "./dist/collab/index.js"
+    },
+    "./agents": {
+      "types": "./dist/agents/index.d.ts",
+      "import": "./dist/agents/index.js"
+    },
+    "./types/editor": {
+      "types": "./dist/types/editor.d.ts",
+      "import": "./dist/types/editor.js"
     },
     "./vite": {
       "types": "./dist/vite.d.ts",
@@ -68,7 +76,7 @@
     "build:clean": "node -e \"fs.rmSync('dist',{recursive:true,force:true});fs.rmSync('.tsbuildinfo',{force:true})\" && tsc",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run build:clean"
+    "prepublishOnly": "pnpm run build:clean"
   },
   "dependencies": {},
   "peerDependencies": {
@@ -106,7 +114,7 @@
     "typescript": "^5.0.0",
     "vite": "^7.1.12",
     "@vitejs/plugin-react": "^5.1.2",
-    "yjs": ">=13.5.42",
+    "yjs": "13.6.32",
     "y-protocols": "^1.0.5"
   },
   "keywords": [

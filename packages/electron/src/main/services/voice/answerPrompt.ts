@@ -7,14 +7,17 @@
  * answer onto the structured prompt response and resolves it through the EXACT
  * same path mobile uses for an in-app answer (`resolveVoicePromptResponse`).
  *
- * Supported prompt types (the canonical `interactive_prompt` shapes):
+ * Supported prompt types (see `pendingVoicePrompts` for how they are found):
  *  - ask_user_question  -> match the answer to an option label, or free text
  *  - permission_request -> yes/no -> allow/deny (once)
  *  - git_commit_proposal -> yes/no -> commit/cancel
  */
 
 import type { BrowserWindow } from 'electron';
+import { explicitVoiceDecision } from './mobileVoicePromptContract';
 import { loadVoiceSession } from './voiceSessionLoader';
+import { pendingVoicePrompts } from './voicePendingPrompts';
+import { sessionHasLivePrompt } from './voicePromptLiveness';
 import {
   resolveVoicePromptResponse,
   type PromptResponsePayload,
@@ -29,15 +32,7 @@ export interface VoiceAnswerResult {
 
 /** Interpret a spoken yes/no-ish answer. Returns true/false, or null if unclear. */
 function interpretAffirmative(text: string): boolean | null {
-  const t = text.trim().toLowerCase();
-  if (!t) return null;
-  if (/\b(yes|yeah|yep|yup|sure|ok|okay|approve|approved|allow|accept|confirm|go ahead|do it|proceed|sounds good|please do)\b/.test(t)) {
-    return true;
-  }
-  if (/\b(no|nope|deny|denied|don'?t|do not|reject|decline|cancel|stop|never mind|nevermind)\b/.test(t)) {
-    return false;
-  }
-  return null;
+  return explicitVoiceDecision(text);
 }
 
 /** Pick the option label that best matches the spoken answer, or null. */
@@ -76,16 +71,17 @@ function buildResponsePayload(
         };
       }
       const q = questions[0];
-      const header = typeof q?.header === 'string' && q.header ? q.header : 'answer';
+      if (typeof q?.question !== 'string' || !q.question) return { error: 'There is no question to answer.' };
       const matched = matchOption(q?.options, answer);
       const value = matched ?? answer.trim();
       return {
         payload: {
           promptType: 'ask_user_question',
           promptId,
-          response: { answers: { [header]: value } },
+          // Keyed by question text, exactly as the app card answers.
+          response: { answers: { [q.question]: value } },
         },
-        describe: `Answered "${header}" with "${value}".`,
+        describe: `Answered "${q.question}" with "${value}".`,
       };
     }
 
@@ -110,11 +106,17 @@ function buildResponsePayload(
       if (decision === null) {
         return { error: 'Could not tell whether to commit. Please say yes or no.' };
       }
+      // The desktop commits exactly what was proposed; without both it settles the proposal as an error.
+      if (decision && (!prompt.commitMessage?.trim() || !prompt.stagedFiles?.length)) {
+        return { error: 'This commit proposal needs its app card.' };
+      }
       return {
         payload: {
           promptType: 'git_commit',
           promptId,
-          response: decision ? { action: 'committed' } : { action: 'cancelled' },
+          response: decision
+            ? { action: 'committed', files: prompt.stagedFiles, message: prompt.commitMessage }
+            : { action: 'cancelled' },
         },
         describe: decision ? 'Approved the commit.' : 'Cancelled the commit.',
       };
@@ -147,16 +149,14 @@ export async function answerSessionPromptForVoice(
     return { success: false, error: loaded.error };
   }
 
-  const messages = (loaded.session.messages || []) as Array<any>;
-  const pending = messages.filter(
-    (m) => m.type === 'interactive_prompt' && m.interactivePrompt?.status === 'pending',
-  );
+  const live = sessionHasLivePrompt(loaded.sessionId, loaded.session.metadata?.hasPendingPrompt);
+  const pending = live ? pendingVoicePrompts(loaded.session.messages || []) : [];
   if (pending.length === 0) {
     return { success: false, error: 'This session is not waiting on any question right now.' };
   }
 
   // The most recent pending prompt is the one the user is responding to.
-  const prompt = pending[pending.length - 1].interactivePrompt;
+  const prompt = pending[pending.length - 1];
   const built = buildResponsePayload(prompt, answer);
   if ('error' in built) {
     return { success: false, error: built.error };

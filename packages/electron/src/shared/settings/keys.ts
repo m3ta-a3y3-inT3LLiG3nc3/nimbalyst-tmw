@@ -86,6 +86,12 @@ function setting<S extends z.ZodTypeAny>(
  *     ai.showMcpSessionStatus, ai.trackerAutomation, ai.diffPeekSize
  */
 export const SETTINGS_REGISTRY = {
+  // The default cap applies to additions, not current or restored projects.
+  'projects.allowUnlimited': setting(
+    z.boolean(),
+    { store: 'app-settings', path: 'allowUnlimitedProjects' },
+    false,
+  ),
   // ---- AI providers (per-key) ----
   'ai.provider.claude': setting(
     ProviderConfigSchema,
@@ -214,10 +220,20 @@ export const SETTINGS_REGISTRY = {
     { store: 'ai-settings', path: 'autoCommitEnabled' },
     false,
   ),
+  'ai.usageLimitAutoResumeEnabled': setting(
+    z.boolean(),
+    { store: 'ai-settings', path: 'usageLimitAutoResumeEnabled' },
+    false,
+  ),
   'ai.showMcpSessionStatus': setting(
     z.boolean(),
     { store: 'ai-settings', path: 'showMcpSessionStatus' },
     false,
+  ),
+  'ai.promptSuggestionsEnabled': setting(
+    z.boolean(),
+    { store: 'ai-settings', path: 'promptSuggestionsEnabled' },
+    true,
   ),
   'ai.trackerAutomation': setting(
     z.object({
@@ -246,6 +262,12 @@ export const SETTINGS_REGISTRY = {
     z.boolean(),
     { store: 'ai-settings', path: 'showGeminiUsageIndicator' },
     true,
+  ),
+  // Explicit opt-in, independent of developer mode and feature enable-all.
+  'app.externalSessionFollowEnabled': setting(
+    z.boolean(),
+    { store: 'app-settings', path: 'externalSessionFollowEnabled' },
+    false,
   ),
   /** Width (px) of the gutter's agent sessions attention popover. */
   'agent.sessionsPopoverWidth': setting(

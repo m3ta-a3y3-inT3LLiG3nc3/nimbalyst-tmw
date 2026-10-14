@@ -12,6 +12,7 @@ public struct SettingsView: View {
     @State private var isDeletingAccount = false
     @State private var deleteAccountError: String?
     @State private var accountSwitchError: String?
+    @State private var copiedDiagnostics = false
     @Environment(\.dismiss) private var dismiss
 
     // Voice mode settings
@@ -23,7 +24,7 @@ public struct SettingsView: View {
     public init() {}
 
     private var connectedDevices: [DeviceInfo] {
-        appState.syncManager?.connectedDevices ?? []
+        DeviceRoster.recent(appState.syncManager?.connectedDevices ?? [])
     }
 
     public var body: some View {
@@ -35,6 +36,7 @@ public struct SettingsView: View {
             notificationsSection
             analyticsSection
             #endif
+            diagnosticsSection
             dangerSection
         }
         .navigationTitle("Settings")
@@ -229,13 +231,24 @@ public struct SettingsView: View {
                 hasOpenAIApiKey = KeychainManager.getOpenAIApiKey() != nil
             }
 
-            // Voice picker
-            Picker("Voice", selection: $voiceSettings.voice) {
-                ForEach(Self.voiceOptions, id: \.self) { voice in
-                    Text(voice.capitalized).tag(voice)
-                }
+            Picker("Engine", selection: Binding(get: { voiceSettings.effectiveEngine.rawValue }, set: { voiceSettings.engine = $0; saveVoiceSettings() })) {
+                Text("Realtime").tag("realtime")
+                Text("GPT-Live (Preview)").tag("live")
             }
-            .onChange(of: voiceSettings.voice) { _, _ in saveVoiceSettings() }
+            if voiceSettings.effectiveEngine == .live {
+                Picker("Live Voice", selection: Binding(get: { voiceSettings.effectiveLiveVoice }, set: { voiceSettings.liveVoice = $0; saveVoiceSettings() })) {
+                    ForEach(VoiceModeSettings.liveVoices, id: \.self) { Text($0.capitalized).tag($0) }
+                }
+                Picker("Live Controller", selection: Binding(get: { voiceSettings.effectiveLiveController }, set: { voiceSettings.liveControllerModel = $0; saveVoiceSettings() })) {
+                    Text("GPT-5.6 Terra").tag("gpt-5.6-terra")
+                    Text("GPT-5.6 Luna").tag("gpt-5.6-luna")
+                }
+            } else {
+                Picker("Voice", selection: $voiceSettings.voice) {
+                    ForEach(Self.voiceOptions, id: \.self) { voice in Text(voice.capitalized).tag(voice) }
+                }
+                .onChange(of: voiceSettings.voice) { _, _ in saveVoiceSettings() }
+            }
 
             // Idle timeout
             Stepper(
@@ -300,6 +313,25 @@ public struct SettingsView: View {
         }
     }
     #endif
+
+    // MARK: - Diagnostics
+
+    private var diagnosticsSection: some View {
+        Section {
+            Button {
+                DiagnosticsReport.copyToClipboard(appState: appState)
+                copiedDiagnostics = true
+            } label: {
+                Label(copiedDiagnostics ? "Copied" : "Copy Diagnostics",
+                      systemImage: copiedDiagnostics ? "checkmark" : "doc.on.doc")
+            }
+            .accessibilityIdentifier("settings-copy-diagnostics")
+        } header: {
+            Text("Troubleshooting")
+        } footer: {
+            Text("Copies app and device versions and recent sync errors to paste into a bug report. No session content is included.")
+        }
+    }
 
     // MARK: - Danger Zone
 

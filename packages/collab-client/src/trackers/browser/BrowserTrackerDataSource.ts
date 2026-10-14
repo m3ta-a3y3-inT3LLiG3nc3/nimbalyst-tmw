@@ -8,20 +8,20 @@ import { trackerRecordToItem, type TrackerRecord } from '@nimbalyst/runtime/core
 import {
   IndexedDbTrackerPersistence,
   type StoredTrackerItem,
-} from '@nimbalyst/runtime/sync/trackerPersistence';
-import { projectLabelsToValues } from '@nimbalyst/runtime/sync/trackerLabels';
+} from '@nimbalyst/tracker-engine';
+import { applyLabelDiff, projectLabelsToValues } from '@nimbalyst/tracker-engine';
 import {
   buildTrackerRoomId,
   type TrackerItemPayload,
-} from '@nimbalyst/runtime/sync/trackerProtocol';
+} from '@nimbalyst/tracker-engine';
 import {
   TrackerSyncEngine,
   type TrackerNavigationSyncHooks,
   type TrackerPresenceIdentity,
   type TrackerSchemaSyncHooks,
   type TrackerSyncEngineConfig,
-} from '@nimbalyst/runtime/sync/TrackerSyncEngine';
-import type { TrackerAccessTermination } from '@nimbalyst/runtime/sync/trackerAccessTermination';
+} from '@nimbalyst/tracker-engine';
+import type { TrackerAccessTermination } from '@nimbalyst/tracker-engine';
 import type {
   TrackerBatchUpdateInput,
   TrackerCreateItemInput,
@@ -33,7 +33,11 @@ import type {
   TrackerSavedViewRecord,
   TrackerSyncState,
   TrackerUpdateItemInput,
+  TrackerItemRevisionRecord,
+  TrackerRevisionRef,
 } from '../dataSource';
+import { TrackerRevisionsUnsupportedError } from '../dataSource';
+import { trackerBodyDocumentId, type TrackerBodyRoom, type TrackerBodySeeder } from './trackerBodyRoom';
 
 export interface BrowserTrackerDataSourceOptions {
   workspacePath: string;
@@ -55,6 +59,15 @@ export interface BrowserTrackerDataSourceOptions {
   createWebSocket?: (url: string) => WebSocket;
   /** Test seam for a harness that has no HTTP worker in front of its fake room. */
   authorizeRoom?: (jwt: TeamJwt) => Promise<TrackerAccessTermination | null>;
+  /** Test seam for the item body's document room; defaults to a `DocumentSyncProvider`. */
+  openTrackerBodyRoom?: (documentId: string) => TrackerBodyRoom;
+  /**
+   * Writes a new item's description into its body room. Injected by the host
+   * from the `./editor` entry (`seedTrackerBody`) because it carries the
+   * Markdown/Lexical codec, which `trackers-ui` must not reach. Without it,
+   * creating an item with a body fails rather than dropping the body.
+   */
+  seedTrackerBody?: TrackerBodySeeder;
   /**
    * Decide whether a failure to mint a team JWT is terminal, and say which
    * terminal thing it is. Return null for anything retryable.
@@ -178,19 +191,26 @@ function payloadToItem(stored: StoredTrackerItem, workspacePath: string): Tracke
   return item;
 }
 
-function createPayload(item: TrackerCreateItemInput, currentUser: TrackerIdentity): TrackerItemPayload {
+/**
+ * The description is the body, written to the item's document room before
+ * this payload goes out (see `seedTrackerBody`); it is never a field.
+ */
+function createPayload(
+  item: TrackerCreateItemInput,
+  currentUser: TrackerIdentity,
+  hasBody: boolean,
+): TrackerItemPayload {
   const now = new Date().toISOString();
   return {
     itemId: item.id,
     primaryType: item.type,
     archived: false,
-    bodyVersion: 0,
+    bodyVersion: hasBody ? 1 : 0,
     fields: {
       ...(item.customFields ?? {}),
       title: item.title,
       status: item.status,
       priority: item.priority,
-      ...(item.description === undefined ? {} : { description: item.description }),
       ...(item.owner === undefined ? {} : { owner: item.owner }),
       ...(item.tags === undefined ? {} : { tags: item.tags }),
     },
@@ -205,12 +225,23 @@ function createPayload(item: TrackerCreateItemInput, currentUser: TrackerIdentit
   };
 }
 
-function updatePayload(
+/**
+ * `labels` is the item's add-wins label set, not a field: reads project it
+ * from `payload.labels` over whatever `fields.labels` says, so an update must
+ * diff into the set or it is lost on the next read.
+ */
+export function updatePayload(
   payload: TrackerItemPayload,
   updates: Record<string, unknown>,
   currentUser: TrackerIdentity,
 ): TrackerItemPayload {
   const fields = { ...payload.fields, ...updates };
+  let labels = payload.labels;
+  if ('labels' in updates) {
+    const next = updates.labels;
+    labels = applyLabelDiff(payload.labels, Array.isArray(next) ? next.filter((value): value is string => typeof value === 'string') : []);
+    delete fields.labels;
+  }
   const primaryType = typeof updates.type === 'string'
     ? updates.type
     : typeof updates.primaryType === 'string'
@@ -225,6 +256,7 @@ function updatePayload(
     archived,
     bodyVersion,
     fields,
+    labels,
     system: {
       ...payload.system,
       lastModifiedBy: currentUser,
@@ -368,6 +400,25 @@ export class BrowserTrackerDataSource implements TrackerDataSource {
     return this.syncState;
   }
 
+  /** Push the schema lane now; before bootstrap finishes, the bootstrap pushes it. */
+  flushSchemas(): Promise<void> {
+    return this.engine.flushSchemas();
+  }
+
+  /**
+   * Not available in the browser yet, and it throws rather than approximating.
+   *
+   * The IndexedDB persistence keeps only current rows: N6 left browser-side
+   * revisions out on purpose, because the room owns `serverRevision` and the
+   * browser's half of that lands with the collab server's revision read (C2).
+   * Answering with the live item instead would silently show newer evidence
+   * under a pinned citation, which is the one failure contract 4.2 exists to
+   * prevent.
+   */
+  async getItemRevision(_itemId: string, _ref: TrackerRevisionRef): Promise<TrackerItemRevisionRecord> {
+    throw new TrackerRevisionsUnsupportedError('The web console');
+  }
+
   async command(command: TrackerDataCommand): Promise<TrackerDataCommandResult> {
     this.assertActive();
     if (
@@ -386,10 +437,23 @@ export class BrowserTrackerDataSource implements TrackerDataSource {
         if (command.item.content !== undefined) {
           throw new Error('Tracker body content must be written through its collaborative document room');
         }
-        return {
-          ok: true,
-          result: await this.upsert(createPayload(command.item, this.options.currentUser)),
-        };
+        {
+          // Body first: the room authorizes on project membership, not on the
+          // item, and an item whose metadata announces a body that never
+          // arrived would open empty. A failed seed leaves no item behind.
+          const body = command.item.description?.trim() ? command.item.description : null;
+          if (body !== null) {
+            const seed = this.options.seedTrackerBody;
+            if (!seed) {
+              throw new Error('This host cannot write item bodies (no seedTrackerBody). The item was not created.');
+            }
+            await seed(await this.openTrackerBodyRoom(trackerBodyDocumentId(command.item.id)), body);
+          }
+          return {
+            ok: true,
+            result: await this.upsert(createPayload(command.item, this.options.currentUser, body !== null)),
+          };
+        }
       case 'update-item':
         return { ok: true, result: await this.updateOne(command.input) };
       case 'update-items':
@@ -525,6 +589,21 @@ export class BrowserTrackerDataSource implements TrackerDataSource {
       updatedAt: new Date().toISOString(),
     };
     return this.upsert(next);
+  }
+
+  private async openTrackerBodyRoom(documentId: string): Promise<TrackerBodyRoom> {
+    if (this.options.openTrackerBodyRoom) return this.options.openTrackerBodyRoom(documentId);
+    // Lazy: only create-with-body needs a document room, and a static import
+    // puts the whole document-sync client in the trackers-ui eager budget.
+    const { DocumentSyncProvider } = await import('@nimbalyst/runtime/sync/DocumentSync');
+    return new DocumentSyncProvider({
+      serverUrl: this.options.serverUrl,
+      orgId: this.options.orgId,
+      documentId,
+      teamMemberId: this.options.teamMemberId,
+      getJwt: () => this.options.getTeamJwt(),
+      ...(this.options.createWebSocket ? { createWebSocket: this.options.createWebSocket } : {}),
+    });
   }
 
   private async upsert(payload: TrackerItemPayload): Promise<{ clientMutationId: string }> {

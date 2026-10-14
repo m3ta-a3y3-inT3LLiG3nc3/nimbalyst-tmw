@@ -1,19 +1,24 @@
+import type { PermissionPromptHints } from './permissions/permissionPromptPolicy';
 /**
  * Common types for AI provider abstraction
  */
 
-import type { ToolDefinition } from '../tools';
-import type { EditorContextItem } from '@nimbalyst/extension-sdk';
+import type { ToolDefinition } from '../tools/definitions';
+// Deep path, not the SDK barrel: `@nimbalyst/extension-sdk`'s index re-exports
+// modules that import `@nimbalyst/runtime`, which drags the whole editor tree
+// into the type graph of anything that touches session execution.
+import type { EditorContextItem } from '@nimbalyst/extension-sdk/types/editor';
 import type { EffortLevel, ThinkingMode } from './effortLevels';
 import type { ToolResult } from './protocols/ProtocolInterface';
 import { ModelIdentifier } from './ModelIdentifier';
+import { claudeCustomModelName } from '../claudeCustomModels';
 import {
   CLAUDE_CODE_ACCEPTED_VARIANT_INPUTS,
   CLAUDE_CODE_PINNED_SDK_MODELS,
   normalizeClaudeCodeVariant,
 } from '../modelConstants';
 import type { TranscriptViewMessage } from './transcript/TranscriptProjector';
-export type { ToolDefinition } from '../tools';
+export type { ToolDefinition } from '../tools/definitions';
 export { ModelIdentifier } from './ModelIdentifier';
 export type { ToolResult } from './protocols/ProtocolInterface';
 export type { TranscriptViewMessage } from './transcript/TranscriptProjector';
@@ -86,7 +91,10 @@ export type PromptProvenanceOrigin =
   | 'mobile'
   | 'automation';
 
+export type OrchestrationMessageKind = 'instruction' | 'report' | 'status' | 'question' | 'error';
+
 export interface PromptProvenance {
+  messageKind?: OrchestrationMessageKind;
   actor: PromptActor;
   origin: PromptProvenanceOrigin;
   originSessionId?: string;
@@ -284,15 +292,17 @@ export function shouldBlockStartedSessionProviderSwitch(
  *
  * `fable` is the Fable tier above Opus (currently Fable 5.1). `fable-5` is the
  * pinned previous-generation Fable. Both run a 1M window natively.
+ *
+ * `haiku` is Haiku 5.5; `haiku-4-5` keeps Haiku 4.5 selectable.
  */
-export const CLAUDE_CODE_VARIANTS = ['fable', 'fable-5', 'opus', 'opus-4-8', 'opus-4-7', 'opus-4-6', 'sonnet', 'sonnet-4-6', 'haiku'] as const;
+export const CLAUDE_CODE_VARIANTS = ['fable', 'fable-5', 'opus', 'opus-5', 'opus-4-8', 'opus-4-7', 'opus-4-6', 'sonnet', 'sonnet-5', 'sonnet-4-6', 'haiku', 'haiku-4-5'] as const;
 
 /**
  * Resolves a configured model string to the SDK model value.
  *
  * Key behaviors:
- * - Canonical variants (opus, sonnet, haiku) are passed straight through — the
- *   SDK maps these to the current-generation model.
+ * - Canonical variants use an explicit model ID when mapped (Opus/Fable);
+ *   other aliases are passed through for the SDK to resolve.
  * - Pinned variants (opus-4-6, ...) are substituted for their full Anthropic
  *   model ID from CLAUDE_CODE_PINNED_SDK_MODELS, so they always resolve to a
  *   specific version regardless of what "latest" becomes.
@@ -307,6 +317,10 @@ export function resolveClaudeCodeModelVariant(configuredModel: string | undefine
 
   // Try parsing with ModelIdentifier
   const parsed = ModelIdentifier.tryParse(configured);
+  // Custom gateway models go to the SDK verbatim (no pinning, no [1m]); the
+  // user's router decides what they mean.
+  const customModel = parsed?.customClaudeModel ?? claudeCustomModelName(configured);
+  if (customModel) return customModel;
   if (parsed && isClaudeCodeFamily(parsed.provider)) {
     // baseVariant strips suffixes like -1m
     const variant = parsed.baseVariant as ClaudeCodeVariant;
@@ -354,6 +368,11 @@ export interface AIModel {
    * so a revoked credential never silently erases a selection (#916).
    */
   unavailable?: boolean;
+  /**
+   * Custom Claude gateway models only: the Anthropic model id whose
+   * capabilities this model shares (from Claude settings `modelPicker`).
+   */
+  behavesAs?: string;
 }
 
 export interface AIModelCost {
@@ -420,6 +439,8 @@ export interface SessionData {
   agentRole?: AgentRole;
   createdBySessionId?: string | null;
   messages: TranscriptViewMessage[];
+  /** Renderer-only: messages were dropped from memory; metadata is still current. */
+  messagesEvicted?: boolean;
   documentContext?: DocumentContext;
   workspacePath?: string;
   title?: string;
@@ -462,10 +483,16 @@ export interface SessionData {
     inputTokens: number;      // Cumulative input tokens across session lifetime
     outputTokens: number;     // Cumulative output tokens across session lifetime
     totalTokens: number;      // Total tokens (input + output)
+    // Cumulative prompt-cache reads/writes, disjoint from inputTokens (which is
+    // uncached input only). Absent on rows written before they were stored;
+    // read absent as 0. Per-provider semantics: tokenUsageAccumulation.ts.
+    cacheReadInputTokens?: number;
+    cacheCreationInputTokens?: number;
     // Internal Codex baseline tracking for cumulative SDK snapshots.
     // Not user-facing; used to convert provider-cumulative usage into per-session deltas.
-    providerCumulativeInputTokens?: number;
+    providerCumulativeInputTokens?: number;   // cache-inclusive
     providerCumulativeOutputTokens?: number;
+    providerCumulativeCachedInputTokens?: number;
     contextWindow?: number;   // Max context window size for the model (legacy, use currentContext)
     categories?: TokenUsageCategory[]; // Breakdown parsed from /context output (legacy, use currentContext)
     costUSD?: number;         // Total cost in USD (from SDK modelUsage)
@@ -565,9 +592,11 @@ export interface StreamChunk {
   // liveness -- the Git journal behind the menu-bar indicator -- can see the
   // call end. It carries the same `toolCall` object as that earlier chunk, so it
   // is a completion signal only, never a second tool call.
-  type: 'text' | 'tool_call' | 'tool_result' | 'tool_error' | 'error' | 'complete' | 'context_usage' | 'stream_edit_start' | 'stream_edit_content' | 'stream_edit_end' | 'pre_edit_snapshot' | 'post_edit_snapshot';
+  type: 'text' | 'tool_call' | 'tool_result' | 'tool_error' | 'error' | 'complete' | 'context_usage' | 'prompt_suggestion' | 'stream_edit_start' | 'stream_edit_content' | 'stream_edit_end' | 'pre_edit_snapshot' | 'post_edit_snapshot';
   content?: string;
   isSystem?: boolean; // For system messages like slash command output
+  /** Predicted next user prompt, for `prompt_suggestion` chunks. Ephemeral UI state, never transcript content. */
+  suggestion?: string;
   toolCall?: {
     id?: string;
     name: string;
@@ -592,6 +621,8 @@ export interface StreamChunk {
   isAuthError?: boolean; // True when error is an authentication failure (SDK first-class detection)
   isBedrockToolError?: boolean; // True when error is a Bedrock tool search error
   isServerError?: boolean; // True when error is a 500/internal server error (Claude may be down)
+  usageLimitResetsAtMs?: number; // A usage limit blocked the turn; when it resets (epoch ms). Drives auto-resume.
+  usageLimitType?: string; // The SDK's limit type for that block, e.g. 'five_hour'
   isCodexAuthRequired?: boolean; // True when a Codex app-server session was blocked because the user is not signed in to OpenAI
   isProcessCrash?: boolean; // True when the agent subprocess died from a native fault (#1361), so the turn must settle as errored despite the follow-up 'complete'
   isComplete?: boolean;
@@ -821,7 +852,7 @@ export type InteractivePromptStatus = 'pending' | 'resolved' | 'cancelled';
 /**
  * Permission request message - persisted when SDK needs tool approval
  */
-export interface PermissionRequestContent {
+export interface PermissionRequestContent extends PermissionPromptHints {
   type: 'permission_request';
   requestId: string;
   toolName: string;

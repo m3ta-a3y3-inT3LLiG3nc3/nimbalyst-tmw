@@ -41,7 +41,7 @@ import {
   type TrackerRoomConfig,
   type TrackerPresenceParticipant,
   type LabelsMap,
-} from '@nimbalyst/runtime/sync';
+} from '@nimbalyst/tracker-engine';
 import { asTeamJwt, asTeamMemberId, type TrackerItem } from '@nimbalyst/runtime';
 import { trackerItemToRecord } from '@nimbalyst/runtime/core/TrackerRecord';
 import WebSocket from 'ws';
@@ -53,15 +53,9 @@ import { getOrgScopedIdentity, getOrgScopedJwt, listMembers, resolveTeamForWorks
 import { getCollabSyncWsUrl } from '../utils/collabSyncUrl';
 import { getDatabase } from '../database/initialize';
 import { TrackerPGLiteStore } from './tracker/TrackerPGLiteStore';
-import {
-  listUnsyncedTrackerSchemaDefs,
-  markTrackerSchemaDefRejected,
-} from './tracker/trackerTypeDefStore';
-import {
-  applyRemoteWorkspaceTrackerSchemaDef,
-  encodeTrackerSchemaDefForPush,
-  refreshWorkspaceSchemaLayer,
-} from './TrackerSchemaService';
+import { createDesktopTrackerSchemaSyncHooks } from './tracker/desktopTrackerSchemaSyncHooks';
+import { registerTrackerSchemaFlushHandler } from './tracker/trackerSchemaFlush';
+import { refreshWorkspaceSchemaLayer } from './TrackerSchemaService';
 import {
   applyRemoteWorkspaceTrackerNavigationEntry,
   registerTrackerNavigationFlushHandler,
@@ -89,6 +83,8 @@ import { AnalyticsService } from './analytics/AnalyticsService';
 import { sendTeamAnalyticsEvent } from './analytics/TeamAnalytics';
 import { CollaborationHealthAttemptTracker } from '../../shared/analytics/collaborationHealth';
 import { bucketItemCount, categorizeTeamAnalyticsError, toStableAnalyticsCategory } from '../../shared/analytics/teamAnalytics';
+import { setBodyLinkHomeScope } from './tracker/trackerBodyLinks';
+import { refuseLocalWikiItem } from './localWiki/localWikiItemIds';
 
 // ============================================================================
 // Engine registry (per workspace)
@@ -145,6 +141,10 @@ registerTrackerSavedViewFlushHandler((workspacePath) =>
   engines.get(workspacePath)?.engine.flushSavedViews(),
 );
 
+registerTrackerSchemaFlushHandler((workspacePath) =>
+  engines.get(workspacePath)?.engine.flushSchemas(),
+);
+
 /**
  * In-flight `initializeTrackerSync` promises, keyed by workspace path.
  * Prevents two near-simultaneous callers (e.g. RepositoryManager +
@@ -163,6 +163,9 @@ const statusListeners = new Set<StatusListener>();
 
 type AppliedItemListener = (workspacePath: string, applied: AppliedTrackerItem) => void;
 const appliedItemListeners = new Set<AppliedItemListener>();
+
+type ConnectedListener = (workspacePath: string) => void;
+const connectedListeners = new Set<ConnectedListener>();
 
 function notifyStatus(status: TrackerSyncStatus): void {
   for (const cb of statusListeners) {
@@ -225,6 +228,22 @@ export function getTrackerSyncStatus(): TrackerSyncStatus {
 export function onTrackerItemApplied(listener: AppliedItemListener): () => void {
   appliedItemListeners.add(listener);
   return () => appliedItemListeners.delete(listener);
+}
+
+/**
+ * Observe a workspace's engine reaching `connected`, on every connect. Main-process
+ * work that must resume after an offline gap (creation-body publication) hangs
+ * off this rather than the aggregate status, which cannot say which workspace.
+ */
+export function onTrackerSyncWorkspaceConnected(listener: ConnectedListener): () => void {
+  connectedListeners.add(listener);
+  return () => connectedListeners.delete(listener);
+}
+
+/** Read an item through the workspace's sync store; null when the workspace has no engine. */
+export async function getTrackerItemForSync(workspacePath: string, itemId: string): Promise<TrackerItem | null> {
+  const entry = engines.get(workspacePath);
+  return entry ? entry.store.getTrackerItem(itemId) : null;
 }
 
 function currentAggregateStatus(): TrackerSyncStatus {
@@ -384,14 +403,7 @@ async function doInitializeTrackerSync(workspacePath: string): Promise<void> {
         });
       },
     },
-    schemaSync: {
-      // An override of a builtin goes out as a DELTA so each peer resolves it
-      // against its own builtin and keeps receiving shipped fields (#1178).
-      listUnsynced: async () =>
-        (await listUnsyncedTrackerSchemaDefs(workspacePath)).map(encodeTrackerSchemaDefForPush),
-      applyRemote: (def) => applyRemoteWorkspaceTrackerSchemaDef(workspacePath, def),
-      markRejected: (type) => markTrackerSchemaDefRejected(workspacePath, type),
-    },
+    schemaSync: createDesktopTrackerSchemaSyncHooks(workspacePath),
     navigationSync: {
       getMaxSyncId: () => getMaxTrackerNavigationSyncId(workspacePath),
       listUnsynced: () => listUnsyncedTrackerNavigationEntries(workspacePath),
@@ -433,6 +445,11 @@ async function doInitializeTrackerSync(workspacePath: string): Promise<void> {
         void backfillSharedLocalItems(workspacePath).catch(err => {
           logger.main.warn('[TrackerSyncManager] backfillSharedLocalItems failed for', workspacePath, err);
         });
+        for (const cb of connectedListeners) {
+          try { cb(workspacePath); } catch (err) {
+            logger.main.warn('[TrackerSyncManager] connected listener threw:', err);
+          }
+        }
       }
     },
     onPresenceChange: (members) => {
@@ -520,6 +537,8 @@ async function doInitializeTrackerSync(workspacePath: string): Promise<void> {
   logger.main.info('[TrackerSyncManager] creating engine for', workspacePath, 'roomId:', `org:${team.orgId}:tracker:${team.teamProjectId}`);
 
   const engine = new TrackerSyncEngine(config);
+  // Body links to another team project are not this workspace's relations.
+  setBodyLinkHomeScope(workspacePath, { orgId: team.orgId, projectId: team.teamProjectId });
   engines.set(workspacePath, {
     workspacePath,
     orgId: team.orgId,
@@ -683,6 +702,8 @@ export async function ensureTrackerSyncForWorkspace(workspacePath: string): Prom
  * caller is expected to consult `isTrackerSyncActive` first).
  */
 export async function syncTrackerItem(item: TrackerItem): Promise<void> {
+  // A Local wiki item is a file, never a room item.
+  refuseLocalWikiItem(item?.id, 'team sync');
   const workspacePath = item.workspace;
   const entry = workspacePath ? engines.get(workspacePath) : undefined;
   if (!entry) return;
@@ -692,6 +713,7 @@ export async function syncTrackerItem(item: TrackerItem): Promise<void> {
 }
 
 export async function unsyncTrackerItem(itemId: string, workspacePath?: string): Promise<void> {
+  refuseLocalWikiItem(itemId, 'team sync');
   if (!workspacePath) {
     // Best-effort: try every engine. v1 callers occasionally omit the
     // workspace path; we want them to keep working without surprises.
@@ -974,13 +996,7 @@ export function registerTrackerSyncHandlers(): void {
             avatarUrl: payload.avatarUrl ?? null,
           },
           persistence,
-          schemaSync: {
-                  listUnsynced: async () =>
-              (await listUnsyncedTrackerSchemaDefs(workspacePath)).map(
-                encodeTrackerSchemaDefForPush,
-              ),
-            applyRemote: (def) => applyRemoteWorkspaceTrackerSchemaDef(workspacePath, def),
-          },
+          schemaSync: createDesktopTrackerSchemaSyncHooks(workspacePath),
           navigationSync: {
             getMaxSyncId: () => getMaxTrackerNavigationSyncId(workspacePath),
             listUnsynced: () => listUnsyncedTrackerNavigationEntries(workspacePath),
@@ -1017,6 +1033,7 @@ export function registerTrackerSyncHandlers(): void {
         };
 
         const engine = new TrackerSyncEngine(config);
+        setBodyLinkHomeScope(workspacePath, { orgId: payload.orgId, projectId: payload.teamProjectId });
         engines.set(workspacePath, {
           workspacePath,
           orgId: payload.orgId,

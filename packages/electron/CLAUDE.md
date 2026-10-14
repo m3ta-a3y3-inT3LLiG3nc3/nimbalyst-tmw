@@ -4,20 +4,20 @@ The Nimbalyst desktop app, built with Electron.
 
 ## Development Commands
 
-- **Dev server**: `npm run dev` (user runs this — don't do it yourself)
-- **Dev with restart loop**: `npm run dev:loop` (enables restart button / `/restart` command)
-- **Build for Mac**: `npm run build:mac:local` or `npm run build:mac:notarized`
-- **Auth callbacks in dev**: no URL-handler setup is required, including for `npm run dev:user2`. Every sign-in flow uses a nonce-protected one-shot listener on `127.0.0.1` owned by the instance that started it.
-- **Other deep links in dev (macOS)**: `npm run dev:url-handler` (from the repo root) points non-auth `nimbalyst://` links at this checkout. The applet in `scripts/install-dev-url-handler.sh` is not part of authentication. The dev app deliberately does *not* claim the scheme itself because all development copies share Electron's `com.github.Electron` bundle id. See `src/main/utils/protocolRegistration.ts`.
+- **Dev server**: `pnpm run dev` (user runs this — don't do it yourself)
+- **Dev with restart loop**: `pnpm run dev:loop` (enables restart button / `/restart` command)
+- **Build for Mac**: `pnpm run build:mac:local` or `pnpm run build:mac:notarized`
+- **Auth callbacks in dev**: no URL-handler setup is required, including for `pnpm run dev:user2`. Every sign-in flow uses a nonce-protected one-shot listener on `127.0.0.1` owned by the instance that started it.
+- **Other deep links in dev (macOS)**: `pnpm run dev:url-handler` (from the repo root) points non-auth `nimbalyst://` links at this checkout. The applet in `scripts/install-dev-url-handler.sh` is not part of authentication. The dev app deliberately does *not* claim the scheme itself because all development copies share Electron's `com.github.Electron` bundle id. See `src/main/utils/protocolRegistration.ts`.
 
 ### Testing
 
 From the repository root:
-- Run one spec: `npx playwright test e2e/monaco/file-watcher-updates.spec.ts`
-- Run a directory: `npx playwright test e2e/monaco/`
-- Run all: `npx playwright test`
+- Run one spec: `pnpm exec playwright test e2e/monaco/file-watcher-updates.spec.ts`
+- Run a directory: `pnpm exec playwright test e2e/monaco/`
+- Run all: `pnpm exec playwright test`
 
-**Always use `npx playwright test` directly.** Never use parallel execution — it corrupts PGLite. See [/docs/E2E_TESTING.md](/docs/E2E_TESTING.md).
+**Always use `pnpm exec playwright test` directly.** Never use parallel execution — it corrupts PGLite. See [/docs/E2E_TESTING.md](/docs/E2E_TESTING.md).
 
 ## Architecture
 
@@ -52,12 +52,7 @@ For deep IPC patterns (`safeHandle`/`safeOn`, error handling, channel structure)
 
 ## Data Persistence
 
-The app runs over **either PGLite (PostgreSQL in WebAssembly) or better-sqlite3** — both backends are active during the in-progress migration. Code must work on either; do not assume one. **Never use `localStorage` in the renderer.** Persist via IPC to main using:
-- **app-settings store** (`src/main/utils/store.ts`) for global app settings
-- **workspace-settings store** for per-project state
-- **AppDatabase** (PGLite or SQLite, selected at init) for complex data (AI sessions, document history, trackers)
-
-The biggest divergence to remember: `data->'key'` returns a parsed object on PGLite but a JSON string on SQLite. For tables, locations, shutdown rules, timestamp handling, and the full list of backend-divergent behaviors, see [DATABASE.md](./DATABASE.md).
+Three stores, all reached from the renderer through IPC: the **app-settings store** (`src/main/utils/store.ts`) for global settings, the **workspace-settings store** for per-project state, and **AppDatabase** (PGLite or SQLite, selected at init) for sessions, document history, and trackers. The dual-backend rules are in the root CLAUDE.md and [DATABASE.md](./DATABASE.md).
 
 ## Renderer State Architecture
 
@@ -77,12 +72,10 @@ For full patterns, see [/docs/EDITOR_STATE.md](/docs/EDITOR_STATE.md) and [/docs
 
 ## Logging
 
-Three log destinations:
+- **Main process log**: `~/Library/Application Support/@nimbalyst/electron/logs/main.log`, with categories like `(MAIN)`, `(AI)`, `(API)`, `(SYNC)`.
+- **Renderer console log** (dev mode only): `~/Library/Application Support/@nimbalyst/electron/nimbalyst-debug.log`.
 
-- **Main process log**: `~/Library/Application Support/@nimbalyst/electron/logs/main.log` — main-process events, AI, sync, file ops; categories like `(MAIN)`, `(AI)`, `(API)`, `(SYNC)`.
-- **Renderer console log** (dev mode only): `~/Library/Application Support/@nimbalyst/electron/nimbalyst-debug.log` — captured via `webContents.on('console-message')` in `src/main/index.ts`.
-
-Use the agent log access tools (`get_main_process_logs`, `get_renderer_debug_logs`) instead of asking users to paste logs. See [/docs/DEBUGGING_LOGS.md](/docs/DEBUGGING_LOGS.md).
+Read them with `get_main_process_logs` and `get_renderer_debug_logs`. See [/docs/DEBUGGING_LOGS.md](/docs/DEBUGGING_LOGS.md).
 
 ## Window State Persistence
 
@@ -117,7 +110,7 @@ Provider implementations live in `packages/runtime` — see `/packages/runtime/C
 ## macOS Code Signing & Notarization
 
 - **Certificate**: Developer ID Application
-- **Builds**: `npm run build:mac:notarized` (notarized), `build:mac:local` (local testing)
+- **Builds**: `pnpm run build:mac:notarized` (notarized), `build:mac:local` (local testing)
 - **Bundled tools**: ripgrep is signed; JAR files are excluded automatically (can't be notarized)
 - **Entitlements**: hardened runtime with necessary exceptions
 

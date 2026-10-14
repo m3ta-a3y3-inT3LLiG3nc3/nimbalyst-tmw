@@ -14,10 +14,18 @@
  * schema loading or `tracker_define_type`. The table may not exist yet on a
  * database that hasn't run the v12 migration, so callers tolerate errors.
  */
-import type { TrackerDataModel } from '@nimbalyst/runtime/plugins/TrackerPlugin/models';
+import {
+  declarationForResolvedModel,
+  encodeTrackerSchemaModelPayload,
+  globalRegistry,
+  TRACKER_SCHEMA_DECLARED_FORM_KEY,
+  type DerivedTrackerTypeDeclaration,
+  type TrackerDataModel,
+} from '@nimbalyst/runtime/plugins/TrackerPlugin/models';
 import { getDatabase } from '../../database/initialize';
 import { logger } from '../../utils/logger';
 import { appendActivity } from './trackerActivity';
+import { requestTrackerSchemaFlush } from './trackerSchemaFlush';
 
 /**
  * Minimal DB surface these writes need (PGLite or better-sqlite3). Injectable so
@@ -51,6 +59,7 @@ interface TypeDefOwnershipRow {
   sync_id: number | null;
   model: string;
   synced_model: string | null;
+  sync_status: string | null;
 }
 
 async function readOwnership(
@@ -59,7 +68,7 @@ async function readOwnership(
   type: string,
 ): Promise<TypeDefOwnershipRow | null> {
   const result = (await db.query(
-    `SELECT sync_id, model, synced_model FROM tracker_type_defs
+    `SELECT sync_id, model, synced_model, sync_status FROM tracker_type_defs
       WHERE workspace = $1 AND type = $2`,
     [workspace, type],
   )) as { rows?: TypeDefOwnershipRow[] } | undefined;
@@ -69,14 +78,44 @@ async function readOwnership(
 /** Compare two stored/JSON models for semantic equality (key order ignored). */
 function sameModel(a: unknown, b: unknown): boolean {
   const parse = (v: unknown): unknown => {
-    if (typeof v !== 'string') return v;
+    if (typeof v !== 'string') return withoutDeclaredForm(v);
     try {
-      return JSON.parse(v);
+      return withoutDeclaredForm(JSON.parse(v));
     } catch {
       return v;
     }
   };
   return canonicalize(parse(a)) === canonicalize(parse(b));
+}
+
+/**
+ * A subtype's declaration rides beside its resolved model in the `model`
+ * column. It is bookkeeping for re-resolution, not schema content, so it never
+ * makes two rows differ.
+ */
+function withoutDeclaredForm(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const { [TRACKER_SCHEMA_DECLARED_FORM_KEY]: _declared, ...rest } = value as Record<string, unknown>;
+  return rest;
+}
+
+/**
+ * The `model` column for a resolved model: a subtype carries its declaration
+ * (the one already beside it, the one in force, or one recovered from the
+ * base), so restart registers the declaration and not this frozen copy.
+ */
+function storedModelJson(model: TrackerDataModel): string {
+  const { [TRACKER_SCHEMA_DECLARED_FORM_KEY]: carried, ...resolved } =
+    model as TrackerDataModel & Record<string, unknown>;
+  const resolvedModel = resolved as unknown as TrackerDataModel;
+  if (!resolvedModel.extends) return JSON.stringify(model);
+  const registered = globalRegistry.getDeclaredModel(resolvedModel.type);
+  const declared = declarationForResolvedModel(
+    resolvedModel,
+    (carried as DerivedTrackerTypeDeclaration | undefined)
+      ?? (registered?.extends === resolvedModel.extends ? registered : undefined),
+  );
+  return encodeTrackerSchemaModelPayload(resolvedModel, declared);
 }
 
 export interface MaterializeYamlOptions {
@@ -119,7 +158,7 @@ function schemaWithoutActivity(model: unknown): unknown {
     }
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return parsed;
-  const { activity: _activity, ...schema } = parsed as Record<string, unknown>;
+  const { activity: _activity, [TRACKER_SCHEMA_DECLARED_FORM_KEY]: _declared, ...schema } = parsed as Record<string, unknown>;
   return schema;
 }
 
@@ -218,7 +257,7 @@ export async function materializeYamlTrackerTypeDef(
                 synced_model = NULL,
                 deleted_at = NULL
           WHERE workspace = $1 AND type = $2`,
-        [workspace, model.type, JSON.stringify(attributedModel)],
+        [workspace, model.type, storedModelJson(attributedModel)],
       );
       return;
     }
@@ -229,6 +268,15 @@ export async function materializeYamlTrackerTypeDef(
           options.activity.authorIdentity,
           options.activity.action,
           options.activity.details,
+        );
+      }
+      if (row?.sync_status === 'rejected' && !schemaUnchanged) {
+        // The room refused the content this row carried. An edited file is a
+        // new attempt; reloading the same file is not, and would be refused again.
+        await db.query(
+          `UPDATE tracker_type_defs SET sync_status = 'local'
+            WHERE workspace = $1 AND type = $2`,
+          [workspace, model.type],
         );
       }
       await materializeTrackerTypeDef(workspace, attributedModel, 'yaml', dbOverride);
@@ -259,8 +307,9 @@ export async function materializeYamlTrackerTypeDef(
       `UPDATE tracker_type_defs
           SET model = $3, updated = NOW(), sync_status = 'pending', deleted_at = NULL
         WHERE workspace = $1 AND type = $2`,
-      [workspace, model.type, JSON.stringify(attributedModel)],
+      [workspace, model.type, storedModelJson(attributedModel)],
     );
+    requestTrackerSchemaFlush(workspace);
   } catch (err) {
     logger.main.warn('[trackerTypeDefStore] materializeYaml failed for', model.type, err);
   }
@@ -319,8 +368,11 @@ export async function materializeTrackerTypeDef(
              source = EXCLUDED.source,
              updated = NOW(),
              deleted_at = NULL`,
-      [typeDefId(workspace, model.type), workspace, model.type, JSON.stringify(model), source],
+      [typeDefId(workspace, model.type), workspace, model.type, storedModelJson(model), source],
     );
+    // A new row enters the outbox at 'local'; an existing row keeps its status,
+    // so for it this is a no-op push.
+    requestTrackerSchemaFlush(workspace);
   } catch (err) {
     logger.main.warn('[trackerTypeDefStore] materialize failed for', model.type, err);
   }
@@ -503,7 +555,7 @@ export function classifyTrackerSchemaDrift(
     if (yaml && db) {
       let dbCanon: string;
       try {
-        dbCanon = canonicalize(JSON.parse(db.model));
+        dbCanon = canonicalize(withoutDeclaredForm(JSON.parse(db.model)));
       } catch {
         dbCanon = '';
       }
@@ -619,6 +671,28 @@ export async function listRetractedTeamOwnedTrackerTypes(
     logger.main.warn('[trackerTypeDefStore] listRetracted failed for', workspace, err);
     return [];
   }
+}
+
+/**
+ * Whether the team's room can hold an item of this type: a builtin this build
+ * seeds as a team type (every client carries it), or a definition the room
+ * has delivered and not retracted. A local YAML type that was never pushed, or
+ * was refused, is not.
+ */
+export async function isTrackerTypeConfirmedByTeam(
+  workspace: string,
+  type: string,
+  dbOverride?: TypeDefDb,
+): Promise<boolean> {
+  if (globalRegistry.getBuiltinModel(type)?.sharing === 'team') return true;
+  const db = dbOverride ?? getDatabase();
+  if (!db) return false;
+  const result = (await db.query(
+    `SELECT sync_id FROM tracker_type_defs
+      WHERE workspace = $1 AND type = $2 AND sync_id IS NOT NULL AND deleted_at IS NULL`,
+    [workspace, type],
+  )) as { rows?: unknown[] } | undefined;
+  return (result?.rows?.length ?? 0) > 0;
 }
 
 /** True when the team's schema room has a version of this type. */
@@ -777,28 +851,22 @@ export interface UnsyncedTrackerSchemaDef {
   /** JSON model, or null when this is a pending deletion (tombstone). */
   model: string | null;
   deleted: boolean;
+  /**
+   * Set for a type the room has never held (`sync_id` NULL after this
+   * connection's bootstrap): sent create-only, so it is refused rather than
+   * written over a definition another client created meanwhile. An older room
+   * gets the plain upsert it always got.
+   */
+  createOnly?: 'whenSupported';
 }
 
-/**
- * The push-side outbox: locally-originated schema rows whose changes have not
- * yet been pushed to peers (`sync_status` in 'local' | 'pending'). A pending
- * deletion (deleted_at set) surfaces with `model = null` so the push path can
- * emit a tombstone. `source = 'sync'` rows are stamped 'synced' and excluded —
- * they came FROM a peer and must never be echoed back.
- *
- * Sharing gate: a type whose model declares `sharing: 'personal'` never leaves
- * the machine — its override (or override-deletion) is filtered out here, the
- * single push choke point. The `model` column retains the last-known JSON even
- * for a tombstoned row, so sharing is readable for deletions too. Types with no
- * explicit sharing value keep their prior behavior (not filtered) so this never
- * silently stops an existing custom type from syncing.
- */
 /**
  * Retire a schema change the server refused for good.
  *
  * `listUnsyncedTrackerSchemaDefs` selects `sync_status IN ('local','pending')`,
  * so `'rejected'` drops this type out of the push queue while leaving the local
- * model intact. No migration: `sync_status` is a plain TEXT column.
+ * model intact. No migration: `sync_status` is a plain TEXT column. An edit to
+ * the YAML file puts the row back in the queue (`materializeYamlTrackerTypeDef`).
  */
 export async function markTrackerSchemaDefRejected(
   workspace: string,
@@ -818,6 +886,21 @@ export async function markTrackerSchemaDefRejected(
   }
 }
 
+/**
+ * The push-side outbox: locally-originated schema rows whose changes have not
+ * yet been pushed to peers (`sync_status` in 'local' | 'pending'). A pending
+ * deletion (deleted_at set) surfaces with `model = null` so the push path can
+ * emit a tombstone. `source = 'sync'` rows are stamped 'synced' and excluded —
+ * they came FROM a peer and must never be echoed back.
+ *
+ * Sharing gate: a type whose model declares `sharing: 'personal'` never leaves
+ * the machine — its override (or override-deletion) is filtered out here, the
+ * single push choke point. The `model` column retains the last-known JSON even
+ * for a tombstoned row, so sharing is readable for deletions too. A stored model
+ * with no sharing value is not filtered here, but none arrives from YAML: the
+ * parser fills in `personal` for a file with no `sharing:` key, so such a file
+ * stays on this machine.
+ */
 export async function listUnsyncedTrackerSchemaDefs(
   workspace: string,
   dbOverride?: TypeDefDb,
@@ -826,17 +909,19 @@ export async function listUnsyncedTrackerSchemaDefs(
     const db = dbOverride ?? getDatabase();
     if (!db) return [];
     const result = (await db.query(
-      `SELECT type, model, deleted_at FROM tracker_type_defs
+      `SELECT type, model, deleted_at, sync_id FROM tracker_type_defs
         WHERE workspace = $1 AND sync_status IN ('local', 'pending')`,
       [workspace],
-    )) as { rows?: Array<{ type: string; model: string; deleted_at: string | null }> } | undefined;
+    )) as { rows?: Array<{ type: string; model: string; deleted_at: string | null; sync_id: number | null }> } | undefined;
     const out: UnsyncedTrackerSchemaDef[] = [];
     for (const r of result?.rows ?? []) {
       if (schemaSharingIsPersonal(r.model)) continue;
+      const deleted = r.deleted_at != null;
       out.push({
         type: r.type,
-        model: r.deleted_at ? null : r.model,
-        deleted: r.deleted_at != null,
+        model: deleted ? null : r.model,
+        deleted,
+        ...(!deleted && r.sync_id == null ? { createOnly: 'whenSupported' as const } : {}),
       });
     }
     return out;
@@ -914,6 +999,7 @@ export async function removeTrackerTypeDef(
        WHERE workspace = $1 AND type = $2 AND deleted_at IS NULL`,
       [workspace, type],
     );
+    requestTrackerSchemaFlush(workspace);
   } catch (err) {
     logger.main.warn('[trackerTypeDefStore] remove failed for', type, err);
   }

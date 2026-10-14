@@ -1,4 +1,9 @@
-import Store from 'electron-store';
+import type { StoredProjectAppearance } from '../../shared/projectAppearance';
+import { normalizeAIProviderOverrides } from './normalizeAIProviderOverrides';
+export { normalizeAIProviderOverrides } from './normalizeAIProviderOverrides';
+import { getProviderCredentials, subscribeProviderCredentialChanges } from '../services/credentials/providerCredentials';
+import { SAVED_CREDENTIAL } from '../../shared/providerCredentials';
+import Store from './privateSettingsStore';
 import { execSync } from 'child_process';
 import { existsSync } from 'fs';
 import * as path from 'path';
@@ -16,7 +21,7 @@ import {
   LAST_SELECTED_ORG_SETTING_KEY,
   ORG_PROJECT_WALK_DISMISSED_SETTING_KEY,
 } from '../../shared/orgProjectWalk';
-import { normalizeCodexProviderConfig, omitModelsField } from '@nimbalyst/runtime/ai/server/utils/modelConfigUtils';
+import { omitModelsField } from '@nimbalyst/runtime/ai/server/utils/modelConfigUtils';
 import { planWorkstreamStatePrune } from './workstreamStatePrune';
 import type { OpenCodeModelCatalogCache } from '@nimbalyst/runtime/ai/server';
 
@@ -86,6 +91,7 @@ export const DEFAULT_DATABASE_MAINTENANCE: DatabaseMaintenanceSettings = {
 export type TrayStripStyle = FleetStatusStyle;
 
 interface AppStoreSchema {
+  mobileSettingsVersion?: number;
   theme: AppTheme;
   themeIsDark?: boolean; // Whether the current theme is dark (used for extension themes)
   // The active theme's resolved --nim-bg, reported by the renderer once it has
@@ -167,6 +173,9 @@ interface AppStoreSchema {
   extensionProjectIntroShown?: boolean;
   // Extension settings (enabled/disabled state and configuration)
   extensionSettings?: Record<string, ExtensionSettings>;
+  // Last applied version of the one-time migration that pins legacy
+  // defaultEnabled:false Claude plugins on (see claudePluginDefaultEnabledMigration.ts).
+  claudePluginDefaultEnabledMigrationVersion?: number;
   // Global-scope privileged-extension capability grants ("Enable for all workspaces").
   // Workspace-scope grants live on WorkspaceState.extensionPermissionGrants.
   // See packages/electron/src/main/extensions/permissionGrantStore.ts for the
@@ -463,6 +472,7 @@ export interface SessionHistoryLayout {
   collapsed: boolean;
   collapsedGroups: string[];
   sortOrder?: 'updated' | 'created';
+  compactRows?: boolean;
 }
 
 /**
@@ -525,6 +535,11 @@ export type { OnboardingConfig } from '../../shared/types/workspace';
 export type AgentFileScopeMode = 'current-changes' | 'session-files' | 'all-changes';
 
 export interface WorkspaceState {
+  remoteSessionDrafts?: Record<string, { text: string; options?: import("@nimbalyst/runtime/sync/types").RemoteTurnOptions; attachments: import("@nimbalyst/runtime/ai/server/types").ChatAttachment[] }>;
+  /** Explicit Cloudflare choices for this project; authentication stays in Wrangler. */
+  cloudflareSandboxSelection?: { profileName: string; accountId: string | null };
+  /** When the Personal Home page was seeded; set once so a removed Home stays removed. */
+  personalPagesHomeSeededAt?: number;
   workspacePath: string;
   /**
    * Additional top-level folders attached to this workspace, as absolute paths.
@@ -580,6 +595,8 @@ export interface WorkspaceState {
     // Stable first-class folder id most recently used. Null means Team root.
     lastSharedFolderId?: string | null;
   };
+  /** Pages-mode sidebar sections the user collapsed or expanded; unset = default. */
+  pagesSidebarCollapsed?: { team?: boolean; personal?: boolean };
   collabPendingUpdates?: Record<string, {
     mergedUpdateBase64: string;
     updatedAt: number;
@@ -649,6 +666,7 @@ export interface WorkspaceState {
   // within the org when the workspace was added to one that already existed;
   // absent means the org's primary project.
   localOrgBinding?: { orgId: string; teamProjectId?: string };
+  projectAppearance?: StoredProjectAppearance;
   // Hidden gutter buttons (navigation sidebar)
   hiddenGutterButtons?: string[];
   // Tracker automation override for this project (undefined fields inherit from global)
@@ -754,6 +772,7 @@ function getWorkspaceStore(): Store<Record<string, WorkspaceState>> {
  * Every write goes through `writeWorkspaceEntry`, which keeps the two in step.
  */
 let _workspaceStoreCache: Record<string, WorkspaceState> | null = null;
+subscribeProviderCredentialChanges(() => { _workspaceStoreCache = null; });
 
 function readWorkspaceStore(): Record<string, WorkspaceState> {
   if (!_workspaceStoreCache) {
@@ -948,6 +967,7 @@ function createDefaultWorkspaceState(workspacePath: string): WorkspaceState {
     agenticCodingWindowState: undefined,
     activeMode: undefined,
     sidebarWidth: 240,
+    projectAppearance: {},
     recentDocuments: [],
     tabs: { ...DEFAULT_TAB_MANAGER_STATE },
     agenticTabs: undefined,
@@ -967,6 +987,7 @@ function createDefaultWorkspaceState(workspacePath: string): WorkspaceState {
       expandedFolders: [],
       customFolders: [],
     },
+    pagesSidebarCollapsed: undefined,
     collabPendingUpdates: {},
     trackerSharingMigration: undefined,
     trackerSharingMigrationSeenAt: undefined,
@@ -1276,6 +1297,21 @@ export function getWorkspaceState(workspacePath: string): WorkspaceState {
   return cloneWorkspaceState(ensureWorkspaceState(workspacePath));
 }
 
+/**
+ * One top-level field, cloned on its own. getWorkspaceState merges and clones the
+ * whole entry, which holds hundreds of KB of workstream UI state, so team
+ * resolution paid for all of it on every lookup. Only for fields that
+ * normalizeWorkspaceState passes through unchanged; attachedFolders is sanitized.
+ */
+export function getWorkspaceStateField<K extends 'localOrgBinding'>(
+  workspacePath: string,
+  field: K,
+): WorkspaceState[K] {
+  const raw = readWorkspaceStore()[workspaceKey(workspacePath)];
+  const value = raw?.[field] !== undefined ? raw[field] : createDefaultWorkspaceState(workspacePath)[field];
+  return value === undefined ? value : structuredClone(value);
+}
+
 export function setWorkspaceState(workspacePath: string, state: WorkspaceState): WorkspaceState {
   return cloneWorkspaceState(persistWorkspaceState(workspacePath, state));
 }
@@ -1552,13 +1588,20 @@ export function saveAgentFileScopeMode(workspacePath: string, mode: AgentFileSco
 
 // AI Provider Override State Management
 export function getAIProviderOverrides(workspacePath: string): AIProviderOverrides | undefined {
-  const overrides = getWorkspaceState(workspacePath).aiProviderOverrides;
-  return normalizeAIProviderOverrides(overrides);
+  const credentials = getProviderCredentials().snapshot().credentials;
+  const overrides = structuredClone(getWorkspaceState(workspacePath).aiProviderOverrides ?? {});
+  for (const config of Object.values(overrides.providers ?? {})) delete config.apiKey;
+  for (const credential of credentials) {
+    if (credential.workspacePath !== path.normalize(workspacePath).replace(/\/+$/, '')) continue;
+    overrides.providers ??= {};
+    overrides.providers[credential.name] ??= {};
+    overrides.providers[credential.name].apiKey = SAVED_CREDENTIAL;
+  }
+  return Object.keys(overrides).length ? normalizeAIProviderOverrides(overrides) : undefined;
 }
 
 /**
- * Lazily-opened `ai-settings` electron-store (where provider API keys live —
- * `apiKeys`). Separate from the `app-settings` store exported as `store`.
+ * Lazily-opened non-secret AI settings, separate from the global app settings.
  */
 let _aiSettingsStore: Store<Record<string, unknown>> | null = null;
 export function getAiSettingsStore(): Store<Record<string, unknown>> {
@@ -1570,38 +1613,46 @@ export function getAiSettingsStore(): Store<Record<string, unknown>> {
 
 /**
  * Resolve a provider API key from EXPLICIT settings only — a per-workspace
- * project override if present, else the global `ai-settings` `apiKeys[providerId]`.
+ * project override if present, else the global encrypted credential.
  * NEVER reads `process.env` (CLAUDE.md no-implicit-env-key rule). Returns null
  * when not configured. Mirrors `AIService.getApiKeyForProvider` so the
  * backend-module `getApiKey` broker hands an extension engine the same key the
- * AI providers use (the key lives in `ai-settings`, NOT `app-settings`).
+ * AI providers use.
  */
-export function getProviderApiKeyFromSettings(
-  providerId: string,
-  workspacePath?: string
-): string | null {
-  if (workspacePath) {
-    const overrideKey = getAIProviderOverrides(workspacePath)?.providers?.[providerId]?.apiKey;
-    if (typeof overrideKey === 'string' && overrideKey.length > 0) {
-      return overrideKey;
-    }
-  }
-  const apiKeys = getAiSettingsStore().get('apiKeys') as Record<string, string> | undefined;
-  const key = apiKeys?.[providerId];
-  return typeof key === 'string' && key.length > 0 ? key : null;
+export function getProviderApiKeyFromSettings(providerId: string, workspacePath?: string): string | null {
+  const credentials = getProviderCredentials();
+  const override = workspacePath ? credentials.get(providerId, { workspacePath }) : undefined;
+  return override ?? credentials.get(providerId === 'claude' ? 'anthropic' : providerId) ?? null;
 }
 
 export function saveAIProviderOverrides(workspacePath: string, overrides: AIProviderOverrides | undefined): void {
-  const normalizedOverrides = normalizeAIProviderOverrides(overrides);
-  updateWorkspaceState(workspacePath, workspace => {
-    workspace.aiProviderOverrides = normalizedOverrides;
-  });
+  const next = structuredClone(normalizeAIProviderOverrides(overrides));
+  const snapshot = getProviderCredentials().snapshot();
+  if (snapshot.state !== 'available') throw new Error(snapshot.message);
+  for (const credential of snapshot.credentials) {
+    if (credential.workspacePath === path.normalize(workspacePath).replace(/\/+$/, '') && !Object.prototype.hasOwnProperty.call(next?.providers ?? {}, credential.name)) {
+      getProviderCredentials().delete(credential.name, { workspacePath });
+    }
+  }
+  for (const [name, config] of Object.entries(next?.providers ?? {})) {
+    if (config.apiKey !== undefined && config.apiKey !== SAVED_CREDENTIAL) {
+      if (config.apiKey) getProviderCredentials().set(name, config.apiKey, { workspacePath });
+      else getProviderCredentials().delete(name, { workspacePath });
+    }
+    delete config.apiKey;
+  }
+  updateWorkspaceState(workspacePath, workspace => { workspace.aiProviderOverrides = next; });
 }
 
 export function clearAIProviderOverrides(workspacePath: string): void {
-  updateWorkspaceState(workspacePath, workspace => {
-    delete workspace.aiProviderOverrides;
-  });
+  const snapshot = getProviderCredentials().snapshot();
+  if (snapshot.state !== 'available') throw new Error(snapshot.message);
+  for (const credential of snapshot.credentials) {
+    if (credential.workspacePath === path.normalize(workspacePath).replace(/\/+$/, '')) {
+      getProviderCredentials().delete(credential.name, { workspacePath });
+    }
+  }
+  updateWorkspaceState(workspacePath, workspace => { delete workspace.aiProviderOverrides; });
 }
 
 // Tracker Automation Override State Management
@@ -1668,42 +1719,6 @@ export function getEffectiveGhAccount(workspacePath?: string): string | undefine
     if (override) return override;
   }
   return getPrReviewDefaultGhAccount();
-}
-
-export function normalizeAIProviderOverrides(overrides: AIProviderOverrides | undefined): AIProviderOverrides | undefined {
-  if (!overrides || typeof overrides !== 'object') {
-    return overrides;
-  }
-
-  const providers = overrides.providers;
-  if (!providers || typeof providers !== 'object') {
-    return overrides;
-  }
-
-  const normalizedProviders = normalizeCodexProviderConfig(providers);
-  const codexConfig = normalizedProviders['openai-codex'];
-
-  // Drop an empty codex config entry (artifact of UI clearing the override).
-  if (codexConfig && Object.keys(codexConfig).length === 0) {
-    const { 'openai-codex': _removed, ...restProviders } = normalizedProviders;
-    if (Object.keys(restProviders).length === 0) {
-      const { providers: _unusedProviders, ...restOverrides } = overrides;
-      // Spreading the input keeps own-but-undefined keys (e.g. an explicit
-      // `customClaudeCodePath: undefined` from a "clear override" save), which
-      // would prevent the empty-overrides check below from collapsing the
-      // object back to `undefined`.
-      if (restOverrides.customClaudeCodePath === undefined) {
-        delete restOverrides.customClaudeCodePath;
-      }
-      return Object.keys(restOverrides).length > 0 ? restOverrides : undefined;
-    }
-    return { ...overrides, providers: restProviders };
-  }
-
-  return {
-    ...overrides,
-    providers: normalizedProviders,
-  };
 }
 
 // Community popup shown state for current process launch (non-persisted)
@@ -2206,8 +2221,24 @@ export function setExtensionProjectIntroShown(shown: boolean): void {
 }
 
 // Extension Settings Management
+//
+// Extension scans check every extension, and each `conf` get re-parses the whole
+// app-settings file (hundreds of KB, mostly provider model catalogs). Cache the
+// parsed value until conf emits 'change', which every in-process write does.
+let _extensionSettingsCache: Record<string, ExtensionSettings> | undefined;
+let _extensionSettingsCacheStore: Store<AppStoreSchema> | undefined;
+
 export function getExtensionSettings(): Record<string, ExtensionSettings> {
-  return getAppStore().get('extensionSettings', {});
+  const appStore = getAppStore();
+  if (!appStore.events) return appStore.get('extensionSettings', {});
+  if (_extensionSettingsCacheStore !== appStore) {
+    _extensionSettingsCacheStore = appStore;
+    _extensionSettingsCache = undefined;
+    appStore.events.on('change', () => { _extensionSettingsCache = undefined; });
+  }
+  _extensionSettingsCache ??= appStore.get('extensionSettings', {});
+  // Callers mutate the result before writing it back.
+  return structuredClone(_extensionSettingsCache);
 }
 
 export function setExtensionSettings(settings: Record<string, ExtensionSettings>): void {
@@ -2240,6 +2271,14 @@ export function setExtensionEnabled(extensionId: string, enabled: boolean): void
     settings[extensionId].enabled = enabled;
   }
   setExtensionSettings(settings);
+}
+
+export function getClaudePluginDefaultEnabledMigrationVersion(): number {
+  return getAppStore().get('claudePluginDefaultEnabledMigrationVersion', 0);
+}
+
+export function setClaudePluginDefaultEnabledMigrationVersion(version: number): void {
+  getAppStore().set('claudePluginDefaultEnabledMigrationVersion', version);
 }
 
 export function getClaudePluginEnabled(extensionId: string): boolean | undefined {

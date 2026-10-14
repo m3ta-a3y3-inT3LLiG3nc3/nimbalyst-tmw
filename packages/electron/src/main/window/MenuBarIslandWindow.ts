@@ -61,6 +61,8 @@ let dragging: { origin: { x: number; y: number }; displayId: number } | null = n
 let ignoringMouse = true;
 /** The fleet's half of the frame. `expanded` and `anchor` are main's, added on push. */
 let latestState: Omit<MenuBarIslandState, 'expanded' | 'anchor'> | null = null;
+/** Set once the app is quitting; never cleared, the process is on its way out. */
+let shutDown = false;
 let onSelectSession: ((sessionId: string, workspacePath: string) => void) | null = null;
 let onNewSession: (() => void) | null = null;
 let onOpenApp: (() => void) | null = null;
@@ -77,23 +79,25 @@ export function isMenuBarIslandSupported(): boolean {
 }
 
 function loadIslandRenderer(window: BrowserWindow): void {
+  // The island has its own lightweight entry (island.html); `mode` stays so
+  // anything reading the query still recognizes the window.
   const query: Record<string, string> = { mode: 'menu-bar-island', theme: getTheme() };
 
   if (process.env.NODE_ENV === 'development') {
     const devPort = process.env.VITE_PORT || '5273';
     const search = new URLSearchParams(query).toString();
-    void window.loadURL(`http://localhost:${devPort}/?${search}`);
+    void window.loadURL(`http://localhost:${devPort}/island.html?${search}`);
     return;
   }
 
   const appPath = app.getAppPath();
   let htmlPath: string;
   if (app.isPackaged) {
-    htmlPath = join(appPath, 'out/renderer/index.html');
+    htmlPath = join(appPath, 'out/renderer/island.html');
   } else if (appPath.includes('/out/main') || appPath.includes('\\out\\main')) {
-    htmlPath = join(appPath, '../renderer/index.html');
+    htmlPath = join(appPath, '../renderer/island.html');
   } else {
-    htmlPath = join(appPath, 'out/renderer/index.html');
+    htmlPath = join(appPath, 'out/renderer/island.html');
   }
   void window.loadFile(htmlPath, { query });
 }
@@ -176,7 +180,9 @@ function createIslandWindow(): BrowserWindow {
   // dark 760x460 slab over the top of the screen on every theme change (#4817).
   markWindowTransparent(window);
 
-  window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  // `skipTransformProcessType` keeps Electron from calling DockHide(), which
+  // `visibleOnFullScreen` otherwise does on macOS (see TrayPanelWindow).
+  window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
   window.setIgnoreMouseEvents(true, { forward: true });
 
   screen.on('display-metrics-changed', handleDisplayChange);
@@ -228,10 +234,10 @@ function createIslandWindow(): BrowserWindow {
     // see `requestInit`. Pushing here would land before React subscribes.
   }
 
-  // The tray panel found that creating a window with this shape can demote the
-  // app's activation policy, which strips the Dock icon and the Cmd+Tab entry
-  // for the whole app. Setting a policy rebuilds the Dock tile and discards the
-  // runtime icon, so the two calls belong together.
+  // Backstop against anything else demoting the app's activation policy, which
+  // strips the Dock icon and the Cmd+Tab entry for the whole app. Setting a
+  // policy rebuilds the Dock tile and discards the runtime icon, so the two
+  // calls belong together.
   if (process.platform === 'darwin') {
     app.setActivationPolicy('regular');
     applyDockIcon();
@@ -369,6 +375,8 @@ function handleDisplayChange(): void {
 export function showMenuBarIsland(state: Omit<MenuBarIslandState, 'expanded' | 'anchor'>): void {
   if (!isMenuBarIslandSupported()) return;
 
+  // A window built mid-quit keeps Electron from ever finishing the quit.
+  if (shutDown) return;
   latestState = state;
 
   if (!islandWindow || islandWindow.isDestroyed()) {
@@ -379,6 +387,12 @@ export function showMenuBarIsland(state: Omit<MenuBarIslandState, 'expanded' | '
   if (islandRendererReady && !islandWindow.isVisible()) islandWindow.showInactive();
   startPolling();
   pushState();
+}
+
+/** Close the island for good: the app is quitting or restarting. */
+export function shutdownMenuBarIsland(): void {
+  shutDown = true;
+  closeMenuBarIsland();
 }
 
 /** Tear the island down -- style switched away, or fleet status turned off. */

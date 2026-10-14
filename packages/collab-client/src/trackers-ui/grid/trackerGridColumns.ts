@@ -88,7 +88,7 @@ function formatValueParts(
 }
 
 /** Human-readable text for a stored value, by column render type. */
-function formatValue(
+export function formatValue(
   col: TrackerColumnDef,
   value: unknown,
   trackerType: string,
@@ -333,6 +333,39 @@ function keyLinkNode(
   ]);
 }
 
+/**
+ * A type page lists pages, where the title is what a reader reaches for. The
+ * Key cell stays the open affordance everywhere else; here the title opens too,
+ * since a local page has no key and would otherwise open only from an icon.
+ * Only the text is the link, so the rest of the cell still selects on click.
+ */
+function titleLinkNode(
+  createElement: HyperFunc<VNode>,
+  text: string,
+  itemId: string,
+  keyLink: KeyLinkOptions,
+): VNode {
+  const swallow = (e: MouseEvent): void => {
+    e.preventDefault();
+    e.stopPropagation();
+  };
+  return createElement(
+    'button',
+    {
+      type: 'button',
+      class: 'tracker-grid-cell-title-link',
+      title: text || 'Untitled',
+      // The grid focuses a cell on pointerdown; keep the click a pure open.
+      onPointerDown: swallow,
+      onClick: (e: MouseEvent) => {
+        swallow(e);
+        keyLink.onOpenDetail(itemId);
+      },
+    },
+    text || 'Untitled',
+  );
+}
+
 interface CellTemplateOptions {
   favorites?: FavoritesOptions;
   rowActions?: boolean;
@@ -353,7 +386,8 @@ function buildCellTemplate(
 
     // The title column carries its inline affordances, so it renders even when
     // the title itself is empty.
-    if ((favorites || rowActions) && (col.role === 'title' || col.id === 'title')) {
+    const titleOpens = keyLink?.titleOpens === true;
+    if ((favorites || rowActions || titleOpens) && (col.role === 'title' || col.id === 'title')) {
       const itemId = String(props.model?.[ROW_ITEM_ID] ?? '');
       return createElement('span', { class: 'tracker-grid-cell-title' }, [
         ...(favorites
@@ -364,7 +398,9 @@ function buildCellTemplate(
             favorites.onToggleFavorite,
           )]
           : []),
-        textNode(createElement, text),
+        titleOpens && keyLink
+          ? titleLinkNode(createElement, text, itemId, keyLink)
+          : textNode(createElement, text),
         ...(rowActions ? [contextMenuNode(createElement, 'title')] : []),
       ]);
     }
@@ -423,6 +459,8 @@ export interface KeyLinkOptions {
   onOpenDetail: (itemId: string) => void;
   /** Hover affordance inside the key cell; omit where documents are unavailable. */
   onOpenDocument?: (itemId: string) => void;
+  /** The title text opens the row too; set by a type page, where titles name pages. */
+  titleOpens?: boolean;
 }
 
 export interface BuildGridColumnsOptions {
@@ -462,6 +500,22 @@ export function buildGridActionsColumn(): ColumnRegular {
     sortable: false,
     readonly: true,
     cellTemplate: (createElement: HyperFunc<VNode>) => contextMenuNode(createElement, 'column'),
+  };
+}
+
+/** A read-only text column whose value the host computed into the row under `id`. */
+export function buildDerivedGridColumn(column: { id: string; label: string; width?: number }): ColumnRegular {
+  return {
+    prop: column.id,
+    name: column.label,
+    size: column.width ?? 200,
+    minSize: 60,
+    sortable: false,
+    readonly: true,
+    cellTemplate: (createElement: HyperFunc<VNode>, props: CellTemplateProp) => {
+      const text = String(props.model?.[column.id] ?? '');
+      return textNode(createElement, text, text);
+    },
   };
 }
 

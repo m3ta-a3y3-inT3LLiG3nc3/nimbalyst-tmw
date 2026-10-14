@@ -1,3 +1,6 @@
+import { ProjectAppearancePanel } from './panels/ProjectAppearancePanel';
+import { SAVED_CREDENTIAL } from '../../../shared/providerCredentials';
+import { ProviderCredentialsPanel } from '../GlobalSettings/panels/ProviderCredentialsPanel';
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useAtom, useAtomValue, useSetAtom } from 'jotai';
 import { usePostHog } from 'posthog-js/react';
@@ -40,6 +43,7 @@ import { NotificationsPanel } from '../GlobalSettings/panels/NotificationsPanel'
 import { VoiceModePanel } from './VoiceModePanel';
 import { MCPServersPanel } from '../GlobalSettings/panels/MCPServersPanel';
 import { ToolsMcpPanel } from './panels/ToolsMcpPanel';
+import { CloudflareSandboxesPanel } from './panels/CloudflareSandboxesPanel';
 import { ClaudeCodePluginsPanel } from '../GlobalSettings/panels/ClaudeCodePluginsPanel';
 import { ProjectPermissionsPanel } from './panels/ProjectPermissionsPanel';
 import { ProviderOverrideWrapper } from './panels/ProviderOverrideWrapper';
@@ -323,7 +327,8 @@ export function SettingsView({
   const [, updateAvailableModels] = useAtom(setAvailableModelsAtom);
 
   // Destructure for easier access (these update when atom updates)
-  const { providers, apiKeys, availableModels } = aiProviderSettings;
+  const { providers, availableModels } = aiProviderSettings;
+  const apiKeys = Object.fromEntries(Object.entries(aiProviderSettings.apiKeys).map(([name, value]) => [name, value === SAVED_CREDENTIAL ? '' : value]));
   const showDirectChatProviders = shouldShowDirectChatProviderSettings(
     advancedSettings.showDirectChatProviders,
     aiProviderSettings,
@@ -392,24 +397,20 @@ export function SettingsView({
   // Push navigation entry when settings category/scope changes (unified cross-mode navigation)
   const pushNavigationEntry = useSetAtom(pushNavigationEntryAtom);
   const isRestoringNavigation = useAtomValue(isRestoringNavigationAtom);
-  const lastNavigationRef = useRef<string | null>(null);
 
   useEffect(() => {
     // Don't push while restoring (going back/forward)
     if (isRestoringNavigation) return;
 
-    const navKey = `${selectedCategory}:${scope}`;
-    if (navKey !== lastNavigationRef.current) {
-      lastNavigationRef.current = navKey;
-      pushNavigationEntry({
-        mode: 'settings',
-        settings: {
-          category: selectedCategory,
-          scope: scope as any,
-        },
-      });
-    }
-  }, [selectedCategory, scope, pushNavigationEntry, isRestoringNavigation]);
+    pushNavigationEntry({
+      mode: 'settings',
+      settings: {
+        category: selectedCategory,
+        scope,
+        target: scope === 'project' ? projectTarget : undefined,
+      },
+    });
+  }, [selectedCategory, scope, projectTarget, pushNavigationEntry, isRestoringNavigation]);
 
   // When scope changes, ensure selected category is valid for that scope
   useEffect(() => {
@@ -668,7 +669,16 @@ export function SettingsView({
     ])
   );
 
+  const panelWorkspacePath = scope === 'project'
+    ? (projectTarget?.kind === 'workspace' ? projectTarget.workspacePath : undefined)
+    : workspacePath;
+  const panelWorkspaceName = panelWorkspacePath === workspacePath
+    ? workspaceName : panelWorkspacePath?.split(/[\\/]/).filter(Boolean).pop();
+
   const renderPanel = () => {
+    // An explicit project destination must also govern subsequent sidebar pages.
+    const workspacePath = panelWorkspacePath;
+    const workspaceName = panelWorkspaceName;
     // Project panels
     if ((selectedCategory === 'agent-permissions' || selectedCategory === 'project-agent-permissions') && workspacePath) {
       return (
@@ -878,6 +888,8 @@ export function SettingsView({
     }
 
     switch (selectedCategory) {
+      case 'provider-credentials':
+        return <ProviderCredentialsPanel />;
       case 'claude':
         return wrapWithOverride('claude', 'Claude', <ClaudePanel {...commonProps} />);
       case 'claude-code':
@@ -944,6 +956,9 @@ export function SettingsView({
         return <DatabasePanel />;
       case 'agent-features':
         return <AgentFeaturesPanel />;
+      case 'cloudflare-sandboxes':
+        // Self-contained; talks to the `cloudflare-sandbox:*` handlers directly.
+        return <CloudflareSandboxesPanel workspacePath={workspacePath ?? undefined} />;
       case 'beta-features':
         return <BetaFeaturesPanel />;
       case 'notifications':
@@ -1021,6 +1036,10 @@ export function SettingsView({
             workspacePath={workspacePath ?? undefined}
           />
         );
+      case 'project-appearance':
+        return projectTarget?.kind === 'workspace'
+          ? <ProjectAppearancePanel key={projectTarget.workspacePath} workspacePath={projectTarget.workspacePath} />
+          : <p className="text-sm text-[var(--nim-text-muted)]">Open a local project to customize its appearance.</p>;
       case 'project-sharing':
       case 'team':
         return <ProjectSharingPanel target={projectTarget} />;
@@ -1158,7 +1177,7 @@ export function SettingsView({
               ? 'These settings apply to all projects'
               : scope === 'account'
                 ? 'Accounts, personal sync, devices, and shared links'
-                : `Settings for ${workspaceName || 'this project'}`}
+                : `Settings for ${panelWorkspaceName || 'this project'}`}
           </span>
         </div>
 
@@ -1188,6 +1207,7 @@ export function SettingsView({
 
         <main className="settings-view-main flex-1 overflow-y-auto p-6 bg-[var(--nim-bg)] relative z-0">
           <div className="settings-panel-container max-w-[800px]">
+            {scope === 'application' && ['claude', 'claude-code', 'openai', 'openai-codex', 'opencode'].includes(selectedCategory) && <ProviderCredentialsPanel compact name={selectedCategory === 'claude' ? 'anthropic' : selectedCategory} />}
             {renderPanel()}
           </div>
         </main>

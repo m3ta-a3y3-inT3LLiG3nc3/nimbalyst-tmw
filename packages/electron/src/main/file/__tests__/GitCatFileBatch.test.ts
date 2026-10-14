@@ -11,8 +11,8 @@
  * shape. These run against real git in a temp repo, because a hand-rolled fake
  * would only prove the parser agrees with my own assumptions.
  */
-import { describe, expect, it, beforeAll, afterAll, afterEach } from 'vitest';
-import { execFileSync } from 'child_process';
+import { describe, expect, it, beforeAll, afterAll, afterEach, vi } from 'vitest';
+import { execFileSync, type ChildProcessWithoutNullStreams } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -49,6 +49,7 @@ beforeAll(() => {
 
 afterEach(() => {
   while (open.length) open.pop()!.dispose();
+  vi.useRealTimers();
 });
 
 afterAll(() => {
@@ -111,11 +112,31 @@ describe('GitCatFileBatch', () => {
     const batch = make({ idleTimeoutMs: 50 });
     expect(await batch.read(sha, 'a.txt')).toBe('alpha\n');
 
-    await new Promise(r => setTimeout(r, 120));
-    expect(batch.isRunning).toBe(false);
+    // Observe the idle callback rather than assuming it has run within a fixed
+    // sleep under full-suite load.
+    await vi.waitFor(() => expect(batch.isRunning).toBe(false));
 
     expect(await batch.read(sha, 'b.txt')).toBe('beta content here\n');
     expect(batch.spawnCount).toBe(2);
+  });
+
+  it.each([
+    ['a.txt', undefined, 'alpha\n'],
+    ['missing.txt', undefined, null],
+    ['a.txt', 1, null],
+  ] as const)('retires after a slow read of %s even when the first idle timer expires', async (file, maxObjectBytes, expected) => {
+    vi.useFakeTimers();
+    const batch = make({ idleTimeoutMs: 50, maxObjectBytes });
+    const response = batch.read(sha, file);
+    // Advance synchronously before the real child's I/O can complete: the
+    // timeout must leave the pending read alive, then restart when it drains.
+    vi.advanceTimersByTime(50);
+    expect(batch.isRunning).toBe(true);
+    expect(await response).toBe(expected);
+    vi.advanceTimersByTime(49);
+    expect(batch.isRunning).toBe(true);
+    vi.advanceTimersByTime(1);
+    expect(batch.isRunning).toBe(false);
   });
 
   it('reports a non-git directory as missing rather than hanging', async () => {
@@ -127,5 +148,21 @@ describe('GitCatFileBatch', () => {
     } finally {
       fs.rmSync(notARepo, { recursive: true, force: true });
     }
+  });
+
+  it('settles broken-pipe reads and ignores late errors from a replaced child', async () => {
+    const batch = make();
+    const pending = [batch.read(sha, 'a.txt'), batch.read(sha, 'b.txt')];
+    const child = (batch as unknown as { child: ChildProcessWithoutNullStreams }).child;
+    const brokenPipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+    // Emit the stream event directly: a real non-repo exit races the stdin write.
+    expect(() => child.stdin.emit('error', brokenPipe)).not.toThrow();
+    expect(await Promise.all(pending)).toEqual([null, null]);
+    expect(batch.isRunning).toBe(false);
+    const replacementRead = batch.read(sha, 'a.txt');
+    expect(() => child.stdin.emit('error', brokenPipe)).not.toThrow();
+    // Output the dead child had already written must not answer the replacement's read.
+    child.stdout.emit('data', Buffer.from('0000000000000000000000000000000000000000 blob 6\n4a5800\n'));
+    expect(await replacementRead).toBe('alpha\n');
   });
 });

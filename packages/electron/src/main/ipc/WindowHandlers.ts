@@ -1,20 +1,33 @@
 import { BrowserWindow, shell, nativeImage, app, powerMonitor } from 'electron';
 import { safeHandle, safeOn } from '../utils/ipcRegistry';
 import { windowStates, windows, getWindowId } from '../window/WindowManager';
-import { syncRepresentedFilename } from '../window/windowState';
+import { syncRepresentedFilename, getWindowProjectPaths } from '../window/windowState';
 import { basename, join } from 'path';
 import { writeFileSync, existsSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
 import { reportDesktopActivity, setWindowFocused, setScreenLocked, setIdleThresholdMs, attemptReconnect } from '../services/SyncManager';
 import { startNetworkAvailability, onNetworkAvailable, notifyNetworkAvailable } from '../services/NetworkAvailability';
 import { AnalyticsService } from '../services/analytics/AnalyticsService';
+import { hasFocusedWindow } from '../services/analytics/dailyActiveHeartbeat';
 import { getPackageRoot } from '../utils/appPaths';
 import { resolveImageExtension } from '../utils/imageFormat';
 import { resolveWorkspaceAttachmentStagingDirectory } from '../services/attachments/attachmentStagingRoot';
+import { registerConsoleLinkHandlers, routeConsoleLink } from '../services/consoleLinks/consoleLinkHandlers';
 
 /** Timestamp of last app_foregrounded event, used to throttle to once per 30 minutes */
 let lastForegroundedEventAt = 0;
 const FOREGROUND_THROTTLE_MS = 30 * 60 * 1000; // 30 minutes
+
+/**
+ * How often to re-check whether the daily-active heartbeat is due while the app
+ * simply stays focused. Focus alone is not enough: someone who leaves Nimbalyst
+ * open across local midnight never fires another focus event, and would go
+ * missing from DAU for the whole of the new day.
+ *
+ * The tick itself emits nothing — it is a date comparison — so the interval is
+ * about how fast a rolled-over day is noticed, not about volume.
+ */
+const DAILY_ACTIVE_CHECK_MS = 10 * 60 * 1000; // 10 minutes
 
 export function registerWindowHandlers() {
     // Get initial window state
@@ -29,8 +42,7 @@ export function registerWindowHandlers() {
         if (!state) return null;
 
         if (state.mode === 'workspace' && state.workspacePath) {
-            const openProjectPaths = [state.workspacePath, ...(state.additionalWorkspacePaths ?? [])]
-                .filter((path, index, paths) => typeof path === 'string' && path.length > 0 && paths.indexOf(path) === index);
+            const openProjectPaths = getWindowProjectPaths(state);
             const activeWorkspacePath =
                 state.activeWorkspacePath && openProjectPaths.includes(state.activeWorkspacePath)
                     ? state.activeWorkspacePath
@@ -49,9 +61,22 @@ export function registerWindowHandlers() {
         };
     });
 
-    // Open external URL in default browser
+    registerConsoleLinkHandlers();
+
+    // Open external URL in default browser. A console link to a page, typed
+    // page, type, view or citation goes to the window first, which opens it
+    // in the app when it can.
     safeHandle('open-external', async (event, url: string) => {
         if (url && typeof url === 'string') {
+            if (routeConsoleLink(url, event.sender)) return;
+            await shell.openExternal(url);
+        }
+    });
+
+    // An explicit "Open in browser" action: always the browser, never routed
+    // back into the app (that would reopen the doc the user is already on).
+    safeHandle('open-in-browser', async (_event, url: string) => {
+        if (typeof url === 'string' && /^https?:\/\//i.test(url)) {
             await shell.openExternal(url);
         }
     });
@@ -226,6 +251,10 @@ export function registerWindowHandlers() {
             win.webContents.send('window:focus-changed', true);
         }
 
+        // Focus is our cleanest "a human is here" signal, so it drives the
+        // daily-active heartbeat. At most one event per install per local day.
+        AnalyticsService.getInstance().maybeEmitDailyActive();
+
         // Emit app_foregrounded for DAU tracking when a window gains focus,
         // throttled to once per 30 minutes to keep event volume low
         const now = Date.now();
@@ -234,6 +263,15 @@ export function registerWindowHandlers() {
             AnalyticsService.getInstance().sendEvent('app_foregrounded');
         }
     });
+
+    // Catch the day rolling over under an app that is focused but idle. Gated on
+    // a window actually being focused so an install nobody has touched stays out
+    // of DAU -- background-only installs were a third of the old inflated number.
+    setInterval(() => {
+        if (hasFocusedWindow(BrowserWindow.getAllWindows())) {
+            AnalyticsService.getInstance().maybeEmitDailyActive();
+        }
+    }, DAILY_ACTIVE_CHECK_MS).unref();
 
     app.on('browser-window-blur', (_event, win) => {
         // Check if any window is still focused

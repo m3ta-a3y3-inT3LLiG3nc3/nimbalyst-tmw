@@ -3,7 +3,11 @@ import * as fsp from 'fs/promises';
 import { homedir } from 'os';
 import * as path from 'path';
 import { parseCommandFile, parseSkillFile, type SlashCommand, validateCommand } from './CommandFileParser';
-import { getAllExtensionDirectories, getNativeClaudePluginPaths } from '../ipc/ExtensionHandlers';
+import {
+  getAllExtensionDirectories,
+  getDiscoverableClaudePluginPaths,
+  getExtensionClaudePluginPaths,
+} from '../ipc/ExtensionHandlers';
 import {
   getAgentWorkflowExportSettings,
   getAgentWorkflowSourceSettings,
@@ -14,6 +18,7 @@ import {
 } from '../utils/store';
 import { usesCodexStyleAgentWorkflows } from '../../shared/agentWorkflowProviders';
 import { createTtlCache } from '../utils/asyncCache';
+import { logger } from '../utils/logger';
 import { resolveClaudeConfigDir } from '@nimbalyst/runtime/ai/server/providers/claudeCode/claudeConfigDir';
 
 export type AgentWorkflowKind = 'command' | 'skill';
@@ -171,7 +176,17 @@ export interface AgentWorkflowQueryOptions {
 export interface AgentWorkflowServiceOptions {
   userHomePath?: string;
   extensionDirectoriesLoader?: () => Promise<string[]>;
+  /**
+   * Everything the picker can SEE: extension plugins plus the user's own
+   * `/plugin`-installed ones. Discovery only — see `claudePluginInjectionLoader`.
+   */
   nativeClaudePluginPathsLoader?: (workspacePath?: string) => Promise<Array<{ type: 'local'; path: string }>>;
+  /**
+   * Only what Nimbalyst may hand to a launching Claude (#1465): plugins that
+   * ship inside enabled extensions. The user's `/plugin`-installed plugins are
+   * loaded by Claude itself and must never be injected on top of that.
+   */
+  claudePluginInjectionLoader?: () => Promise<Array<{ type: 'local'; path: string }>>;
   releaseChannelLoader?: () => ReleaseChannel;
 }
 
@@ -454,12 +469,78 @@ async function syncDirectoryRecursive(
   await removeUnexpectedEntries(targetDir, expectedNames);
 }
 
+/**
+ * Remove a generated entry unless it is already a real (non-symlink) entry of
+ * the wanted kind, so a later write can never follow a link out of the export
+ * or trip over a file where a directory now belongs (or the reverse).
+ */
+async function clearIncompatibleGeneratedEntry(targetPath: string, want: 'file' | 'directory'): Promise<void> {
+  try {
+    const stat = await fsp.lstat(targetPath);
+    if (want === 'directory' ? stat.isDirectory() : stat.isFile()) {
+      return;
+    }
+    await fsp.rm(targetPath, { recursive: true, force: true });
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') {
+      throw error;
+    }
+  }
+}
+
+async function writeGeneratedFile(targetPath: string, content: string | Buffer, mode?: number): Promise<void> {
+  await clearIncompatibleGeneratedEntry(targetPath, 'file');
+  await ensureFileMatches(targetPath, content);
+  if (mode !== undefined && ((await fsp.stat(targetPath)).mode & 0o777) !== mode) {
+    await fsp.chmod(targetPath, mode);
+  }
+}
+
+/**
+ * Copy a skill's source directory, minus `skipNames`, into `targetDir` and
+ * return the names copied. Source symlinks are skipped rather than followed:
+ * a skill ships its own files, and following a link would copy whatever it
+ * points at into the workspace.
+ */
+async function syncSkillSupportingFiles(
+  sourceDir: string,
+  targetDir: string,
+  skipNames: ReadonlySet<string> = new Set(),
+): Promise<string[]> {
+  const entries = await fsp.readdir(sourceDir, { withFileTypes: true });
+  const names: string[] = [];
+  for (const entry of entries) {
+    if (skipNames.has(entry.name)) {
+      continue;
+    }
+    const sourcePath = path.join(sourceDir, entry.name);
+    const targetPath = path.join(targetDir, entry.name);
+    if (entry.isDirectory()) {
+      await clearIncompatibleGeneratedEntry(targetPath, 'directory');
+      await fsp.mkdir(targetPath, { recursive: true });
+      const childNames = await syncSkillSupportingFiles(sourcePath, targetPath);
+      await removeUnexpectedEntries(targetPath, new Set(childNames));
+    } else if (entry.isFile()) {
+      const stat = await fsp.stat(sourcePath);
+      await writeGeneratedFile(targetPath, await fsp.readFile(sourcePath), stat.mode & 0o777);
+    } else {
+      if (entry.isSymbolicLink()) {
+        logger.main.warn(`[AgentWorkflowService] Skipping symlink in skill export: ${sourcePath}`);
+      }
+      continue;
+    }
+    names.push(entry.name);
+  }
+  return names;
+}
+
 export class AgentWorkflowService {
   private readonly workspacePath: string;
   private readonly userHomePath: string;
   private readonly userClaudeConfigDir: string;
   private readonly extensionDirectoriesLoader: () => Promise<string[]>;
   private readonly nativeClaudePluginPathsLoader: (workspacePath?: string) => Promise<Array<{ type: 'local'; path: string }>>;
+  private readonly claudePluginInjectionLoader: () => Promise<Array<{ type: 'local'; path: string }>>;
   private readonly releaseChannelLoader: () => ReleaseChannel;
   // Single-flight + TTL: listEntries() is fanned out from every mounted AI
   // input on startup (one per open tab/pane), with no shared cache at the
@@ -479,7 +560,8 @@ export class AgentWorkflowService {
       ? path.join(options.userHomePath, '.claude')
       : resolveClaudeConfigDir();
     this.extensionDirectoriesLoader = options.extensionDirectoriesLoader ?? getAllExtensionDirectories;
-    this.nativeClaudePluginPathsLoader = options.nativeClaudePluginPathsLoader ?? getNativeClaudePluginPaths;
+    this.nativeClaudePluginPathsLoader = options.nativeClaudePluginPathsLoader ?? getDiscoverableClaudePluginPaths;
+    this.claudePluginInjectionLoader = options.claudePluginInjectionLoader ?? getExtensionClaudePluginPaths;
     this.releaseChannelLoader = options.releaseChannelLoader ?? getReleaseChannel;
   }
 
@@ -532,18 +614,30 @@ export class AgentWorkflowService {
     return entries.find(entry => entry.name === name) ?? null;
   }
 
+  /**
+   * The plugin roots Nimbalyst hands to a launching Claude session — the SDK's
+   * `options.plugins` and the CLI's `--plugin-dir`.
+   *
+   * #1465: injection carries Nimbalyst's own plugins only — those contributed by
+   * enabled extensions, plus the workflow plugins we generate under
+   * `.claude/plugins/.nimbalyst-generated`. Claude already loads the user's
+   * `/plugin`-installed marketplace plugins itself, so re-injecting them by path
+   * gave every one of them an unconfigured `@inline` twin in the session. Those
+   * plugins stay in the picker's discovery scan (`scanLegacyClaudePluginSources`),
+   * which is what keeps their commands listed.
+   */
   async getClaudeProviderPluginPaths(): Promise<Array<{ type: 'local'; path: string }>> {
-    const nativePlugins = await this.nativeClaudePluginPathsLoader(this.workspacePath);
+    const extensionPlugins = await this.claudePluginInjectionLoader();
     const exportSettings = getAgentWorkflowExportSettings();
 
     if (!exportSettings.claudeGeneratedExtensionWorkflowsEnabled) {
-      return dedupePlugins(nativePlugins);
+      return dedupePlugins(extensionPlugins);
     }
 
     const snapshot = await this.getSnapshot();
     const generatedPlugins = await this.ensureGeneratedClaudePluginsSynced(snapshot);
     return dedupePlugins([
-      ...nativePlugins,
+      ...extensionPlugins,
       ...generatedPlugins.map(pluginPath => ({ type: 'local' as const, path: pluginPath })),
     ]);
   }
@@ -1073,12 +1167,19 @@ export class AgentWorkflowService {
       const skillDirName = sanitizeFileName(codexName);
       const skillDir = path.join(generatedRoot, skillDirName);
       expectedSkillDirs.add(skillDirName);
+      await clearIncompatibleGeneratedEntry(skillDir, 'directory');
       await fsp.mkdir(skillDir, { recursive: true });
-      await ensureFileMatches(
+      await writeGeneratedFile(
         path.join(skillDir, 'SKILL.md'),
         renderCodexSkillMarkdown(descriptor, codexName),
       );
-      await removeUnexpectedEntries(skillDir, new Set(['SKILL.md']));
+      // A skill's SKILL.md may point at supporting files next to it
+      // (references/, scripts/); copy them so a Codex agent can resolve them.
+      const supportingNames = descriptor.kind === 'skill' && descriptor.sourcePath
+        && path.basename(descriptor.sourcePath) === 'SKILL.md'
+        ? await syncSkillSupportingFiles(path.dirname(descriptor.sourcePath), skillDir, new Set(['SKILL.md']))
+        : [];
+      await removeUnexpectedEntries(skillDir, new Set(['SKILL.md', ...supportingNames]));
 
       manifestEntries.push({
         id: descriptor.id,

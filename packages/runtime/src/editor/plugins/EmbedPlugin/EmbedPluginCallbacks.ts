@@ -9,7 +9,7 @@
 import type { ComponentType } from 'react';
 import type { NodeKey } from 'lexical';
 
-import type { EmbedAttrs } from './EmbeddedFileNode';
+import type { EmbedAttrs } from './EmbeddedFileNodeCore';
 
 export interface EmbedFrameProps {
   /** Raw path written in the markdown link. May be relative or absolute. */
@@ -20,6 +20,8 @@ export interface EmbedFrameProps {
   attrs: EmbedAttrs;
   /** Lexical node key for the originating `EmbeddedFileNode`. */
   nodeKey: NodeKey;
+  /** Nested in another node, so selection and resize persistence do not apply. */
+  detached?: boolean;
 }
 
 export interface EmbedPluginCallbacks {

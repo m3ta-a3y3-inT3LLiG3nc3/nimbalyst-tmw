@@ -26,7 +26,7 @@ describe('WindowTopBar', () => {
     render(
       <WindowTopBar
         workspaceName="Timely Nebula"
-        activeModeLabel="Shared Docs"
+        activeModeLabel="Wiki"
         gitStatus={null}
         gitActions={{
           onPull: () => {},
@@ -41,7 +41,7 @@ describe('WindowTopBar', () => {
     expect(root.getAttribute('data-component')).toBe('WindowTopBar');
     expect(root.getAttribute('style')).toContain('height: 38px');
     expect(screen.getByTestId('window-top-bar-workspace-name').textContent).toBe('Timely Nebula');
-    expect(screen.getByTestId('window-top-bar-mode-label').textContent).toBe('Shared Docs');
+    expect(screen.getByTestId('window-top-bar-mode-label').textContent).toBe('Wiki');
     expect(screen.queryByTestId('window-top-bar-git-status')).toBeNull();
     expect(screen.queryByTestId('window-top-bar-git-slot')).toBeNull();
   });
@@ -580,5 +580,34 @@ describe('WindowTopBar', () => {
 
     fireEvent.click(screen.getByTestId('window-top-bar-git-activity-item'));
     expect(onOpenActivity).toHaveBeenCalledTimes(1);
+  });
+
+  // A pull in a repository cloned inside the project used to show nothing: the
+  // bar now names the repository and marks only its row busy.
+  it('names the repository a command runs in and marks only that repository busy', () => {
+    const pull = { id: 'p', command: 'git pull', source: 'nimbalyst' as const, repoLabel: 'api' };
+    render(
+      <WindowTopBar
+        workspaceName="Repo"
+        activeModeLabel="Files"
+        gitStatus={{ branch: 'main', hasUncommitted: false, ahead: 0, behind: 0 }}
+        gitActions={{
+          onPull: () => {},
+          onPush: () => {},
+          onOpenLog: () => {},
+          repos: [{ path: '/repo', label: 'repo' }, { path: '/repo/api', label: 'api', busy: true }],
+          activeRepoPath: '/repo',
+          activity: { running: [pull], latest: pull },
+        }}
+      />,
+    );
+
+    const git = screen.getByTestId('window-top-bar-git-status');
+    expect(git.getAttribute('title')).toContain('Nimbalyst: git pull in api');
+    fireEvent.click(git);
+    expect(screen.getAllByTestId('window-top-bar-git-repo-item').map((row) => row.getAttribute('data-busy')))
+      .toEqual([null, 'true']);
+    const pullItem = screen.getAllByRole('menuitem').find((item) => item.textContent?.endsWith('Pull'))!;
+    expect(pullItem.hasAttribute('disabled')).toBe(false);
   });
 });

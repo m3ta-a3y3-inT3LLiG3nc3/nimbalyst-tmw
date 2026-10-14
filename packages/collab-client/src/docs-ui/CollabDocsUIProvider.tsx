@@ -48,7 +48,10 @@ interface CollabDocsUIContextValue {
   controller: CollabDocsUIController;
 }
 
-const CollabDocsUIContext = createContext<CollabDocsUIContextValue | null>(null);
+/** Exported for this package's own hooks (`useCollabPagesState`); hosts use `useCollabDocsUI`. */
+export const CollabDocsUIContext = createContext<CollabDocsUIContextValue | null>(null);
+
+const NO_CONTROLLER: CollabDocsUIController = {};
 
 export interface CollabDocsUIProviderProps {
   session: CollabDocsSession;
@@ -61,14 +64,17 @@ export function CollabDocsUIProvider({
   controller,
   children,
 }: CollabDocsUIProviderProps) {
+  // A fresh object here re-renders every consumer (each sidebar row and unread
+  // dot) whenever the host re-renders the provider.
+  const value = useMemo(() => ({
+    scope: session.scope,
+    host: session.host,
+    session,
+    controller: controller ?? NO_CONTROLLER,
+  }), [session, controller]);
   return (
     <JotaiProvider store={store}>
-      <CollabDocsUIContext.Provider value={{
-        scope: session.scope,
-        host: session.host,
-        session,
-        controller: controller ?? {},
-      }}>
+      <CollabDocsUIContext.Provider value={value}>
         {children}
       </CollabDocsUIContext.Provider>
     </JotaiProvider>
@@ -78,7 +84,7 @@ export function CollabDocsUIProvider({
 export function useCollabDocsUI(): CollabDocsUIContextValue {
   const value = useContext(CollabDocsUIContext);
   if (!value) {
-    throw new Error('Shared Docs UI must be rendered inside CollabDocsUIProvider');
+    throw new Error('Wiki UI must be rendered inside CollabDocsUIProvider');
   }
   return value;
 }
@@ -97,6 +103,8 @@ const noSharedDocuments: Atom<SharedDocument[]> = atom<SharedDocument[]>([]);
  * it for labels, and an unnamed tab is a far better failure than an editor
  * route that will not render at all.
  */
+const noSharedFolders: Atom<SharedFolder[]> = atom<SharedFolder[]>([]);
+
 export function useSharedDocumentTitles(): Map<string, string> {
   const value = useContext(CollabDocsUIContext);
   const documents = useAtomValue(value?.session.atoms.allSharedDocuments ?? noSharedDocuments);
@@ -109,12 +117,19 @@ export function useSharedDocumentTitles(): Map<string, string> {
   );
 }
 
+/**
+ * The project's first-class folders, for a host that files a new item
+ * somewhere and has no tree of its own to read them from.
+ */
+export function useSharedFolders(): SharedFolder[] {
+  const value = useContext(CollabDocsUIContext);
+  return useAtomValue(value?.session.atoms.sharedFolders ?? noSharedFolders);
+}
+
 export interface SharedDocumentBreadcrumb {
   documentTitle: string | null;
   folders: Array<{ folderId: string; name: string }>;
 }
-
-const noSharedFolders: Atom<SharedFolder[]> = atom<SharedFolder[]>([]);
 
 /** Resolved first-class folder ancestry for browser/native breadcrumb chrome. */
 export function useSharedDocumentBreadcrumb(

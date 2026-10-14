@@ -21,6 +21,7 @@ import { applyLoadedFolderContents, refreshFileTree } from '../store/listeners/f
 import { useTabsActions } from '../contexts/TabsContext';
 import { useProjectOrg } from '../hooks/useProjectOrg';
 import { WorkspaceSummaryHeader } from './WorkspaceSummaryHeader';
+import { errorNotificationService } from '../services/ErrorNotificationService';
 
 type FileTreeItem = RendererFileTreeItem;
 
@@ -423,11 +424,11 @@ export function WorkspaceSidebar({
         handleRefreshFileTree();
         onFileSelect(filePath);
       } else {
-        alert('Failed to create file: ' + (result?.error || 'Unknown error'));
+        errorNotificationService.showError('Create file failed', 'Failed to create file: ' + (result?.error || 'Unknown error'));
       }
     } catch (error) {
       console.error('Failed to create file:', error);
-      alert('Failed to create file: ' + error);
+      errorNotificationService.showError('Create file failed', 'Failed to create file: ' + error);
     } finally {
       setTargetFolder(null);
     }
@@ -445,11 +446,11 @@ export function WorkspaceSidebar({
         // Refresh file tree
         handleRefreshFileTree();
       } else {
-        alert('Failed to create folder: ' + (result?.error || 'Unknown error'));
+        errorNotificationService.showError('Create folder failed', 'Failed to create folder: ' + (result?.error || 'Unknown error'));
       }
     } catch (error) {
       console.error('Failed to create folder:', error);
-      alert('Failed to create folder: ' + error);
+      errorNotificationService.showError('Create folder failed', 'Failed to create folder: ' + error);
     } finally {
       setTargetFolder(null);
     }
@@ -505,11 +506,11 @@ export function WorkspaceSidebar({
         handleRefreshFileTree();
         onFileSelect(filePath);
       } else {
-        alert('Failed to create file: ' + (result?.error || 'Unknown error'));
+        errorNotificationService.showError('Create file failed', 'Failed to create file: ' + (result?.error || 'Unknown error'));
       }
     } catch (error) {
       console.error('Failed to create file:', error);
-      alert('Failed to create file: ' + error);
+      errorNotificationService.showError('Create file failed', 'Failed to create file: ' + error);
     } finally {
       setIsNewFileDialogOpen(false);
       setNewFileDialogDirectory(null);
@@ -837,7 +838,9 @@ export function WorkspaceSidebar({
   const gitWorktreeModifiedPathSet = useMemo(() => new Set(gitWorktreeModifiedFiles), [gitWorktreeModifiedFiles]);
 
   // Filter file tree based on current filter
-  const filterFileTree = useCallback((items: FileTreeItem[], filter: FileTreeFilter): FileTreeItem[] => {
+  const filteredFileTree = useMemo((): FileTreeItem[] => {
+    const items = fileTree;
+    const filter = fileTreeFilter;
     if (filter === 'all') {
       return items;
     }
@@ -950,12 +953,7 @@ export function WorkspaceSidebar({
     };
 
     return filterItems(items);
-  }, [aiReadPathSet, aiWrittenPathSet, gitUncommittedPathSet, gitWorktreeModifiedPathSet]);
-
-  const filteredFileTree = useMemo(
-    () => filterFileTree(fileTree, fileTreeFilter),
-    [fileTree, fileTreeFilter, filterFileTree]
-  );
+  }, [fileTree, fileTreeFilter, aiReadPathSet, aiWrittenPathSet, gitUncommittedPathSet, gitWorktreeModifiedPathSet]);
 
   const isAISessionFilter = CLAUDE_SESSION_FILTERS.has(fileTreeFilter);
   const hasActiveClaudeSession = Boolean(currentAISessionId);

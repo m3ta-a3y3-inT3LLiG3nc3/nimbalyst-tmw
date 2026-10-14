@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { EMPTY_FORMATTING } from '../../sheetMeta/formatting';
 import { describe, expect, it, vi } from 'vitest';
 import type { RevoGridElement } from '../../revogrid-types';
 import { parseCSV, columnIndexToLetter } from '../csvParser';
@@ -9,6 +10,7 @@ import {
 } from '../gridOperations';
 import { createSpreadsheetEditorAPI } from '../../editorAPI';
 import { aiTools } from '../../aiTools';
+import type { SheetMeta } from '../../commands/sheetState';
 
 vi.mock('@nimbalyst/extension-sdk', () => ({
   copyToClipboard: vi.fn(async () => undefined),
@@ -17,7 +19,7 @@ vi.mock('@nimbalyst/extension-sdk', () => ({
 function createFormulaGrid(content: string) {
   const parsed = parseCSV(content);
   const formulaViewState = new FormulaViewState();
-  const gridData = spreadsheetDataToGridSource(parsed.data, 0, 0);
+  const gridData = spreadsheetDataToGridSource(parsed.data, 0);
   formulaViewState.recalculate(parsed.data, gridData);
 
   let columnCount = parsed.data.columnCount;
@@ -54,17 +56,19 @@ function createFormulaGrid(content: string) {
     },
   } as unknown as RevoGridElement;
 
+  let meta: SheetMeta = {
+    ...EMPTY_FORMATTING,
+    headerRowCount: parsed.data.headerRowCount,
+    frozenColumnCount: parsed.data.frozenColumnCount,
+    columnCount: parsed.data.columnCount,
+    columnFormats: parsed.data.columnFormats,
+    columnWidths: {},
+    cellStyles: {},
+  };
   const operations = createGridOperations({ current: grid }, {
-    getHeaderRowCount: () => parsed.data.headerRowCount,
-    getColumnCount: () => columnCount,
-    setColumnCount: (count) => { columnCount = count; },
+    getMeta: () => meta,
+    setMeta: (next) => { meta = next; columnCount = next.columnCount; },
     getDelimiter: () => parsed.delimiter,
-    getColumnFormats: () => parsed.data.columnFormats,
-    getColumnWidths: () => ({}),
-    getCellStyles: () => ({}),
-    getFrozenColumnCount: () => parsed.data.frozenColumnCount,
-    onDirty: () => undefined,
-    getUndoPlugin: () => null,
     formulaViewState,
   });
 
@@ -217,4 +221,14 @@ describe('formula grid wiring', () => {
     });
     expect(data.limits.distinctValueSamplePerColumn).toBe(10);
   });
+});
+
+it('serializes all pinned rows when React header metadata still describes the previous grid', async () => {
+  const initial = Array.from({ length: 38 }, (_, i) => `Row${i},${i}`).join('\n');
+  const { operations } = createFormulaGrid(initial);
+  // Source moves first; the caller's React metadata setter runs afterward.
+  await operations.updateHeaderRowCount(37);
+  const serialized = await operations.toCSV();
+  expect(parseCSV(serialized).data.rows.map(row => row.map(cell => cell.raw)))
+    .toEqual(parseCSV(initial).data.rows.map(row => row.map(cell => cell.raw)));
 });

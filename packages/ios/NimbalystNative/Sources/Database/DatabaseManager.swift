@@ -309,7 +309,87 @@ public final class DatabaseManager: @unchecked Sendable {
             }
         }
 
+        // Action prompts from the desktop workspace's ai-actions.md, stored as a
+        // JSON blob beside the slash commands they arrive with. NULL means the
+        // desktop predates action sync or the workspace has no actions; both
+        // read as an empty picker.
+        migrator.registerMigration("v15_project_action_prompts") { db in
+            try db.alter(table: "projects") { t in
+                t.add(column: "actionsJson", .text)
+            }
+        }
+
+        // Indexes for the bounded sidebar window (see SessionListQueries.swift). The
+        // list orders by (projectId, updatedAt DESC, id DESC) and resolves group
+        // membership through worktreeId; the pre-existing idx_sessions_updated is not
+        // usable for either because it is not project-scoped. Adding indexes rewrites
+        // no rows, so an existing install keeps its cache.
+        migrator.registerMigration("v16_session_list_window_indexes") { db in
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_sessions_project_updated
+                ON sessions(projectId, updatedAt DESC, id DESC)
+                """)
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_sessions_project_worktree
+                ON sessions(projectId, worktreeId)
+                WHERE worktreeId IS NOT NULL
+                """)
+            // Running / queued / pinned sessions stay reachable from outside the loaded
+            // page, and they can be arbitrarily old, so that query cannot use the
+            // recency index. A partial index keeps it proportional to how many sessions
+            // actually need attention rather than to history.
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_sessions_project_attention
+                ON sessions(projectId, updatedAt DESC, id DESC)
+                WHERE isExecuting = 1 OR hasQueuedPrompts = 1 OR isPinned = 1
+                """)
+        }
+
+        // Derived projection of the sidebar's display groups, so a page of the session
+        // list is a bounded index read instead of a re-aggregation of history. Creating
+        // tables and triggers is additive; no session row is touched.
+        migrator.registerMigration("v17_session_list_group_projection") { db in
+            try SessionListProjection.ensureSchema(db)
+        }
+
+        migrator.registerMigration("v18_session_list_auxiliary_indexes") { db in
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_sessions_workstream_page
+                ON sessions(projectId, updatedAt DESC, id DESC) WHERE sessionType = 'workstream';
+                CREATE INDEX IF NOT EXISTS idx_sessions_archived_project
+                ON sessions(projectId) WHERE isArchived = 1;
+                CREATE INDEX IF NOT EXISTS idx_sessions_phase_project
+                ON sessions(projectId) WHERE phase IS NOT NULL AND phase <> '';
+                """)
+        }
+
+        migrator.registerMigration(IndexReplicationStore.migrationIdentifier) { db in
+            try IndexReplicationStore.createSchema(db)
+        }
+
+        // The Local wiki folder and type definitions from the desktop's project
+        // config. NULL means the project has no Local wiki (or no wiki types), or
+        // the desktop predates wiki sync.
+        // Registered after v2IndexReplication so existing installs apply it in order.
+        migrator.registerMigration("v19_project_local_wiki_folder") { db in
+            try db.alter(table: "projects") { t in
+                t.add(column: "localWikiFolder", .text)
+                t.add(column: "localWikiTypesJSON", .text)
+            }
+        }
+
+        // #1711: same-ID transcript repairs are ordered by this stamp. NULL is
+        // projection version 0, so every existing row accepts a repaired copy.
+        migrator.registerMigration("v20_message_projection_stamp") { db in
+            try db.alter(table: "messages") { t in
+                t.add(column: "projectionJson", .text)
+            }
+        }
+
         try migrator.migrate(writer)
+        // The projection is derived data with its own shape marker; a recorded
+        // migration says nothing about which shape it created.
+        try writer.write { db in try SessionListProjection.ensureSchema(db) }
     }
 
     // MARK: - Project Queries
@@ -450,20 +530,11 @@ public final class DatabaseManager: @unchecked Sendable {
     }
 
     public func appendMessage(_ message: Message) throws {
-        try writer.write { db in
-            // Use INSERT OR IGNORE to skip duplicates (same sessionId + sequence).
-            // This handles the case where we store a message locally (e.g. a sent prompt)
-            // and then receive the same message back via a session room broadcast.
-            try message.insert(db, onConflict: .ignore)
-        }
+        try appendMessages([message])
     }
 
     public func appendMessages(_ messages: [Message]) throws {
-        try writer.write { db in
-            for message in messages {
-                try message.insert(db, onConflict: .ignore)
-            }
-        }
+        try writer.write { db in try persistMessageProjections(messages, in: db) }
     }
 
     // MARK: - Sync State Queries
@@ -545,6 +616,19 @@ public final class DatabaseManager: @unchecked Sendable {
                 sql: "UPDATE sessions SET draftInput = ?, draftUpdatedAt = ? WHERE id = ?",
                 arguments: [draftInput, draftUpdatedAt, sessionId]
             )
+        }
+    }
+
+    /// Update only the live context-window usage for an existing session.
+    /// Returns false when no local row exists; never creates one.
+    @discardableResult
+    public func updateSessionContext(sessionId: String, tokens: Int, contextWindow: Int) throws -> Bool {
+        try writer.write { db in
+            try db.execute(
+                sql: "UPDATE sessions SET contextTokens = ?, contextWindow = ? WHERE id = ?",
+                arguments: [tokens, contextWindow, sessionId]
+            )
+            return db.changesCount > 0
         }
     }
 

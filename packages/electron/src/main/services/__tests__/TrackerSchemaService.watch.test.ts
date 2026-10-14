@@ -24,9 +24,9 @@ const {
   };
 });
 
-vi.mock('electron', () => ({
+vi.mock('electron', async () => ({
   app: {
-    getPath: vi.fn(() => '/tmp'),
+    getPath: (await import('../../../../test-stubs/privateUserData')).testApp.getPath,
     isPackaged: false,
     getName: vi.fn(() => 'Nimbalyst'),
     getVersion: vi.fn(() => '0.0.0-test'),
@@ -70,6 +70,14 @@ vi.mock('chokidar', () => ({
 // tolerate a null database, so returning null preserves test intent.
 vi.mock('../../database/initialize', () => ({
   getDatabase: () => null,
+}));
+
+// Keep schema loading independent of the team/auth graph during hook setup.
+vi.mock('../TeamService', () => ({
+  findTeamForWorkspace: vi.fn(async () => null),
+}));
+vi.mock('../TrackerIdentityService', () => ({
+  getCurrentIdentity: vi.fn(() => ({ displayName: 'Test User', email: 'test@example.com' })),
 }));
 
 interface TrackerSchemaServiceModule {

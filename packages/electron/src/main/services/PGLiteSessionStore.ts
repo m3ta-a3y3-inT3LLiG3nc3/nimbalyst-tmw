@@ -1,9 +1,17 @@
+import { sessionMetadataMergeSql } from './sessionMetadataMerge';
 /**
  * PGLite implementation of SessionStore interface from runtime package
  */
 
 import { toMillis } from '../utils/timestampUtils';
 import { parseJsonObjectColumn } from '../utils/jsonColumn';
+import { assertSessionCreation, SESSION_DESCENDANTS_CTE, computeDescendantStats, publishSubtreeArchive, wrapSessionHierarchyWrites, deleteSessionAndLiftChildren, type HierarchyStatement } from './sessionHierarchy';
+import {
+  OWNER_METADATA_KEY,
+  SESSION_OWNER_KEY,
+  readSessionOwner,
+  stripOwnerControlledMetadata,
+} from './extensionSessions/sessionOwnership';
 import {
   computeSessionPhaseTransition,
   normalizeSessionPhaseMetadataUpdate,
@@ -23,6 +31,7 @@ import { filterSessionsForPersonalSync } from '@nimbalyst/runtime/sync';
 
 type PGliteLike = {
   query<T = any>(sql: string, params?: any[]): Promise<{ rows: T[] }>;
+  runTransaction?(statements: HierarchyStatement[]): Promise<void>;
   searchTranscriptEventSessions?(
     query: string,
     opts?: {
@@ -53,6 +62,16 @@ function buildSessionArchiveFilter(includeArchived: boolean, sessionAlias = 's',
 // Shared with other JSON-typed column readers; see ../utils/jsonColumn.ts
 // for the metadata-corruption postmortem.
 const normalizeJsonObject = parseJsonObjectColumn;
+
+/** A metadata column SQL can merge into: absent, or a stored JSON object (not a string or array). */
+function isStoredJsonObject(value: unknown): boolean {
+  if (value == null) return true;
+  let parsed = value;
+  if (typeof value === 'string') {
+    try { parsed = JSON.parse(value); } catch { return false; }
+  }
+  return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed);
+}
 
 /**
  * Parse a TEXT column that's supposed to hold JSON back into the value the
@@ -99,7 +118,69 @@ type SyncedMessage = AgentMessage;
  * Get all sessions for sync (no workspace filter)
  * Uses the module-level db reference set by createPGLiteSessionStore
  */
-export async function getAllSessionsForSync(includeMessages = false): Promise<Array<{
+/**
+ * Metadata keys the personal-sync wire actually consumes:
+ * `tutorial` gates eligibility (`filterSessionsForPersonalSync`), `hostDeviceId`
+ * is copied onto the index entry (`buildSyncedSessionIndexFields`), and the rest
+ * feed the encrypted client metadata (`buildClientMetadataFromRaw`). Everything
+ * else in the blob -- transcript summaries, provider scratch state -- is dead
+ * weight this query used to carry for every session in the database.
+ */
+const SYNCED_METADATA_KEYS = [
+  'tutorial',
+  'hostDeviceId',
+  'tokenUsage',
+  'phase',
+  'tags',
+  'draftInput',
+  'draftUpdatedAt',
+] as const;
+
+/**
+ * Projects the consumed keys in SQL, so a session's full metadata blob
+ * (transcript summaries, provider scratch state) never crosses the database
+ * boundary for every row in the account.
+ *
+ * One string serves both backends: `dialectTranslator` rewrites
+ * `jsonb_build_object` to `json_object`, and `->` is a JSON accessor on both
+ * PGLite and SQLite (>= 3.38), preserving nested objects/arrays as JSON rather
+ * than re-quoting them as strings.
+ *
+ * Nulls are stripped in JS afterwards, not here: `jsonb_strip_nulls` has no
+ * safe SQLite translation, and an absent key must stay absent -- `draftInput`
+ * distinguishes "" (explicit clear) from "not set".
+ */
+export function buildSyncedMetadataProjectionSql(column: string): string {
+  const pairs = SYNCED_METADATA_KEYS.map((key) => `'${key}', ${column}->'${key}'`).join(', ');
+  return `jsonb_build_object(${pairs})`;
+}
+
+function projectSyncedMetadata(metadata: Record<string, any> | undefined): Record<string, any> | undefined {
+  if (!metadata) return metadata;
+  const projected: Record<string, any> = {};
+  for (const key of SYNCED_METADATA_KEYS) {
+    const value = metadata[key];
+    // SQL always emits every key; a key the row never had comes back null and
+    // must not become a present-but-null field on the wire.
+    if (value !== undefined && value !== null) projected[key] = value;
+  }
+  return projected;
+}
+
+export interface AllSessionsForSyncOptions {
+  /**
+   * Called once per DISTINCT local workspace path, not once per session. The
+   * caller owns worktree-to-project resolution (`resolveProjectPath`), which
+   * touches the disk; keeping it out here also keeps this module dialect- and
+   * filesystem-independent. Omit to load every project.
+   */
+  isProjectEnabled?: (workspaceId: string) => boolean;
+}
+
+export async function getAllSessionsForSync(
+  includeMessages = false,
+  options?: AllSessionsForSyncOptions,
+): Promise<Array<{
   id: string;
   title: string;
   provider: string;
@@ -118,6 +199,8 @@ export async function getAllSessionsForSync(includeMessages = false): Promise<Ar
   workspaceId?: string;
   workspacePath?: string;
   messageCount: number;
+  /** False: this query deliberately does not count messages -- see the mapper. */
+  messageCountKnown?: boolean;
   updatedAt: number;
   createdAt: number;
   metadata?: Record<string, any>;
@@ -136,16 +219,43 @@ export async function getAllSessionsForSync(includeMessages = false): Promise<Ar
   }
   const ensureTime = performance.now() - startTime;
 
+  // Resolve the enabled-project filter against the DISTINCT workspace paths
+  // first, so the session scan below never materializes rows the caller is
+  // going to discard. `IN (...)` with expanded placeholders works on both
+  // PGLite and SQLite; `= ANY($1)` would be Postgres-only.
+  let projectFilterSql = '';
+  let projectFilterParams: string[] = [];
+  if (options?.isProjectEnabled) {
+    const { rows: projectRows } = await moduleDb.query<any>(
+      `SELECT DISTINCT workspace_id FROM ai_sessions WHERE workspace_id IS NOT NULL`
+    );
+    projectFilterParams = projectRows
+      .map((row: any) => row.workspace_id as string)
+      .filter((workspaceId: string) => options.isProjectEnabled!(workspaceId));
+    if (projectFilterParams.length === 0) {
+      // No enabled project has any local session. Scanning would return rows
+      // that are all filtered out anyway.
+      return [];
+    }
+    const placeholders = projectFilterParams.map((_, i) => `$${i + 1}`).join(', ');
+    projectFilterSql = `WHERE s.workspace_id IN (${placeholders})`;
+  }
+
   const queryStart = performance.now();
   // The COUNT(m.id) projection used to live here, but the mapper below hardcodes
   // messageCount: 0, so the LEFT JOIN + GROUP BY produced ~2.4s of wasted work
   // on databases with ~1k sessions. Stripped down to an indexed SELECT.
+  // s.draft_input is deliberately absent: the mapper drops it (drafts sync on
+  // change, not in bulk), so selecting it only widened every row. s.metadata is
+  // projected down to the keys the sync wire reads, in SQL, for the same reason.
   const { rows } = await moduleDb.query<any>(
-    `SELECT s.id, s.provider, s.model, s.mode, s.session_type, s.parent_session_id, s.agent_role, s.created_by_session_id, s.title, s.workspace_id, s.draft_input,
+    `SELECT s.id, s.provider, s.model, s.mode, s.session_type, s.parent_session_id, s.agent_role, s.created_by_session_id, s.title, s.workspace_id,
             s.worktree_id, s.is_archived, s.is_pinned, s.branched_from_session_id, s.branch_point_message_id, s.branched_at,
-            s.created_at, s.updated_at, s.metadata
+            s.created_at, s.updated_at, ${buildSyncedMetadataProjectionSql('s.metadata')} AS metadata
      FROM ai_sessions s
-     ORDER BY s.updated_at DESC`
+     ${projectFilterSql}
+     ORDER BY s.updated_at DESC`,
+    projectFilterParams.length > 0 ? projectFilterParams : undefined
   );
   const queryTime = performance.now() - queryStart;
 
@@ -167,12 +277,12 @@ export async function getAllSessionsForSync(includeMessages = false): Promise<Ar
       model: row.model,
       mode: row.mode,
       sessionType: row.session_type || 'session',
-      parentSessionId: row.parent_session_id || undefined,
+      parentSessionId: row.parent_session_id ?? null,
       agentRole: row.agent_role || 'standard',
-      createdBySessionId: row.created_by_session_id || undefined,
+      createdBySessionId: row.created_by_session_id ?? null,
       worktreeId: row.worktree_id || undefined,
-      isArchived: row.is_archived ?? false,
-      isPinned: row.is_pinned ?? false,
+      isArchived: !!row.is_archived,
+      isPinned: !!row.is_pinned,
       branchedFromSessionId: row.branched_from_session_id || undefined,
       branchPointMessageId: row.branch_point_message_id || undefined,
       branchedAt: toMillis(row.branched_at) ?? undefined,
@@ -181,12 +291,18 @@ export async function getAllSessionsForSync(includeMessages = false): Promise<Ar
       workspacePath: row.workspace_id, // workspace_id is the path in this system
       // NOTE: Do NOT include draftInput in bulk sync - it should only sync when actually changed
       // Including it here causes spurious metadata_updated events for all sessions on startup
+      //
+      // No COUNT join here: it cost seconds on a large database. The zero is a
+      // placeholder, and `messageCountKnown: false` is what stops the sync
+      // producer from publishing it over the server's real count.
       messageCount: 0,
+      messageCountKnown: false,
       updatedAt: toMillis(row.updated_at)!,
       createdAt: toMillis(row.created_at)!,
       // Sync clients (mobile, peer devices) expect a parsed object here.
-      // See `parseJsonColumn` for the SQLite/PGLite shape difference.
-      metadata: normalizeJsonObject(row.metadata),
+      // See `parseJsonColumn` for the SQLite/PGLite shape difference; the
+      // projection then keeps only what the wire reads.
+      metadata: projectSyncedMetadata(normalizeJsonObject(row.metadata)),
       messages: undefined as SyncedMessage[] | undefined,
     };
   }));
@@ -326,6 +442,35 @@ export async function getSessionMessagesForSyncBatch(
   return result;
 }
 
+/** Provider variants use the same on-disk resume identity. */
+export function providerSessionAliases(provider: string): [string, string] {
+  if (provider === 'claude-code' || provider === 'claude-code-cli') return ['claude-code', 'claude-code-cli'];
+  if (provider === 'openai-codex' || provider === 'openai-codex-acp') return ['openai-codex', 'openai-codex-acp'];
+  return [provider, provider];
+}
+
+/** Resolve only within the provider and workspace; never guess between resume handles. */
+export async function resolveProviderSessionId(
+  db: PGliteLike,
+  provider: string,
+  providerSessionId: string,
+  workspaceId: string,
+  sourceWorkspacePath = workspaceId,
+): Promise<string | null> {
+  const [canonicalProvider, alias] = providerSessionAliases(provider);
+  const { rows } = await db.query<{ id: string }>(
+    `SELECT id FROM ai_sessions
+     WHERE provider IN ($1, $4) AND provider_session_id = $2 AND workspace_id IN ($3, $5)
+     UNION ALL
+     SELECT id FROM ai_sessions
+     WHERE id = $2 AND provider IN ($1, $4) AND workspace_id IN ($3, $5) AND provider_session_id IS NULL
+     LIMIT 2`,
+    [canonicalProvider, providerSessionId, workspaceId, alias, sourceWorkspacePath],
+  );
+  if (rows.length > 1) throw new Error('Ambiguous external provider session identity');
+  return rows[0]?.id ?? null;
+}
+
 export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureReadyFn): SessionStore {
   // Store db reference for module-level functions
   moduleDb = db;
@@ -336,7 +481,7 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
     }
   };
 
-  return {
+  const store: SessionStore = {
     async ensureReady(): Promise<void> {
       await ensureReady();
     },
@@ -353,6 +498,24 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
       const updatedAt = new Date(updatedAtMs);
 
       const branchedAt = payload.branchedAt ? new Date(payload.branchedAt) : null;
+
+      // The insert below upserts. Re-creating an existing extension-owned row
+      // (e.g. a renderer re-issuing sessions:create) must not wipe its owner or
+      // the owner's bag: ownership is immutable once assigned.
+      let createMetadata: Record<string, unknown> = payload.metadata ?? {};
+      const { rows: existingRows } = await db.query<{ metadata: unknown; workspace_id?: string }>(
+        `SELECT metadata, workspace_id FROM ai_sessions WHERE id = $1`,
+        [payload.id],
+      );
+      await assertSessionCreation(db, payload, existingRows[0]);
+      const existingMetadata = existingRows[0] ? normalizeJsonObject(existingRows[0].metadata) : null;
+      if (existingMetadata && readSessionOwner(existingMetadata)) {
+        createMetadata = {
+          ...stripOwnerControlledMetadata(createMetadata),
+          [SESSION_OWNER_KEY]: existingMetadata[SESSION_OWNER_KEY],
+          [OWNER_METADATA_KEY]: existingMetadata[OWNER_METADATA_KEY] ?? {},
+        };
+      }
 
       await db.query(
         `INSERT INTO ai_sessions (
@@ -408,8 +571,8 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
           payload.providerConfig ?? null,
           payload.providerSessionId ?? null,
           null,
-          (payload as any).metadata ?? {},
-          (payload as any).hasBeenNamed ?? false,
+          createMetadata,
+          payload.hasBeenNamed ?? false,
           createdAt,
           updatedAt,
           payload.branchedFromSessionId ?? null,  // Branch tracking - separate from parent
@@ -440,6 +603,7 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
       if (metadata.mode !== undefined) pushUpdate('mode =', metadata.mode);
       if (metadata.agentRole !== undefined) pushUpdate('agent_role =', metadata.agentRole);
       if (metadata.createdBySessionId !== undefined) pushUpdate('created_by_session_id =', metadata.createdBySessionId ?? null);
+      if (metadata.worktreeId !== undefined) pushUpdate('worktree_id =', metadata.worktreeId ?? null);
       if (metadata.workspaceId !== undefined) pushUpdate('workspace_id =', metadata.workspaceId);
       if (metadata.filePath !== undefined) pushUpdate('file_path =', metadata.filePath ?? null);
       if (metadata.providerConfig !== undefined) pushUpdate('provider_config =', metadata.providerConfig ?? null);
@@ -460,7 +624,14 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
       // loudly so the upstream caller surfaces in main.log instead of
       // silently amplifying corruption.
       if (metadata.metadata !== undefined) {
-        const incoming = metadata.metadata;
+        // Owner keys are assigned at creation and edited only by the owning
+        // extension's broker; drop them from every ordinary write. Non-objects
+        // pass through untouched to be refused below.
+        const raw = metadata.metadata as unknown;
+        const incoming =
+          raw && typeof raw === 'object' && !Array.isArray(raw)
+            ? stripOwnerControlledMetadata(raw as Record<string, unknown>)
+            : metadata.metadata;
         if (
           incoming === null ||
           typeof incoming !== 'object' ||
@@ -476,7 +647,10 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
             [sessionId],
           );
           const existingMetadata = normalizeJsonObject(rows[0]?.metadata);
-          const merged: Record<string, any> = { ...existingMetadata, ...normalizedIncoming };
+          // Only the incoming keys are written, merged in SQL. Writing back the whole
+          // blob read above let two overlapping updates each drop the other's keys: a
+          // question's `hasPendingPrompt` vanished when a token-usage write raced it.
+          const patch: Record<string, any> = { ...normalizedIncoming };
           // Record workflow-phase transitions into metadata.activity[] so the
           // session's lifecycle history is self-contained and renderable on the
           // project-graph timeline (see session/sessionPhaseTransition.ts). This
@@ -492,10 +666,16 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
               null,
               Date.now(),
             );
-            if (transition.changed) merged.activity = transition.metadata.activity;
+            if (transition.changed) patch.activity = transition.metadata.activity;
           }
-          updates.push(`metadata = $${values.length + 1}`);
-          values.push(JSON.stringify(merged));
+          if (isStoredJsonObject(rows[0]?.metadata)) {
+            updates.push(`metadata = ${sessionMetadataMergeSql("COALESCE(metadata, '{}'::jsonb)", values.length + 1, patch)}`);
+            values.push(JSON.stringify(patch));
+          } else {
+            // A malformed column cannot be merged into; replace it with the repaired object.
+            updates.push(`metadata = $${values.length + 1}`);
+            values.push(JSON.stringify({ ...existingMetadata, ...patch }));
+          }
         }
       }
       if ((metadata as any).hasBeenNamed !== undefined) pushUpdate('has_been_named =', (metadata as any).hasBeenNamed);
@@ -517,24 +697,26 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
         return;
       }
 
+      if (metadata.hierarchySync && !metadata.hierarchySync.isCurrent()) throw new Error('Superseded hierarchy update');
       const setClause = updates.join(', ');
-      await db.query(
-        `UPDATE ai_sessions SET ${setClause} WHERE id=$1`,
-        values
-      );
-
-      // GitHub #925 / NIM-1831: a workstream is archived (or restored) as a unit.
-      // Cascade the is_archived flag to direct children (linked by
-      // parent_session_id) so archiving a workstream parent doesn't leave its
-      // child sessions active — invisible orphans that keep counting toward the
-      // active total. buildSessionArchiveFilter only checks a row's own
-      // is_archived, so the children must carry the flag themselves.
       if (metadata.isArchived !== undefined) {
-        await db.query(
-          `UPDATE ai_sessions SET is_archived=$2 WHERE parent_session_id=$1`,
-          [sessionId, metadata.isArchived]
-        );
+        const { rows: subtree } = await db.query<{ id: string }>(`${SESSION_DESCENDANTS_CTE} SELECT id FROM session_subtree`, [sessionId]);
+        const statements = [
+          { sql: `UPDATE ai_sessions SET ${setClause} WHERE id=$1`, params: values },
+          { sql: `${SESSION_DESCENDANTS_CTE} UPDATE ai_sessions SET is_archived=$2 WHERE id IN (SELECT id FROM session_subtree)`, params: [sessionId, metadata.isArchived] },
+        ];
+        if (db.runTransaction) await db.runTransaction(statements);
+        else for (const statement of statements) await db.query(statement.sql, statement.params);
+        await publishSubtreeArchive(subtree.map(row => row.id), metadata.isArchived);
+      } else {
+        await db.query(`UPDATE ai_sessions SET ${setClause} WHERE id=$1`, values);
       }
+    },
+
+    async findByProviderSessionId(provider: string, providerSessionId: string, workspaceId: string): Promise<ChatSession | null> {
+      await ensureReady();
+      const id = await resolveProviderSessionId(db, provider, providerSessionId, workspaceId);
+      return id ? this.get(id) : null;
     },
 
     async get(sessionId: string): Promise<ChatSession | null> {
@@ -585,8 +767,8 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
         providerSessionId: row.provider_session_id ?? undefined,
         lastReadMessageTimestamp: row.last_read_ms ? Number(row.last_read_ms) : undefined,
         hasBeenNamed: row.has_been_named ?? false,
-        isArchived: row.is_archived ?? false,
-        isPinned: row.is_pinned ?? false,
+        isArchived: !!row.is_archived,
+        isPinned: !!row.is_pinned,
         // Branch tracking fields - SEPARATE from hierarchical parentSessionId
         branchedFromSessionId: row.branched_from_session_id ?? undefined,
         branchPointMessageId: row.branch_point_message_id ? parseInt(row.branch_point_message_id) : undefined,
@@ -645,8 +827,8 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
           providerSessionId: row.provider_session_id ?? undefined,
           lastReadMessageTimestamp: row.last_read_ms ? Number(row.last_read_ms) : undefined,
           hasBeenNamed: row.has_been_named ?? false,
-          isArchived: row.is_archived ?? false,
-          isPinned: row.is_pinned ?? false,
+          isArchived: !!row.is_archived,
+          isPinned: !!row.is_pinned,
           branchedFromSessionId: row.branched_from_session_id ?? undefined,
           branchPointMessageId: row.branch_point_message_id ? parseInt(row.branch_point_message_id) : undefined,
           branchedAt: toMillis(row.branched_at) ?? undefined,
@@ -663,49 +845,42 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
       const archiveFilter = buildSessionArchiveFilter(includeArchived);
 
       const queryStart = performance.now();
-      // Query includes parent_session_id and child_count for hierarchical session support
-      // child_count and max child updated_at are pre-aggregated once per parent session
-      // so list rendering does not pay for correlated subqueries on every row.
-      // branched_from_session_id is separate from parent_session_id (branch vs hierarchy)
-      // metadata is included for hasUnread state (transient UI state stored in DB for cross-device sync)
-      // NOTE: message_count removed - it required an expensive LEFT JOIN on ai_agent_messages
-      // that was slow with many sessions. The count is not essential for the list view.
+      // Direct counts in SQL; recursive counts and subtree activity in JS (see
+      // computeDescendantStats). Message counts load lazily to keep the history
+      // query off the raw log.
       const { rows } = await db.query<any>(
         `SELECT s.id, s.provider, s.model, s.session_type, s.mode, s.agent_role, s.created_by_session_id, s.title, s.workspace_id,
                 s.worktree_id, s.parent_session_id, s.created_at, s.updated_at, s.is_archived, s.is_pinned,
                 s.branched_from_session_id, s.branch_point_message_id, s.branched_at, s.metadata,
-                COALESCE(child_stats.child_count, 0) as child_count,
-                GREATEST(s.updated_at, COALESCE(child_stats.max_child_updated_at, s.updated_at)) as effective_updated_at
+                COALESCE(child_stats.child_count, 0) as child_count
          FROM ai_sessions s
          LEFT JOIN worktrees w ON s.worktree_id = w.id
          LEFT JOIN (
-           SELECT
-             parent_session_id,
-             COUNT(*) AS child_count,
-             MAX(updated_at) AS max_child_updated_at
+           SELECT parent_session_id, COUNT(*) AS child_count
            FROM ai_sessions
            WHERE parent_session_id IS NOT NULL
              AND workspace_id = $1
            GROUP BY parent_session_id
          ) child_stats ON child_stats.parent_session_id = s.id
-         WHERE s.workspace_id=$1 ${archiveFilter}
-         ORDER BY effective_updated_at DESC`,
+         WHERE s.workspace_id=$1 ${archiveFilter}`,
         [workspaceId]
       );
+      // Archived descendants still count toward their ancestors.
+      const { rows: graph } = await db.query<any>(
+        'SELECT id, parent_session_id, updated_at FROM ai_sessions WHERE workspace_id = $1',
+        [workspaceId]
+      );
+      const descendants = computeDescendantStats(graph.map(row => ({ id: row.id, parentId: row.parent_session_id, updatedAt: toMillis(row.updated_at) ?? 0 })));
       const queryTime = performance.now() - queryStart;
       const totalTime = performance.now() - startTime;
       // console.log(`[PGLiteSessionStore] list() - ensureReady: ${ensureTime.toFixed(1)}ms, query: ${queryTime.toFixed(1)}ms, total: ${totalTime.toFixed(1)}ms, rows: ${rows.length}`);
-      return rows.map(row => {
+      const sessions = rows.map(row => {
         const createdAt = toMillis(row.created_at)!;
         // For workstream parents, use the effective timestamp that includes child activity
-        const updatedAt = toMillis(row.effective_updated_at ?? row.updated_at)!;
+        const updatedAt = Math.max(toMillis(row.updated_at)!, descendants.get(row.id)?.maxUpdatedAt ?? 0);
         const branchedAt = toMillis(row.branched_at) ?? undefined;
         const childCount = parseInt(row.child_count) || 0;
-        // Parse JSON columns at the boundary -- see `parseJsonColumn`.
-        // Without this, `metadata.tags`, `metadata.phase`, `metadata.hasUnread`
-        // etc. all read as undefined under the SQLite backend (because
-        // `metadata` is a raw JSON string), so kanban tags/phase disappear
-        // from the session list view.
+        // SQLite returns JSON text; PGLite returns a parsed object.
         const metadata = normalizeJsonObject(row.metadata);
         return {
           id: row.id,
@@ -720,12 +895,13 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
           parentSessionId: row.parent_session_id ?? null,
           createdBySessionId: row.created_by_session_id ?? null,
           childCount,
+          descendantCount: descendants.get(row.id)?.count ?? 0,
           uncommittedCount: 0,
           createdAt,
           updatedAt,
           messageCount: 0,  // Not computed in list query for performance - loaded lazily if needed
-          isArchived: row.is_archived ?? false,
-          isPinned: row.is_pinned ?? false,
+          isArchived: !!row.is_archived,
+          isPinned: !!row.is_pinned,
           // Branch tracking - SEPARATE from hierarchical parentSessionId
           branchedFromSessionId: row.branched_from_session_id ?? undefined,
           branchPointMessageId: row.branch_point_message_id ? parseInt(row.branch_point_message_id) : undefined,
@@ -737,6 +913,10 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
           // Replaces the legacy `metadata.pendingAskUserQuestion` flag,
           // which nothing was writing.
           hasPendingInteractivePrompt: !!metadata.hasPendingPrompt,
+          externalSource: metadata.externalSource === 'claude-code' || metadata.externalSource === 'openai-codex'
+            ? metadata.externalSource : undefined,
+          externalLastActivityAt: typeof metadata.externalLastActivityAt === 'number' && Number.isFinite(metadata.externalLastActivityAt)
+            ? metadata.externalLastActivityAt : undefined,
           // Kanban board phase and tags from metadata JSONB
           phase: metadata.phase ?? undefined,
           tags: Array.isArray(metadata.tags) ? metadata.tags : undefined,
@@ -744,6 +924,7 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
           linkedTrackerItemIds: Array.isArray(metadata.linkedTrackerItemIds) ? metadata.linkedTrackerItemIds : undefined,
         } satisfies SessionMeta & { hasPendingInteractivePrompt?: boolean; phase?: string; tags?: string[]; linkedTrackerItemIds?: string[] };
       });
+      return sessions.sort((a, b) => b.updatedAt - a.updatedAt);
     },
 
     async search(workspaceId: string, query: string, options?: SessionSearchOptions): Promise<SessionMeta[]> {
@@ -984,8 +1165,8 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
           createdAt,
           updatedAt,
           messageCount: 0,  // Not computed in search query for performance
-          isArchived: row.is_archived ?? false,
-          isPinned: row.is_pinned ?? false,
+          isArchived: !!row.is_archived,
+          isPinned: !!row.is_pinned,
           branchedFromSessionId: row.branched_from_session_id ?? undefined,
           branchPointMessageId: row.branch_point_message_id ? parseInt(row.branch_point_message_id) : undefined,
           branchedAt,
@@ -1026,8 +1207,8 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
           createdAt,
           updatedAt,
           messageCount: 0,
-          isArchived: row.is_archived ?? false,
-          isPinned: row.is_pinned ?? false,
+          isArchived: !!row.is_archived,
+          isPinned: !!row.is_pinned,
           branchedFromSessionId: row.branched_from_session_id ?? undefined,
           branchPointMessageId: row.branch_point_message_id ? parseInt(row.branch_point_message_id) : undefined,
           branchedAt,
@@ -1037,7 +1218,7 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
 
     async delete(sessionId: string): Promise<void> {
       await ensureReady();
-      await db.query('DELETE FROM ai_sessions WHERE id=$1', [sessionId]);
+      await deleteSessionAndLiftChildren(db, sessionId);
     },
 
     async updateTitleIfNotNamed(sessionId: string, title: string): Promise<boolean> {
@@ -1058,4 +1239,5 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
     // Note: claimQueuedPrompt has been moved to the new queued_prompts table
     // See PGLiteQueuedPromptsStore.ts for the new implementation
   };
+  return wrapSessionHierarchyWrites(store, db, ensureReady);
 }

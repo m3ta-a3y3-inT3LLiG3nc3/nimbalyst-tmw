@@ -13,7 +13,7 @@ import {
   computeInverseFieldDeltas,
 } from '../trackerRelationships';
 import { parseBuiltinTrackers } from '../ModelLoader';
-import type { FieldDefinition, TrackerRelationshipValue } from '../TrackerDataModel';
+import type { FieldDefinition, TrackerRelationshipValue } from '@nimbalyst/tracker-schema';
 
 /**
  * Epic C Phase 1: pure relationship value-model. Field-backed relationships sync
@@ -66,6 +66,27 @@ describe('normalizeRelationshipValue', () => {
 
   it('drops entries with no resolvable id', () => {
     expect(normalizeRelationshipValue([{ title: 'no id' }, ''])).toEqual([]);
+  });
+
+  // The coercer is an allow-list, so a key it does not name is dropped -- and
+  // `addRelationshipValue` normalizes the EXISTING entries before appending,
+  // which is how adding a second target silently strips the first one's pinned
+  // revision (contract 4.2). Relations carry no qualifiers, so a stale bag is
+  // the one key that SHOULD go.
+  it('carries the pinned revision through an add and drops a stale qualifier bag', () => {
+    const pinned = {
+      itemId: 'a',
+      revisionId: '9f2c1d4a-7b31-4e59-a0c8-5d6e2f1b3a77',
+      serverRevision: 4,
+      qualifiers: { operations: ['read'] },
+    } as TrackerRelationshipValue;
+    const next = addRelationshipValue(relField(), [pinned], { itemId: 'b' });
+    const kept = next.find((v) => v.itemId === 'a');
+    expect(kept).toMatchObject({
+      revisionId: '9f2c1d4a-7b31-4e59-a0c8-5d6e2f1b3a77',
+      serverRevision: 4,
+    });
+    expect(kept).not.toHaveProperty('qualifiers');
   });
 });
 

@@ -13,6 +13,8 @@ vi.mock('@nimbalyst/runtime', () => ({
   AISessionsRepository: { list: (...a: any[]) => list(...a) },
 }));
 
+vi.mock('../voicePromptLiveness', () => ({ sessionHasLivePrompt: () => true }));
+
 const resolveVoicePromptResponse = vi.fn();
 vi.mock('../../ai/MobileSessionControlHandler', () => ({
   resolveVoicePromptResponse: (...a: any[]) => resolveVoicePromptResponse(...a),
@@ -53,6 +55,14 @@ beforeEach(() => {
 });
 
 describe('answerSessionPromptForVoice', () => {
+  it('never interprets a negated or qualified approval as yes', async () => {
+    findWindowByWorkspace.mockReturnValue(makeWindow({ s1: sessionWith({ promptType: 'permission_request', status: 'pending', requestId: 'p', toolName: 'Bash' }) }));
+    for (const answer of ["don't approve", "yes, but don't run it", 'not yet', 'yes if the tests pass']) {
+      resolveVoicePromptResponse.mockClear();
+      await answerSessionPromptForVoice(WS, 's1', answer);
+      expect(resolveVoicePromptResponse.mock.calls.some(([, payload]) => payload.response.decision === 'allow')).toBe(false);
+    }
+  });
   it('maps a spoken answer to the matching option of a pending question', async () => {
     findWindowByWorkspace.mockReturnValue(
       makeWindow({
@@ -76,7 +86,7 @@ describe('answerSessionPromptForVoice', () => {
     expect(payload).toEqual({
       promptType: 'ask_user_question',
       promptId: 'req-1',
-      response: { answers: { Theme: 'Dark' } },
+      response: { answers: { 'Default theme?': 'Dark' } },
     });
   });
 
@@ -123,6 +133,30 @@ describe('answerSessionPromptForVoice', () => {
 
     expect(out.success).toBe(false);
     expect(out.error).toMatch(/multiple questions/i);
+    expect(resolveVoicePromptResponse).not.toHaveBeenCalled();
+  });
+
+  it('approves a commit proposal recorded as a tool call with exactly its files and message', async () => {
+    const proposal = (status: string) => ({
+      title: 'Commit',
+      messages: [{
+        type: 'tool_call',
+        toolCall: {
+          toolName: 'mcp__nimbalyst__developer_git_commit_proposal', providerToolCallId: 'toolu_c', status,
+          arguments: { commitMessage: 'fix: voice', filesToStage: [{ path: 'a.ts', status: 'modified' }, 'b.ts'] },
+        },
+      }],
+    });
+    findWindowByWorkspace.mockReturnValue(makeWindow({ s1: proposal('running') }));
+    expect((await answerSessionPromptForVoice(WS, 's1', 'approve')).success).toBe(true);
+    expect(resolveVoicePromptResponse).toHaveBeenCalledWith('s1', {
+      promptType: 'git_commit',
+      promptId: 'toolu_c',
+      response: { action: 'committed', files: ['a.ts', 'b.ts'], message: 'fix: voice' },
+    });
+    resolveVoicePromptResponse.mockClear();
+    findWindowByWorkspace.mockReturnValue(makeWindow({ s1: proposal('completed') }));
+    expect((await answerSessionPromptForVoice(WS, 's1', 'approve')).success).toBe(false);
     expect(resolveVoicePromptResponse).not.toHaveBeenCalled();
   });
 

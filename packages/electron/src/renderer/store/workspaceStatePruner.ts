@@ -11,6 +11,7 @@
  * `initOpenProjects()` has hydrated the rail.
  */
 import { store } from '@nimbalyst/runtime/store';
+import { setSessionWorkspaceOpenAtom } from './atoms/sessions';
 import { openProjectsAtom } from './atoms/openProjects';
 import { pruneAgentModeWorkspaceState } from './atoms/agentMode';
 import { pruneNavigationHistoryWorkspaceState } from './atoms/navigationHistory';
@@ -19,6 +20,7 @@ import { pruneCollabDocumentsScopeState } from './atoms/collabDocuments';
 import { pruneCollabDiscoveryState } from './atoms/collabDiscovery';
 import { pruneFileMentionWorkspaceState } from './atoms/fileMention';
 import { pruneGitOperationsWorkspaceState } from './atoms/gitOperations';
+import { projectAppearanceAtom } from './atoms/projectAppearance';
 import { pruneTabsSlot } from '../contexts/TabsContext';
 
 let initialized = false;
@@ -30,6 +32,7 @@ function snapshotPaths(): Set<string> {
 }
 
 function pruneWorkspace(path: string): void {
+  store.set(setSessionWorkspaceOpenAtom, { workspacePath: path, isOpen: false });
   pruneAgentModeWorkspaceState(path);
   pruneNavigationHistoryWorkspaceState(path);
   pruneWorkspaceLayout(path);
@@ -38,6 +41,7 @@ function pruneWorkspace(path: string): void {
   pruneFileMentionWorkspaceState(path);
   pruneGitOperationsWorkspaceState(path);
   pruneTabsSlot(path);
+  projectAppearanceAtom.remove(path);
 }
 
 export function initWorkspaceStatePruner(): void {
@@ -51,6 +55,9 @@ export function initWorkspaceStatePruner(): void {
       if (!current.has(path)) {
         pruneWorkspace(path);
       }
+    }
+    for (const path of current) {
+      if (!lastSeenPaths.has(path)) store.set(setSessionWorkspaceOpenAtom, { workspacePath: path, isOpen: true });
     }
     lastSeenPaths = current;
   });

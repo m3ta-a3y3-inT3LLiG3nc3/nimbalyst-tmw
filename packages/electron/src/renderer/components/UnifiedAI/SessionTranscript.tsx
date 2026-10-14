@@ -1,3 +1,4 @@
+import { RemoteSessionTranscript } from './RemoteSessionTranscript';
 /**
  * SessionTranscript - Encapsulated transcript + input for a single session
  *
@@ -27,7 +28,8 @@ import { ClaudeCliNotInstalledNotice } from './ClaudeCliNotInstalledNotice';
 import type { HunkSelection, InteractiveWidgetHost, PermissionScope } from '@nimbalyst/runtime/ui/AgentTranscript/components/CustomToolWidgets/InteractiveWidgetHost';
 import type { TodoItem } from '@nimbalyst/runtime/ui/AgentTranscript/types';
 import { isToolLikeMessage } from '@nimbalyst/runtime/ui/AgentTranscript/utils/messageTypeHelpers';
-import { AIInput, AIInputRef } from './AIInput';
+import type { AIInputRef } from './AIInput';
+import { SessionAIInput } from './SessionAIInput';
 import { PromptQueueList } from './PromptQueueList';
 import { TranscriptEmbeddedFileCard } from './TranscriptEmbeddedFileCard';
 import { getDiffPeekSizeForInteractiveWidgetHost } from './interactiveWidgetHostProxy';
@@ -58,9 +60,9 @@ import { diffTreeGroupByDirectoryAtom, setDiffTreeGroupByDirectoryAtom } from '.
 import { openSettingsCommandAtom } from '../../store/atoms/settingsNavigation';
 import {
   sessionDraftInputAtom,
-  sessionDraftHydratedAtom,
   sessionDraftAttachmentsAtom,
   sessionStoreAtom,
+  sessionRemoteHostAtom,
   sessionLoadedAtom,
   sessionMessagesAtom,
   sessionProviderAtom,
@@ -103,7 +105,9 @@ import {
   loadInitialQueuedPrompts,
 } from '../../store';
 import { streamCompletionSignalAtom } from '../../store/atoms/sessionTranscript';
-import { canPersistSessionDraft, convertToWorkstreamAtom, sessionPromptAdditionsAtom, sessionLastSubmitAtAtom, sessionDraftLocalModifiedAtAtom, nextOptimisticId } from '../../store/atoms/sessions';
+import { sessionBackgroundTasksAtom } from '../../store/atoms/sessionBackgroundTasks';
+import { sessionPromptAdditionsAtom, sessionLastSubmitAtAtom, sessionDraftLocalModifiedAtAtom, nextOptimisticId } from '../../store/atoms/sessions';
+import { sessionViewRetention } from '../../store/sessionViewRetention';
 import { clearAIInputHistoryAtom } from '../../store/atoms/aiInputUndo';
 import {
   cliTerminalExpandedAtom,
@@ -128,11 +132,15 @@ import { setAgentModeSettingsAtom, showPromptAdditionsAtom, hasExternalEditorAto
 import { supportsEffortLevel, supportsThinkingToggle, parseEffortLevel, resolveThinkingMode, type EffortLevel, type ThinkingMode } from '../../utils/modelUtils';
 import { buildPlanImplementationPrompt, resolvePlanFilePath } from '../../utils/pathUtils';
 import { resolveTranscriptClickPath } from '../../utils/resolveTranscriptClickPath';
+import { openAgentEditedPage } from '../../utils/agentEditedPage';
+import { saveSessionArchived } from '../../utils/saveSessionArchived';
 import { autoCommitEnabledAtom, setAutoCommitEnabledAtom } from '../../store/atoms/autoCommitAtoms';
+import { settingAtom } from '../../store/atoms/settingAtomFamily';
 import { diffPeekSizeAtom, setDiffPeekSizeAtom } from '../../store/atoms/diffPeekSizeAtoms';
 import { registerSessionWorkspace, loadInitialSessionFileState } from '../../store/listeners/fileStateListeners';
 import { sessionFileEditsAtom } from '../../store/atoms/sessionFiles';
 import { SESSION_PHASE_COLUMNS, setSessionPhaseAtom, type SessionPhase } from '../../store/atoms/sessionKanban';
+import { mergeRestoredPromptIntoDraft } from '../../../shared/restoredDraft';
 
 /**
  * Detect a metadata value that's the artifact of `{...stringValue, ...}` -
@@ -202,6 +210,7 @@ function makeOptimisticUserMessage(
     subagentId: null,
     mode,
     attachments,
+    optimistic: true,
   };
 }
 
@@ -342,75 +351,11 @@ async function updateSessionMetadataField<T>(
   }
 }
 
-// Props for the input wrapper — same as AIInput minus the value/onChange
-// pair (which the wrapper owns) and attachments handling (we wire it up
-// directly so the attachments subscription is isolated too).
-type SessionAIInputProps = Omit<
-  React.ComponentProps<typeof AIInput>,
-  'value' | 'onChange' | 'attachments' | 'onAttachmentAdd' | 'onAttachmentRemove'
-> & {
-  sessionId: string;
-  workspacePath: string;
-  enableAttachments: boolean;
-  onAttachmentAdd?: (attachment: ChatAttachment) => void;
-  onAttachmentRemove?: (attachmentId: string) => void;
-};
-
-/**
- * Thin wrapper that owns the draft-input and draft-attachments
- * subscriptions for one session. Extracted from SessionTranscript so that
- * each keystroke re-renders only this component (and the textarea inside
- * AIInput) instead of cascading through the entire transcript / banners /
- * queue list — which used to break text selection in the messages area.
- *
- * Also owns the debounced persistence of the draft to PGLite (formerly in
- * SessionTranscript), since that effect needs to fire on every draftInput
- * change.
- */
-const SessionAIInput = forwardRef<AIInputRef, SessionAIInputProps>(function SessionAIInput(
-  { sessionId, workspacePath, enableAttachments, onAttachmentAdd, onAttachmentRemove, ...rest },
-  ref,
-) {
-  const [draftInput, setDraftInputRaw] = useAtom(sessionDraftInputAtom(sessionId));
-  const draftHydrated = useAtomValue(sessionDraftHydratedAtom(sessionId));
-  const draftAttachments = useAtomValue(sessionDraftAttachmentsAtom(sessionId));
-  const [draftLocalModifiedAt, setDraftLocalModifiedAt] = useAtom(sessionDraftLocalModifiedAtAtom(sessionId));
-
-  const handleChange = useCallback((value: string) => {
-    setDraftInputRaw(value);
-    setDraftLocalModifiedAt(Date.now());
-  }, [setDraftInputRaw, setDraftLocalModifiedAt]);
-
-  // Debounced persistence of draft input to database — survives restarts.
-  useEffect(() => {
-    if (!workspacePath) return;
-    if (!canPersistSessionDraft(draftHydrated, draftLocalModifiedAt)) return;
-    const timeoutId = setTimeout(() => {
-      window.electronAPI.invoke('ai:saveDraftInput', sessionId, draftInput, workspacePath)
-        .catch(err => console.error('[SessionAIInput] Failed to persist draft input:', err));
-    }, 1000);
-    return () => clearTimeout(timeoutId);
-  }, [sessionId, draftInput, draftHydrated, draftLocalModifiedAt, workspacePath]);
-
-  return (
-    <AIInput
-      ref={ref}
-      value={draftInput}
-      onChange={handleChange}
-      workspacePath={workspacePath}
-      sessionId={sessionId}
-      attachments={enableAttachments ? draftAttachments : undefined}
-      onAttachmentAdd={enableAttachments ? onAttachmentAdd : undefined}
-      onAttachmentRemove={enableAttachments ? onAttachmentRemove : undefined}
-      {...rest}
-    />
-  );
-});
 
 /**
  * SessionTranscript - Fully encapsulated transcript + input for one session
  */
-export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscriptProps>(({
+const LocalSessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscriptProps>(({
   sessionId,
   workspacePath,
   mode,
@@ -430,6 +375,8 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
 }, ref) => {
   const posthog = usePostHog();
   const inputRef = useRef<AIInputRef>(null);
+  // Guards the await between Enter and the composer clearing against a second send.
+  const submittingRef = useRef(false);
   const transcriptPanelRef = useRef<{ scrollToMessage: (index: number) => void; scrollToTop: () => void }>(null);
   const loadToolCallDiffs = useCallback(
     (toolCallItemId: string, toolCallTimestamp?: number): Promise<ToolCallDiffLoadResult> =>
@@ -469,6 +416,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   const [isArchived, setIsArchived] = useAtom(sessionArchivedAtom(sessionId));
   const [isProcessing, setIsProcessing] = useAtom(sessionProcessingAtom(sessionId));
   const hasPendingInteractivePrompt = useAtomValue(sessionHasPendingInteractivePromptAtom(sessionId));
+  const backgroundTasks = useAtomValue(sessionBackgroundTasksAtom(sessionId));
   const worktreeId = useAtomValue(sessionWorktreeIdAtom(sessionId));
   const hasSessionData = useAtomValue(sessionLoadedAtom(sessionId));
   // NOTE: deliberately NOT subscribing to sessionUpdatedAtAtom. updatedAt churns
@@ -490,7 +438,6 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
 
   // Child session creation for "start new session" option
   const createChildSession = useSetAtom(createChildSessionAtom);
-  const convertToWorkstream = useSetAtom(convertToWorkstreamAtom);
   const sessionChildren = useAtomValue(sessionChildrenAtom(sessionId));
   const sessionParentId = useAtomValue(sessionParentIdAtom(sessionId));
   const defaultModel = useAtomValue(defaultAgentModelAtom);
@@ -806,6 +753,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   // Auto-commit setting
   const autoCommitEnabled = useAtomValue(autoCommitEnabledAtom);
   const setAutoCommitEnabled = useSetAtom(setAutoCommitEnabledAtom);
+  const usageLimitAutoResumeEnabled = useAtomValue(settingAtom('ai.usageLimitAutoResumeEnabled'));
 
   // Diff peek popover size (shared with git extension)
   const diffPeekSize = useAtomValue(diffPeekSizeAtom);
@@ -827,6 +775,9 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   // ============================================================
   // Load session data on mount
   // ============================================================
+  // Keep this session's messages resident while it is shown.
+  useEffect(() => (sessionId ? sessionViewRetention.acquire(sessionId) : undefined), [sessionId]);
+
   useEffect(() => {
     if (!sessionId || !workspacePath) return;
     if (!hasSessionData) {
@@ -935,7 +886,9 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         (sessionError.message.toLowerCase().includes('401 unauthorized') ||
          (sessionError.message.toLowerCase().includes('401') && sessionError.message.toLowerCase().includes('authentication')));
 
-      if (!isCodexOpenAIAuthError) {
+      // A usage-limit block is already saved as the rate-limit card, which
+      // carries the auto-resume switch; a local copy would show it twice.
+      if (!isCodexOpenAIAuthError && !sessionError.isUsageLimit) {
         // Add error as an assistant message so user can see what went wrong.
         // isCodexAuthRequired short-circuits the rendered text to a CTA widget
         // that opens the Codex auth section in settings; the raw error string
@@ -1102,40 +1055,21 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       // from re-rendering the entire transcript.
       const currentAttachments = store.get(sessionDraftAttachmentsAtom(sessionId)) ?? [];
 
-      // If there's already a pending queued prompt, append to it instead of
-      // creating a separate entry. This bundles multiple queued messages into
-      // one prompt, matching how Claude Code handles stacked queries.
-      const lastQueued = queuedPrompts[queuedPrompts.length - 1];
-      let combinedPrompt = message.trim();
-      let combinedAttachments = currentAttachments;
-
-      if (lastQueued) {
-        // Delete the existing queued prompt so we can replace it
-        await window.electronAPI.invoke('ai:deleteQueuedPrompt', lastQueued.id);
-        combinedPrompt = lastQueued.prompt + '\n\n' + message.trim();
-        // Merge attachments from both prompts
-        combinedAttachments = [...(lastQueued.attachments || []), ...currentAttachments];
-      }
-
+      // Keep each submission's authorship/context and stable queue position.
+      // Delete-and-recreate merging can race a claim or absorb an agent report.
       const result = await window.electronAPI.invoke(
         'ai:createQueuedPrompt',
         sessionId,
-        combinedPrompt,
-        combinedAttachments,
+        message.trim(),
+        currentAttachments,
         serializableContext
       ) as { id: string; prompt: string; timestamp: number };
 
-      setQueuedPrompts(prev => {
-        // Remove the old queued prompt (if we merged into it) and add the new combined one
-        const filtered = lastQueued ? prev.filter(p => p.id !== lastQueued.id) : prev;
-        return [...filtered, {
-          id: result.id,
-          prompt: combinedPrompt,
-          timestamp: result.timestamp,
-          documentContext: serializableContext,
-          attachments: combinedAttachments
-        }];
-      });
+      setQueuedPrompts(prev => [...prev.filter(p => p.id !== result.id), {
+        ...result,
+        documentContext: serializableContext,
+        attachments: currentAttachments
+      }]);
 
       setLastSubmitAt(Date.now());
       setDraftInput('');
@@ -1146,7 +1080,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     } finally {
       setIsQueueing(false);
     }
-  }, [sessionId, getEffectiveDocumentContext, setDraftInput, setDraftAttachments, setLastSubmitAt, isQueueing, queuedPrompts, clearAIInputHistory]);
+  }, [sessionId, getEffectiveDocumentContext, setDraftInput, setDraftAttachments, setLastSubmitAt, isQueueing, clearAIInputHistory]);
 
   // What the composer looked like when this session opened. Once per session,
   // not per render: we are trying to explain why people do not act on a screen,
@@ -1354,6 +1288,30 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     const sessionRegistry = store.get(sessionRegistryAtom);
     message = expandSessionMentions(message, sessionRegistry);
 
+    // Record the prompt durably before the composer and its persisted draft
+    // are cleared. Setup before the provider logs the prompt can stall, and a
+    // quit during that stall used to lose the text. If this write fails, the
+    // draft is left alone and nothing is sent.
+    if (submittingRef.current) {
+      blocked('duplicate_prompt');
+      return;
+    }
+    submittingRef.current = true;
+    let submissionId: string;
+    try {
+      ({ submissionId } = await window.electronAPI.invoke('ai:recordPendingSubmission', sessionId, message) as { submissionId: string });
+    } catch (error) {
+      console.error('[SessionTranscript] Failed to record submission:', error);
+      updateSessionStore({
+        sessionId,
+        updates: { messages: [...messages, makeOptimisticError('Could not save your message, so it was not sent. Your text is still in the composer.')] },
+      });
+      blocked('submission_record_failed');
+      return;
+    } finally {
+      submittingRef.current = false;
+    }
+
     setLastSubmitAt(Date.now());
     setDraftInput('');
     setDraftAttachments([]);
@@ -1384,6 +1342,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         attachments: attachments.length > 0 ? attachments : undefined,
         mode: overrideMode,
         inputType: 'user' as const,
+        submissionId,
       };
 
       await window.electronAPI.invoke('ai:sendMessage', message, docContext, sessionId, workspacePath);
@@ -1406,6 +1365,12 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
           messages: [...messages, userMessage, errorMessage],
         },
       });
+      // Give the text back so a failed send can be retried, keeping anything
+      // typed since. The `prev` form reads the live draft, not the one above.
+      setDraftInput(prev => mergeRestoredPromptIntoDraft(prev, message));
+      if (attachments.length > 0) {
+        setDraftAttachments(prev => (prev && prev.length > 0 ? prev : attachments));
+      }
       setIsProcessing(false);
     }
   }, [sessionId, sessionData, isLoading, getEffectiveDocumentContext, aiMode, workspacePath, setDraftInput, setDraftAttachments, setLastSubmitAt, resetHistory, updateSessionStore, handleQueue, setIsProcessing, messages, sessionHasMessages, startedCliSessionId, mode, onClearSession, onClearAgentSession, clearAIInputHistory, provider, recordClaudeActivity]);
@@ -1446,6 +1411,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
           actionLabel: action.label,
           config: {
             model: action.config.model,
+            effort: action.config.effort,
             foreground: action.config.foreground,
             autoSubmit: action.config.autoSubmit,
             worktree: action.config.worktree,
@@ -1508,7 +1474,14 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     return !!registration?.supportsTranscriptEmbed;
   }, []);
 
+  // Read through a ref so handleCompact keeps its identity across message
+  // updates; it is threaded down to every transcript row, and a new identity
+  // per streamed frame would defeat the row memoization.
+  const compactStateRef = useRef({ sessionData, messages });
+  compactStateRef.current = { sessionData, messages };
+
   const handleCompact = useCallback(async () => {
+    const { sessionData, messages } = compactStateRef.current;
     if (!sessionData) return;
 
     // Phase 4: the provider's declared capability chooses the mechanism. This
@@ -1556,7 +1529,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     } catch (error) {
       console.error('[SessionTranscript] Failed to send /compact command:', error);
     }
-  }, [sessionId, sessionData, messages, getEffectiveDocumentContext, aiMode, workspacePath, updateSessionStore, compactionSupport]);
+  }, [sessionId, getEffectiveDocumentContext, aiMode, workspacePath, updateSessionStore, compactionSupport]);
 
   const handleTodoClick = useCallback((todo: TodoItem) => {
     onTodoClick?.(todo);
@@ -1608,22 +1581,16 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   }, [sessionId, workspacePath]);
 
   const handleCloseAndArchive = useCallback(async () => {
-    try {
-      await window.electronAPI.invoke('sessions:update-metadata', sessionId, { isArchived: true });
-      setIsArchived(true);
-      onCloseAndArchive?.(sessionId);
-    } catch (error) {
-      console.error('[SessionTranscript] Failed to archive session:', error);
-    }
+    // The helper shows an error message itself if the save fails. Stop here so the screen never says "archived" when it was not saved.
+    if (!(await saveSessionArchived(sessionId, true))) return;
+    setIsArchived(true);
+    onCloseAndArchive?.(sessionId);
   }, [sessionId, setIsArchived, onCloseAndArchive]);
 
   const handleUnarchive = useCallback(async () => {
-    try {
-      await window.electronAPI.invoke('sessions:update-metadata', sessionId, { isArchived: false });
-      setIsArchived(false);
-    } catch (error) {
-      console.error('[SessionTranscript] Failed to unarchive session:', error);
-    }
+    // Same rule as above: if the save fails, the helper shows the error and we change nothing on screen.
+    if (!(await saveSessionArchived(sessionId, false))) return;
+    setIsArchived(false);
   }, [sessionId, setIsArchived]);
 
   const handleAIModeChange = useCallback(async (newMode: AIMode) => {
@@ -1765,45 +1732,15 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
 
   // Handler for "Start new session to implement" option
   // Creates a new session and opens it with a populated draft before stopping the current plan session.
-  // For worktree sessions: creates a new session in the same worktree (no parent-child hierarchy)
-  // For regular sessions: creates a workstream hierarchy (converts to workstream if needed)
+  // The implementation session stays under the planning session in the same container.
   const handleExitPlanModeStartNewSession = useCallback(async (requestId: string, confirmSessionId: string, planFilePath: string) => {
     try {
-      let newSessionId: string | null = null;
-
-      // Check if we're in a worktree session
-      if (worktreeId && onCreateWorktreeSession) {
-        // Worktree sessions: create a new session in the same worktree (NOT a workstream)
-        // This avoids creating workstreams-within-worktrees which is not supported
-        console.log('[SessionTranscript] Creating new session in worktree:', worktreeId);
-        newSessionId = await onCreateWorktreeSession(worktreeId);
-      } else {
-        // Regular sessions: use workstream hierarchy logic
-        const hasChildren = sessionChildren.length > 0;
-
-        if (hasChildren || sessionParentId) {
-          // Already part of a workstream hierarchy - create a child of the appropriate parent
-          // If sessionParentId exists, we're a child session - create sibling under the same parent
-          // If hasChildren, we're the root - create child under us
-          const parentId = sessionParentId || confirmSessionId;
-          newSessionId = await createChildSession({
-            parentSessionId: parentId,
-            workspacePath: workspacePath || '',
-            provider: 'claude-code',
-            model: defaultModel,
-          });
-        } else {
-          // Single session - convert to workstream first, which creates a sibling session
-          const result = await convertToWorkstream({
-            sessionId: confirmSessionId,
-            workspacePath: workspacePath || '',
-            model: defaultModel,
-          });
-          if (result?.siblingId) {
-            newSessionId = result.siblingId;
-          }
-        }
-      }
+      const newSessionId = await createChildSession({
+        parentSessionId: confirmSessionId,
+        workspacePath: workspacePath || '',
+        provider: 'claude-code',
+        model: defaultModel,
+      });
 
       if (!newSessionId) {
         console.error('[SessionTranscript] Failed to create new implementation session');
@@ -1833,7 +1770,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     } catch (error) {
       console.error('[SessionTranscript] Failed to start new session for implementation:', error);
     }
-  }, [sessionChildren, sessionParentId, workspacePath, worktreeId, onCreateWorktreeSession, createChildSession, convertToWorkstream, sessionWorktreePath, posthog, defaultModel, openSessionWithDraft, stopExitPlanModeSession]);
+  }, [sessionChildren, sessionParentId, workspacePath, worktreeId, onCreateWorktreeSession, createChildSession, sessionWorktreePath, posthog, defaultModel, openSessionWithDraft, stopExitPlanModeSession]);
 
   const handleExitPlanModeCancel = useCallback(async (requestId: string, confirmSessionId: string) => {
     try {
@@ -2000,6 +1937,13 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         setAutoCommitEnabled(enabled);
       },
 
+      // Usage-limit auto-resume (the rate-limit card's switch)
+      usageLimitAutoResumeEnabled,
+      setUsageLimitAutoResume: async (enabled: boolean, resetsAtMs: number | null) => {
+        const current = workspacePath && resetsAtMs != null ? { sessionId, workspacePath, resetsAtMs } : undefined;
+        await window.electronAPI.invoke('wakeup:set-usage-limit-auto-resume', enabled, current);
+      },
+
       // Git commit operations
       gitCommit: async (
         proposalId: string,
@@ -2017,7 +1961,9 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
             message,
             files,
             sessionId,
-            hunkSelections
+            hunkSelections,
+            undefined,
+            proposalId
           ) as {
             success: boolean;
             commitHash?: string;
@@ -2243,6 +2189,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
           await window.electronAPI.invoke('workspace:open-file', { workspacePath, filePath });
         }
       },
+      openPage: (uri: string) => openAgentEditedPage(uri, workspacePath || ''),
       trackEvent: (eventName: string, properties?: Record<string, unknown>) => {
         posthog?.capture(eventName, properties);
       },
@@ -2258,6 +2205,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       get workspacePath() { return liveHostRef.current?.workspacePath ?? (workspacePath || ''); },
       get worktreeId() { return liveHostRef.current?.worktreeId ?? worktreeId; },
       get autoCommitEnabled() { return liveHostRef.current?.autoCommitEnabled ?? false; },
+      get usageLimitAutoResumeEnabled() { return liveHostRef.current?.usageLimitAutoResumeEnabled ?? false; },
       get diffPeekSize() { return getDiffPeekSizeForInteractiveWidgetHost(liveHostRef.current); },
       askUserQuestionSubmit: (...args) => liveHostRef.current!.askUserQuestionSubmit(...args),
       askUserQuestionCancel: (...args) => liveHostRef.current!.askUserQuestionCancel(...args),
@@ -2275,6 +2223,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       renderFeedbackArtifactPreview: (...args) => liveHostRef.current!.renderFeedbackArtifactPreview!(...args),
       renderFeedbackArtifactPopover: (...args) => liveHostRef.current!.renderFeedbackArtifactPopover!(...args),
       setAutoCommitEnabled: (...args) => liveHostRef.current!.setAutoCommitEnabled(...args),
+      setUsageLimitAutoResume: (...args) => liveHostRef.current!.setUsageLimitAutoResume!(...args),
       gitCommit: (...args) => liveHostRef.current!.gitCommit(...args),
       gitCommitCancel: (...args) => liveHostRef.current!.gitCommitCancel(...args),
       gitFileDiff: (...args) => liveHostRef.current!.gitFileDiff!(...args),
@@ -2284,6 +2233,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       retryAttachmentStaging: (...args) => liveHostRef.current!.retryAttachmentStaging!(...args),
       openAttachmentSettings: (...args) => liveHostRef.current!.openAttachmentSettings!(...args),
       openFile: (...args) => liveHostRef.current!.openFile(...args),
+      openPage: (...args) => liveHostRef.current!.openPage!(...args),
       trackEvent: (...args) => liveHostRef.current!.trackEvent(...args),
     };
 
@@ -2647,6 +2597,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
             promptAdditions={showPromptAdditions ? promptAdditions : null}
             currentTeammates={transcriptTeammates}
             waitingForNoun={waitingForNoun}
+            backgroundTasks={isProcessing && backgroundTasks?.length ? backgroundTasks : undefined}
             appStartTime={appStartTime ?? undefined}
             renderEmbeddedFile={renderEmbeddedFile}
             canEmbedFile={canEmbedFile}
@@ -2860,4 +2811,12 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   );
 });
 
+LocalSessionTranscript.displayName = 'LocalSessionTranscript';
+
+export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscriptProps>((props, ref) => {
+  const remoteHost = useAtomValue(sessionRemoteHostAtom(props.sessionId));
+  return remoteHost
+    ? <RemoteSessionTranscript key={props.sessionId} {...props} ref={ref} />
+    : <LocalSessionTranscript {...props} ref={ref} />;
+});
 SessionTranscript.displayName = 'SessionTranscript';

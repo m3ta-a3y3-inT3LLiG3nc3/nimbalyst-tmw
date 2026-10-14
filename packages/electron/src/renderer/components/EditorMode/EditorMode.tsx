@@ -43,6 +43,8 @@ import {
   aiChatCollapsedAtomFamily,
 } from '../../store/atoms/workspaceLayout';
 import { refreshFileTree } from '../../store/listeners/fileTreeListeners';
+import { bindActiveFileToTabs } from '../../store/atoms/fileTree';
+import { requestConfirmation } from '../../dialogs/requestConfirmation';
 
 export interface EditorModeRef {
   closeActiveTab: () => void;
@@ -244,6 +246,10 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
     return unsubscribe;
   }, [tabsActions]);
 
+  // The repo-aware UI (title-bar branch, new-worktree source) reads the active
+  // file from Jotai; the main tabs live in TabsContext.
+  useEffect(() => bindActiveFileToTabs(tabsActions), [tabsActions]);
+
   // Keep activeTabForContextRef in sync with active tab (no re-render)
   useEffect(() => {
     const updateActiveTabForContext = () => {
@@ -373,11 +379,14 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
       : 'disconnected';
 
     if (isCollabUri(tab.filePath) && hasCollabUnsyncedChanges(collabStatus)) {
-      const confirmed = window.confirm(
-        collabStatus === 'replaying'
+      const confirmed = await requestConfirmation({
+        title: 'Close document?',
+        message: collabStatus === 'replaying'
           ? 'This collaborative document is still replaying local changes to the server. Close it anyway?'
-          : 'This collaborative document still has local changes that have not been confirmed by the server. Close it anyway?'
-      );
+          : 'This collaborative document still has local changes that have not been confirmed by the server. Close it anyway?',
+        confirmLabel: 'Close Anyway',
+        destructive: true,
+      });
       if (!confirmed) {
         return;
       }

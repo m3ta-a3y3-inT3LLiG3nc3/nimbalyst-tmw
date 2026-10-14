@@ -61,6 +61,7 @@ vi.mock('fs/promises', () => ({
 
 vi.mock('../../utils/store', () => ({
   getWorkspaceState: (workspacePath: string) => workspaceStates.get(workspacePath) ?? {},
+  getWorkspaceStateField: (workspacePath: string, field: string) => (workspaceStates.get(workspacePath) as any)?.[field],
   updateWorkspaceState: (workspacePath: string, updater: (state: any) => void) => {
     const state = workspaceStates.get(workspacePath) ?? {};
     updater(state);
@@ -122,11 +123,17 @@ import {
   autoMatchTeamForWorkspace,
   bindWorkspaceToSharedProject,
   findTeamForWorkspace,
+  getTeamByOrgId,
   invalidateListTeamsCache,
   listTeams,
   registerTeamHandlers,
 } from '../TeamService';
-import { refreshPersonalSessionForAccount } from '../StytchAuthService';
+import {
+  getPersonalSessionJwtForAccount,
+  getSessionTokenForAccount,
+  refreshPersonalSessionForAccount,
+} from '../StytchAuthService';
+import { logger } from '../../utils/logger';
 import { getJwtExp } from '../jwtOrg';
 import {
   inspectProjectFolder,
@@ -527,6 +534,28 @@ describe('listTeams TTL cache + invalidation (RC4)', () => {
     expect(apiTeamsFetchCallCount()).toBe(2);
   });
 
+  it('rejects array-only consumers on server discovery failure and recovers without caching emptiness', async () => {
+    await listTeams();
+    invalidateListTeamsCache();
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({ code: 'TEAM_DIRECTORY_UNAVAILABLE', error: 'Organizations unavailable' }) });
+    await expect(listTeams()).rejects.toThrow('Organization directory is unavailable');
+    await expect(listTeams()).resolves.toEqual([expect.objectContaining({ orgId: 'org-1' })]);
+    expect(apiTeamsFetchCallCount()).toBe(3);
+  });
+
+  it('does not flatten an unavailable directory into "org not found" for a single-org lookup', async () => {
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({ code: 'TEAM_DIRECTORY_UNAVAILABLE', error: 'Organizations unavailable' }) });
+    await expect(getTeamByOrgId('org-1')).rejects.toThrow('Organization directory is unavailable');
+    await expect(getTeamByOrgId('org-1')).resolves.toEqual(expect.objectContaining({ orgId: 'org-1' }));
+    await expect(getTeamByOrgId('org-absent')).resolves.toBeNull();
+  });
+
+  it('rejects a malformed successful response instead of caching an empty directory', async () => {
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({}) });
+    await expect(listTeams()).rejects.toThrow('Organization directory is unavailable');
+    await expect(listTeams()).resolves.toEqual([expect.objectContaining({ orgId: 'org-1' })]);
+  });
+
   it('refreshes the account personal JWT rather than retrying discovery with an active team JWT', async () => {
     vi.mocked(refreshPersonalSessionForAccount).mockResolvedValueOnce('fresh-personal-jwt' as never);
     fetchMock
@@ -559,6 +588,44 @@ describe('listTeams TTL cache + invalidation (RC4)', () => {
       headers: expect.objectContaining({ Authorization: 'Bearer fresh-personal-jwt' }),
     }));
   });
+
+  // Launch with a team-exchanged primary session: signed in, but no personal
+  // JWT until the first personal-org exchange. Every lookup in that gap used to
+  // fail as "not signed in" -- 63 error lines per startup.
+  it('mints a missing personal JWT for a startup burst instead of failing every lookup', async () => {
+    vi.mocked(getPersonalSessionJwtForAccount).mockReturnValueOnce(null as never);
+    vi.mocked(refreshPersonalSessionForAccount).mockResolvedValueOnce('fresh-personal-jwt' as never);
+    const handler = handlers.get('team:find-for-workspace')!;
+
+    const results = await Promise.all(
+      ['/workspace/one', '/workspace/two', '/workspace/three'].map((path) => handler(null, path)),
+    );
+
+    for (const result of results) {
+      expect(result).toEqual({ success: true, team: expect.objectContaining({ orgId: 'org-1' }), complete: true });
+    }
+    expect(refreshPersonalSessionForAccount).toHaveBeenCalledTimes(1);
+    expect(apiTeamsFetchCallCount()).toBe(1);
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({
+      headers: expect.objectContaining({ Authorization: 'Bearer fresh-personal-jwt' }),
+    }));
+  });
+
+  it('reports a signed-out account as incomplete without a refresh or a pending-invite error', async () => {
+    vi.mocked(getPersonalSessionJwtForAccount).mockReturnValue(null as never);
+    vi.mocked(getSessionTokenForAccount).mockReturnValue(null as never);
+    try {
+      const result = await handlers.get('team:find-for-workspace')!(null, '/workspace/one');
+
+      expect(result).toEqual({ success: true, team: null, complete: false });
+      expect(refreshPersonalSessionForAccount).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(vi.mocked(logger.main.error).mock.calls.flat().join(' ')).not.toContain('findPendingInviteForWorkspace');
+    } finally {
+      vi.mocked(getPersonalSessionJwtForAccount).mockReturnValue('personal-jwt' as never);
+      vi.mocked(getSessionTokenForAccount).mockReturnValue('session-token' as never);
+    }
+  });
 });
 
 /**
@@ -588,10 +655,10 @@ describe('autoMatchTeamForWorkspace across the JWT arrival gap', () => {
     vi.useRealTimers();
   });
 
-  it('retries a lookup that could not complete, and starts tracker sync once it does', async () => {
-    fetchMock
-      .mockRejectedValueOnce(new Error('Not authenticated. Sign in first.'))
-      .mockImplementation(okTeams([{
+  it.each(['auth', 'server'])('recovers tracker startup after an incomplete %s lookup', async (failure) => {
+    if (failure === 'auth') fetchMock.mockRejectedValueOnce(new Error('Not authenticated. Sign in first.'));
+    else fetchMock.mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({ error: 'Organizations unavailable' }) });
+    fetchMock.mockImplementation(okTeams([{
         orgId: 'org-1', name: 'Widgets Team', gitRemoteHash: REMOTE_HASH,
         teamProjectId: 'tp-1', createdAt: new Date().toISOString(), role: 'admin',
       }]));

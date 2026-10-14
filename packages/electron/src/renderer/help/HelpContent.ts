@@ -9,6 +9,7 @@
  */
 
 import { KeyboardShortcuts } from '../../shared/KeyboardShortcuts';
+import { CANVAS_HELP_CONTENT } from '@nimbalyst/runtime/canvas/canvasHelpContent';
 import { getRegisteredPanels } from '../extensions/panels/PanelRegistry';
 import { getRegisteredKeybindings } from '../extensions/commands/ExtensionCommandRegistry';
 
@@ -28,6 +29,7 @@ export interface HelpEntry {
  * Central registry of help content, keyed by data-testid
  */
 export const HelpContent: Record<string, HelpEntry> = {
+  ...CANVAS_HELP_CONTENT,
   // ============================================================================
   // Teams - Security & encryption (Epic H2)
   // ============================================================================
@@ -372,8 +374,8 @@ export const HelpContent: Record<string, HelpEntry> = {
     shortcut: KeyboardShortcuts.view.trackerMode,
   },
   'collab-mode-button': {
-    title: 'Shared Documents',
-    body: 'Browse and edit documents shared with your team in real-time. Collaborate on markdown, spreadsheets, and diagrams.',
+    title: 'Wiki',
+    body: 'Browse and edit pages shared with your team in real-time. Collaborate on markdown, spreadsheets, diagrams, and placed tracker types.',
     shortcut: KeyboardShortcuts.view.collabMode,
   },
   'org-mode-button': {

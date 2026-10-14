@@ -1,3 +1,5 @@
+import { createCommittedRankBuilder, createSessionOrder, getLiveSessionOrderTimestamp } from './sessionHistoryOrder';
+import {selectedMachineAtom} from '../../store/atoms/remoteMachines';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { activeFileRepoPathAtom } from '../../store/atoms/workspaceRepos';
@@ -9,17 +11,21 @@ import { Virtuoso, VirtuosoHandle } from 'react-virtuoso';
 import { CollapsibleGroup } from './CollapsibleGroup';
 import { WorktreeBaseBranchPicker } from './WorktreeBaseBranchPicker';
 import { SessionListItem } from './SessionListItem';
+import { SessionTreeRow, useVisibleSessionTreeRows, type VisibleSessionTreeRow } from './SessionTree.tsx';
+import { visibleSessionTreeIds, sessionTreeRootId } from './sessionTreeModel';
+import { resolveSessionArchiveSelection, sessionArchiveSubtreeIds } from './sessionArchiveSelection';
 import { WorkstreamGroup } from './WorkstreamGroup';
 import { BlitzGroup } from './BlitzGroup';
 import { SuperLoopGroup } from './SuperLoopGroup';
-import { MetaAgentGroup } from './MetaAgentGroup';
 import { NewSuperLoopDialog } from './NewSuperLoopDialog';
 import { ArchiveProgress } from './ArchiveProgress';
 import { IndexBuildDialog } from './IndexBuildDialog';
 import { ArchiveWorktreeDialog } from '../AgentMode/ArchiveWorktreeDialog';
 import { useArchiveWorktreeDialog } from '../../hooks/useArchiveWorktreeDialog';
+import { requestConfirmation } from '../../dialogs/requestConfirmation';
 import { getTimeGroupKey, TimeGroupKey } from '../../utils/dateFormatting';
 import { getFileName } from '../../utils/pathUtils';
+import { saveSessionArchived } from '../../utils/saveSessionArchived';
 import { KeyboardShortcuts, getShortcutDisplay } from '../../../shared/KeyboardShortcuts';
 import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
 import {
@@ -39,14 +45,16 @@ import {
 import { alphaFeatureEnabledAtom, worktreesFeatureAvailableAtom } from '../../store/atoms/appSettings';
 import { activeWorkspacePathAtom } from '../../store/atoms/openProjects';
 import { useGitRepoProbe } from '../../hooks/useGitRepoProbe';
-import { activeSessionIdAtom as globalActiveSessionIdAtom, sessionPinnedUpdateAtom } from '../../store/atoms/sessions';
-import { collapsedGroupsAtom, sortOrderAtom, setCollapsedGroupsAtom, setSortOrderAtom } from '../../store/atoms/agentMode';
+import { workstreamStateAtom } from '../../store/atoms/workstreamState';
+import { sessionProcessingAtom, sessionUnreadAtom, sessionHasPendingInteractivePromptAtom, activeSessionIdAtom as globalActiveSessionIdAtom, sessionPinnedUpdateAtom } from '../../store/atoms/sessions';
+import { collapsedGroupsAtom, compactRowsAtom, setCompactRowsAtom, sortOrderAtom, setCollapsedGroupsAtom, setSortOrderAtom } from '../../store/atoms/agentMode';
 import {
   recentlyRenamedSessionAtom,
   selectSessionActionAtom,
   selectChildSessionActionAtom,
   deleteSessionActionAtom,
   archiveSessionActionAtom,
+  deselectArchivedSessionActionAtom,
   renameSessionActionAtom,
   branchSessionActionAtom,
   createNewSessionActionAtom,
@@ -76,6 +84,7 @@ import { HelpTooltip } from '../../help';
 import { AlphaBadge } from '../common/AlphaBadge';
 import { defaultAgentModelAtom } from '../../store/atoms/appSettings';
 import { usePostHog } from 'posthog-js/react';
+import { projectAppearanceAtom } from '../../store/atoms/projectAppearance';
 import { WorkspaceSummaryHeader, generateWorkspaceAccentColor } from '../WorkspaceSummaryHeader';
 import { errorNotificationService } from '../../services/ErrorNotificationService';
 import { FloatingPortal, useFloatingMenu } from '../../hooks/useFloatingMenu';
@@ -83,6 +92,7 @@ import {
   patchWorkstreamChildPin,
   reconcileSessionPinToggle,
   workstreamChildrenNeedRefresh,
+  countRegistryDescendants,
 } from './workstreamChildPinReconciliation';
 import './SessionHistory.css';
 
@@ -124,7 +134,22 @@ type UnifiedListItem =
   | { type: 'worktree'; worktreeId: string; sessions: SessionItem[]; timestamp: number; rank: number }
   | { type: 'blitz'; blitzId: string; worktrees: { worktreeId: string; sessions: SessionItem[] }[]; timestamp: number; rank: number }
   | { type: 'superLoop'; loop: SuperLoop; timestamp: number; rank: number }
-  | { type: 'metaAgent'; metaSession: SessionItem; childSessions: SessionItem[]; timestamp: number; rank: number };
+;
+
+/** Stable identity for virtual list keys; index keys remount rows whenever the list re-sorts. */
+function unifiedItemId(item: UnifiedListItem): string {
+  switch (item.type) {
+    case 'session':
+    case 'workstream':
+      return item.session.id;
+    case 'worktree':
+      return item.worktreeId;
+    case 'blitz':
+      return item.blitzId;
+    case 'superLoop':
+      return item.loop.id;
+  }
+}
 
 // Search filter options for content search
 type SearchTimeRange = '7d' | '30d' | '90d' | 'all';
@@ -155,26 +180,6 @@ const DIRECTION_LABELS: Record<SearchDirection, string> = {
   'output': 'Assistant only',
 };
 
-function getLiveSessionOrderTimestamp(
-  session: Pick<SessionItem, 'id' | 'createdAt' | 'updatedAt'>,
-  options: {
-    sortBy: 'updated' | 'created';
-    mode: 'chat' | 'agent';
-    turnActivity: Map<string, number>;
-  }
-): number {
-  const { sortBy, mode, turnActivity } = options;
-  if (sortBy === 'created') {
-    return session.createdAt;
-  }
-  if (mode === 'agent') {
-    const turnBoundaryTimestamp = turnActivity.get(session.id);
-    if (turnBoundaryTimestamp !== undefined) {
-      return turnBoundaryTimestamp;
-    }
-  }
-  return session.updatedAt || session.createdAt;
-}
 
 function mapsHaveSameKeys(a: Map<string, number>, b: Map<string, number>): boolean {
   if (a.size !== b.size) return false;
@@ -196,9 +201,14 @@ function compareNumbersDesc(a: number, b: number): number {
   return b - a;
 }
 
-function compareNumbersAsc(a: number, b: number): number {
-  return a - b;
+function compareUnifiedItems(a: UnifiedListItem, b: UnifiedListItem) {
+  const timestampDiff = compareNumbersDesc(a.timestamp, b.timestamp);
+  if (timestampDiff !== 0) return timestampDiff;
+  const rankDiff = a.rank - b.rank;
+  if (rankDiff !== 0) return rankDiff;
+  return a.type.localeCompare(b.type);
 }
+
 
 /**
  * SessionHistory takes no props. All inputs come from Jotai atoms:
@@ -218,6 +228,8 @@ const SessionHistoryComponent: React.FC = () => {
   const activeSessionId = useAtomValue(globalActiveSessionIdAtom);
   const collapsedGroups = useAtomValue(collapsedGroupsAtom);
   const controlledSortOrder = useAtomValue(sortOrderAtom);
+  const compactRows = useAtomValue(compactRowsAtom);
+  const setCompactRows = useSetAtom(setCompactRowsAtom);
   const setCollapsedGroupsAction = useSetAtom(setCollapsedGroupsAtom);
   const setSortOrderAction = useSetAtom(setSortOrderAtom);
   const onCollapsedGroupsChange = setCollapsedGroupsAction;
@@ -251,6 +263,7 @@ const SessionHistoryComponent: React.FC = () => {
   const dispatchSelectChildSession = useSetAtom(selectChildSessionActionAtom);
   const dispatchDeleteSession = useSetAtom(deleteSessionActionAtom);
   const dispatchArchiveSession = useSetAtom(archiveSessionActionAtom);
+  const dispatchDeselectArchivedSession = useSetAtom(deselectArchivedSessionActionAtom);
   const dispatchRenameSession = useSetAtom(renameSessionActionAtom);
   const dispatchBranchSession = useSetAtom(branchSessionActionAtom);
   const dispatchCreateNewSession = useSetAtom(createNewSessionActionAtom);
@@ -279,9 +292,10 @@ const SessionHistoryComponent: React.FC = () => {
   const onSessionDelete: ((sessionId: string) => void) | undefined = useCallback((sessionId: string) => {
     void dispatchDeleteSession(sessionId);
   }, [dispatchDeleteSession]);
+  // This runs after an archive is already saved, so it must not send a second archive request.
   const onSessionArchive: ((sessionId: string) => void) | undefined = useCallback((sessionId: string) => {
-    void dispatchArchiveSession(sessionId);
-  }, [dispatchArchiveSession]);
+    dispatchDeselectArchivedSession(sessionId);
+  }, [dispatchDeselectArchivedSession]);
   const onSessionRename: ((sessionId: string, newName: string) => void) | undefined = useCallback((sessionId: string, newName: string) => {
     void dispatchRenameSession({ sessionId, newName });
   }, [dispatchRenameSession]);
@@ -319,6 +333,7 @@ const SessionHistoryComponent: React.FC = () => {
 
   // === Atom subscriptions for session list ===
   // Use sessionListRootAtom to only show root sessions (not children of workstreams)
+  const selectedRemoteHost = useAtomValue(selectedMachineAtom(workspacePath));
   const allSessionsFromAtom = useAtomValue(sessionListRootAtom);
   const atomLoading = useAtomValue(sessionListLoadingAtom);
   const showArchivedAtom = useAtomValue(showArchivedSessionsAtom);
@@ -335,7 +350,8 @@ const SessionHistoryComponent: React.FC = () => {
   const isMetaAgentEnabled = useAtomValue(alphaFeatureEnabledAtom('meta-agent'));
 
   // === Super Loop state ===
-  const superLoops = useAtomValue(superLoopListAtom);
+  const localSuperLoops = useAtomValue(superLoopListAtom);
+  const superLoops = useMemo(() => selectedRemoteHost ? [] : localSuperLoops, [selectedRemoteHost, localSuperLoops]);
   const upsertSuperLoop = useSetAtom(upsertSuperLoopAtom);
   const removeSuperLoop = useSetAtom(removeSuperLoopAtom);
   const { openDialog: openSuperLoopDialog } = useSuperLoopDialog();
@@ -344,7 +360,7 @@ const SessionHistoryComponent: React.FC = () => {
   const defaultAgentModel = useAtomValue(defaultAgentModelAtom);
   const addSession = useSetAtom(addSessionFullAtom);
 
-  const handleNewMetaAgent = useCallback(async () => {
+  const handleNewMetaAgent = async () => {
     try {
       const result = await createMetaAgentSession(workspacePath, defaultAgentModel);
       if (result) {
@@ -372,7 +388,7 @@ const SessionHistoryComponent: React.FC = () => {
     } catch (error) {
       console.error('[SessionHistory] Failed to create meta-agent session:', error);
     }
-  }, [defaultAgentModel, workspacePath, onSessionSelect, addSession]);
+  };
 
   // Get the session registry to look up parent session IDs
   const sessionRegistry = useAtomValue(sessionRegistryAtom);
@@ -396,13 +412,13 @@ const SessionHistoryComponent: React.FC = () => {
   const iosMatchCount = useMemo(() => {
     let count = 0;
     for (const s of sessionRegistry.values()) {
-      if (s.workspaceId !== workspacePath) continue;
+      if (s.workspaceId !== workspacePath || (s.remoteHostDeviceId ?? '') !== selectedRemoteHost) continue;
       if (s.isArchived) continue;
       if (s.sessionType === 'workstream' || s.sessionType === 'blitz') continue;
       count++;
     }
     return count;
-  }, [sessionRegistry, workspacePath]);
+  }, [sessionRegistry, workspacePath, selectedRemoteHost]);
 
   const [sessions, setSessions] = useState<SessionItem[]>([]); // Filtered sessions to display
   const loading = atomLoading && allSessions.length === 0; // Only show loading on initial load
@@ -421,7 +437,7 @@ const SessionHistoryComponent: React.FC = () => {
   const showArchived = showArchivedAtom;
   const setShowArchived = setShowArchivedAtom;
   const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(new Set());
-  const [selectedGroupIds, setSelectedGroupIds] = useState<Set<string>>(new Set()); // Format: "blitz:id", "worktree:id", "workstream:id", "superloop:id", "meta-agent:id"
+  const [selectedGroupIds, setSelectedGroupIds] = useState<Set<string>>(new Set()); // Format: "blitz:id", "worktree:id", "workstream:id", "superloop:id"
   const lastSelectedIdRef = useRef<string | null>(null); // For shift+click range selection
   // Tracks the last searchQuery|tagFilter|mode combination the title-filter effect ran for, so
   // it can tell a real user-driven filter change apart from an unrelated `allSessions` reference
@@ -431,6 +447,8 @@ const SessionHistoryComponent: React.FC = () => {
   const [workstreamChildrenCache, setWorkstreamChildrenCache] = useState<Map<string, SessionItem[]>>(new Map()); // Cache workstream children
   const [blitzCache, setBlitzCache] = useState<Map<string, BlitzData>>(new Map()); // Cache blitz data
   const pendingWorkstreamChildrenFetchesRef = useRef<Set<string>>(new Set());
+  // childCount each cached children list was fetched for, keyed `${id}|${showArchived}`.
+  const workstreamChildrenFetchedForRef = useRef<Map<string, number>>(new Map());
   // Mirrors `workstreamChildrenCache` so the workstream-children fetch
   // effect below can read the current cache without putting it in deps
   // (which previously formed a self-trigger loop: setCache -> dep change ->
@@ -502,7 +520,7 @@ const SessionHistoryComponent: React.FC = () => {
     );
   }, [allWorkspaceTags, allSessions, tagFilter.tags, tagQuery]);
 
-  const addTagFilter = useCallback((tag: string) => {
+  const addTagFilter = (tag: string) => {
     if (!tagFilter.tags.includes(tag)) {
       const next = [...tagFilter.tags, tag];
       setTagFilter({ tags: next });
@@ -514,11 +532,11 @@ const SessionHistoryComponent: React.FC = () => {
     setTagQuery('');
     setShowTagDropdown(false);
     setHighlightedTagIndex(0);
-  }, [tagFilter, setTagFilter, posthog]);
+  };
 
-  const removeTagFilter = useCallback((tag: string) => {
+  const removeTagFilter = (tag: string) => {
     setTagFilter({ tags: tagFilter.tags.filter(t => t !== tag) });
-  }, [tagFilter, setTagFilter]);
+  };
 
   // Archive worktree dialog hook
   const {
@@ -568,7 +586,8 @@ const SessionHistoryComponent: React.FC = () => {
 
   // Extract workspace name from path
   const workspaceName = getFileName(workspacePath) || 'Workspace';
-  const workspaceColor = generateWorkspaceAccentColor(workspacePath);
+  const projectAppearance = useAtomValue(projectAppearanceAtom(workspacePath)).snapshot?.appearance;
+  const workspaceColor = projectAppearance?.color || generateWorkspaceAccentColor(workspacePath);
   const useThrottledTurnOrdering = mode === 'agent' && sortBy === 'updated';
   const liveOrderTimestampMap = useMemo(() => {
     const timestamps = new Map<string, number>();
@@ -608,69 +627,16 @@ const SessionHistoryComponent: React.FC = () => {
       });
     return new Map(rankedSessions.map((session, index) => [session.id, index]));
   });
-  const buildCommittedRankMap = useCallback((nextMap: Map<string, number>) => {
-    const rankedSessions = Array.from(sessionRegistry.values())
-      .sort((a, b) => {
-        const timestampDiff = compareNumbersDesc(
-          nextMap.get(a.id) ?? 0,
-          nextMap.get(b.id) ?? 0,
-        );
-        if (timestampDiff !== 0) return timestampDiff;
-
-        const previousRankA = displayOrderRankMap.get(a.id);
-        const previousRankB = displayOrderRankMap.get(b.id);
-        if (previousRankA !== undefined && previousRankB !== undefined && previousRankA !== previousRankB) {
-          return compareNumbersAsc(previousRankA, previousRankB);
-        }
-
-        const createdDiff = compareNumbersDesc(a.createdAt, b.createdAt);
-        if (createdDiff !== 0) return createdDiff;
-
-        return a.id.localeCompare(b.id);
-      });
-    return new Map(rankedSessions.map((session, index) => [session.id, index]));
-  }, [sessionRegistry, displayOrderRankMap]);
-  const getDisplayedOrderTimestamp = useCallback((session: Pick<SessionItem, 'id' | 'createdAt' | 'updatedAt'>) => {
-    const liveTimestamp = getLiveSessionOrderTimestamp(session, {
-      sortBy,
-      mode,
-      turnActivity: workspaceTurnActivity,
-    });
-    if (!useThrottledTurnOrdering) {
-      return liveTimestamp;
-    }
-    return displayOrderTimestampMap.get(session.id) ?? liveTimestamp;
-  }, [sortBy, mode, workspaceTurnActivity, useThrottledTurnOrdering, displayOrderTimestampMap]);
-  const getDisplayedOrderRank = useCallback((sessionId: string) => {
-    return displayOrderRankMap.get(sessionId) ?? Number.MAX_SAFE_INTEGER;
-  }, [displayOrderRankMap]);
-  const compareSessionOrder = useCallback((
-    a: Pick<SessionItem, 'id' | 'createdAt' | 'updatedAt'>,
-    b: Pick<SessionItem, 'id' | 'createdAt' | 'updatedAt'>
-  ) => {
-    const timestampDiff = compareNumbersDesc(
-      getDisplayedOrderTimestamp(a),
-      getDisplayedOrderTimestamp(b),
-    );
-    if (timestampDiff !== 0) return timestampDiff;
-
-    const rankDiff = compareNumbersAsc(
-      getDisplayedOrderRank(a.id),
-      getDisplayedOrderRank(b.id),
-    );
-    if (rankDiff !== 0) return rankDiff;
-
-    const createdDiff = compareNumbersDesc(a.createdAt, b.createdAt);
-    if (createdDiff !== 0) return createdDiff;
-    return a.id.localeCompare(b.id);
-  }, [getDisplayedOrderRank, getDisplayedOrderTimestamp]);
-  const compareUnifiedItems = useCallback((a: UnifiedListItem, b: UnifiedListItem) => {
-    const timestampDiff = compareNumbersDesc(a.timestamp, b.timestamp);
-    if (timestampDiff !== 0) return timestampDiff;
-    const rankDiff = compareNumbersAsc(a.rank, b.rank);
-    if (rankDiff !== 0) return rankDiff;
-    return a.type.localeCompare(b.type);
-  }, []);
+  // Create comparators outside this render scope so cached functions cannot
+  // keep older session-panel renders alive through each other's closures.
+  const buildCommittedRankMap = useMemo(
+    () => createCommittedRankBuilder(sessionRegistry, displayOrderRankMap),
+    [sessionRegistry, displayOrderRankMap],
+  );
+  const { getDisplayedOrderTimestamp, getDisplayedOrderRank, compareSessionOrder } = useMemo(
+    () => createSessionOrder({ sortBy, mode, workspaceTurnActivity, useThrottledTurnOrdering, displayOrderTimestampMap, displayOrderRankMap }),
+    [sortBy, mode, workspaceTurnActivity, useThrottledTurnOrdering, displayOrderTimestampMap, displayOrderRankMap],
+  );
 
   // Load all sessions - now just triggers atom refresh
   // The atom handles IPC calls and state updates
@@ -691,7 +657,7 @@ const SessionHistoryComponent: React.FC = () => {
   }, [refreshSessions]);
 
   // Execute the actual search query
-  const executeSearch = useCallback(async (query: string, filters: SearchFilters = searchFilters) => {
+  const executeSearch = async (query: string, filters: SearchFilters = searchFilters) => {
     try {
       setIsSearching(true);
       setError(null);
@@ -734,11 +700,11 @@ const SessionHistoryComponent: React.FC = () => {
     } finally {
       setIsSearching(false);
     }
-  }, [workspacePath, showArchived, mode, searchFilters]);
+  };
 
   // Search message content in database (heavy operation)
   // Checks if FTS index exists and prompts user to build if needed for large databases
-  const searchMessageContent = useCallback(async (query: string) => {
+  const searchMessageContent = async (query: string) => {
     try {
       // Check FTS index status before searching
       const { indexExists, messageCount } = await window.electronAPI.ai.getFtsIndexStatus(workspacePath);
@@ -757,7 +723,7 @@ const SessionHistoryComponent: React.FC = () => {
       console.error('[SessionHistory] Failed to search sessions:', err);
       setError('Failed to search sessions');
     }
-  }, [workspacePath, executeSearch]);
+  };
 
   // Load all sessions on mount and when refreshTrigger or showArchived changes
   useEffect(() => {
@@ -974,13 +940,13 @@ const SessionHistoryComponent: React.FC = () => {
   }, [activeSessionId, sessions, onSessionSelect]);
 
   // Function to trigger content search (database query for message content)
-  const searchMessageContents = useCallback(() => {
+  const searchMessageContents = () => {
     if (!searchQuery.trim() || contentSearchTriggered) {
       return; // Don't search if already triggered or no query
     }
     setContentSearchTriggered(true);
     searchMessageContent(searchQuery);
-  }, [searchQuery, contentSearchTriggered, searchMessageContent]);
+  };
 
   // Close search filters dropdown on click outside
   useEffect(() => {
@@ -1020,7 +986,7 @@ const SessionHistoryComponent: React.FC = () => {
   }, []);
 
   // Handle user choosing to build FTS index
-  const handleBuildIndex = useCallback(async () => {
+  const handleBuildIndex = async () => {
     setIsIndexBuilding(true);
     try {
       const result = await window.electronAPI.ai.buildFtsIndex();
@@ -1042,17 +1008,17 @@ const SessionHistoryComponent: React.FC = () => {
       setShowIndexDialog(false);
       setPendingSearchQuery(null);
     }
-  }, [pendingSearchQuery, executeSearch]);
+  };
 
   // Handle user skipping index build
-  const handleSkipIndex = useCallback(async () => {
+  const handleSkipIndex = async () => {
     setShowIndexDialog(false);
     // Still run the search, just slower
     if (pendingSearchQuery) {
       await executeSearch(pendingSearchQuery);
     }
     setPendingSearchQuery(null);
-  }, [pendingSearchQuery, executeSearch]);
+  };
 
   // Note: Visual indicators (processing, unread, pending) are now applied in the
   // allSessions useMemo above, which depends on the status props. The filtering
@@ -1212,84 +1178,15 @@ const SessionHistoryComponent: React.FC = () => {
   };
 
   const handleArchiveSession = async (sessionId: string) => {
-    // The IPC handler at packages/electron/src/main/ipc/SessionHandlers.ts:472
-    // returns `{success: true}` on the happy path and `{success: false, error}`
-    // on validation/DB failures (e.g. session-provider-switch guard, session
-    // not found, store write failure). We previously only caught throws,
-    // which meant a returned `{success: false}` envelope still produced the
-    // optimistic UI removal even though the DB write didn't happen — the
-    // session reappeared on next refresh and the user saw "Archive does
-    // nothing" with no clue why. See #282.
-    try {
-      const result = await window.electronAPI.invoke('sessions:update-metadata', sessionId, { isArchived: true });
-      if (result && typeof result === 'object' && result.success === false) {
-        const message = (result.error && String(result.error)) || 'The backend rejected the archive request.';
-        errorNotificationService.showError('Failed to archive session', message);
-        console.error('[SessionHistory] Archive rejected by backend:', message);
-        return;
-      }
-      // Update atom state immediately for instant feedback (optimistic update)
-      // If not showing archived, this effectively removes it from view
-      updateSessionStore({ sessionId, updates: { isArchived: true } });
-      // Also remove from filtered list for immediate feedback
-      setSessions(prev => prev.filter(s => s.id !== sessionId));
-      // Notify parent to close the tab if open
-      if (onSessionArchive) {
-        onSessionArchive(sessionId);
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      errorNotificationService.showError('Failed to archive session', message);
-      console.error('[SessionHistory] Failed to archive session:', err);
+    // The action saves the archive, shows any error, updates the store and clears the selection.
+    const archivedIds = await dispatchArchiveSession(sessionId);
+    if (archivedIds.length > 0) {
+      setSessions(prev => prev.filter(s => !archivedIds.includes(s.id)));
     }
   };
 
-  const getMetaAgentGroupSessionIds = useCallback((metaSessionId: string) => {
-    return [
-      metaSessionId,
-      ...sessions
-        .filter(session => session.createdBySessionId === metaSessionId)
-        .map(session => session.id),
-    ];
-  }, [sessions]);
-
-  const handleArchiveMetaAgentSession = useCallback(async (metaSessionId: string) => {
-    const sessionIds = getMetaAgentGroupSessionIds(metaSessionId);
-    try {
-      const results = await Promise.all(
-        sessionIds.map(sessionId => window.electronAPI.invoke('sessions:update-metadata', sessionId, { isArchived: true }))
-      );
-      // Same rejection-surfacing as handleArchiveSession: if any per-session
-      // archive came back `{success: false}`, surface it rather than silently
-      // proceeding with the optimistic UI update. See #282.
-      const failures = results
-        .map((r, i) => ({ r, sessionId: sessionIds[i] }))
-        .filter(({ r }) => r && typeof r === 'object' && r.success === false);
-      if (failures.length > 0) {
-        const message = failures
-          .map(({ r, sessionId }) => `${sessionId}: ${(r && r.error && String(r.error)) || 'rejected'}`)
-          .join('\n');
-        errorNotificationService.showError(
-          `Failed to archive meta-agent session (${failures.length} of ${sessionIds.length} rejected)`,
-          message,
-        );
-        console.error('[SessionHistory] Meta-agent archive rejected by backend:', failures);
-        return;
-      }
-      sessionIds.forEach(sessionId => {
-        updateSessionStore({ sessionId, updates: { isArchived: true } });
-        onSessionArchive?.(sessionId);
-      });
-      setSessions(prev => prev.filter(session => !sessionIds.includes(session.id)));
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      errorNotificationService.showError('Failed to archive meta-agent session', message);
-      console.error('[SessionHistory] Failed to archive meta-agent session:', err);
-    }
-  }, [getMetaAgentGroupSessionIds, onSessionArchive, updateSessionStore]);
-
   // Clean up UI state after a worktree archive (used by both auto-archive and dialog confirm paths)
-  const cleanupAfterWorktreeArchive = useCallback((worktreeId: string) => {
+  const cleanupAfterWorktreeArchive = (worktreeId: string) => {
     const worktreeSessions = allSessions.filter(s => s.worktreeId === worktreeId);
     worktreeSessions.forEach(session => {
       removeSessionFromAtom(session.id);
@@ -1309,7 +1206,7 @@ const SessionHistoryComponent: React.FC = () => {
     if (superLoop) {
       removeSuperLoop(superLoop.id);
     }
-  }, [allSessions, removeSessionFromAtom, onSessionArchive, superLoops, removeSuperLoop]);
+  };
 
   // Archive worktree: auto-archives if clean, otherwise shows confirmation dialog
   const handleArchiveWorktree = async (worktreeId: string) => {
@@ -1330,7 +1227,7 @@ const SessionHistoryComponent: React.FC = () => {
     }
   };
 
-  const handleCleanGitignored = useCallback(async (worktreeId: string) => {
+  const handleCleanGitignored = async (worktreeId: string) => {
     const worktreeData = worktreeCache.get(worktreeId);
     if (!worktreeData?.path) return;
 
@@ -1340,25 +1237,28 @@ const SessionHistoryComponent: React.FC = () => {
       const preview = await window.electronAPI.worktreeListGitignored(worktreeData.path);
       if (!preview.success || preview.count === 0) return;
 
-      const confirmed = window.confirm(
-        `Remove ${preview.count} gitignored ${preview.count === 1 ? 'item' : 'items'} from "${worktreeName}"?\n\nThis includes files like node_modules and build artifacts that can be regenerated.`
-      );
+      const confirmed = await requestConfirmation({
+        title: 'Clean Gitignored Files',
+        message: `Remove ${preview.count} gitignored ${preview.count === 1 ? 'item' : 'items'} from "${worktreeName}"?\n\nThis includes files like node_modules and build artifacts that can be regenerated.`,
+        confirmLabel: 'Remove',
+        destructive: true,
+      });
       if (!confirmed) return;
 
       const result = await window.electronAPI.worktreeCleanGitignored(worktreeData.path);
       if (result.success) {
-        window.alert(`Removed ${result.count} gitignored ${result.count === 1 ? 'item' : 'items'} from "${worktreeName}".`);
+        errorNotificationService.showInfo('Gitignored Files Removed', `Removed ${result.count} gitignored ${result.count === 1 ? 'item' : 'items'} from "${worktreeName}".`);
       } else {
         console.error('[SessionHistory] Failed to clean gitignored files:', result.error);
-        window.alert(`Failed to clean gitignored files: ${result.error}`);
+        errorNotificationService.showError('Clean Failed', `Failed to clean gitignored files: ${result.error}`);
       }
     } catch (error) {
       console.error('[SessionHistory] Failed to clean gitignored files:', error);
     }
-  }, [worktreeCache]);
+  };
 
   // Handle archive confirmation from the dialog
-  const handleConfirmArchiveWorktree = useCallback(async () => {
+  const handleConfirmArchiveWorktree = async () => {
     if (!archiveWorktreeDialogState) return;
 
     const worktreeId = archiveWorktreeDialogState.worktreeId;
@@ -1366,51 +1266,16 @@ const SessionHistoryComponent: React.FC = () => {
     await confirmArchiveWorktree(workspacePath, () => {
       cleanupAfterWorktreeArchive(worktreeId);
     });
-  }, [archiveWorktreeDialogState, workspacePath, confirmArchiveWorktree, cleanupAfterWorktreeArchive]);
-
-  const handleUnarchiveSession = async (sessionId: string) => {
-    try {
-      await window.electronAPI.invoke('sessions:update-metadata', sessionId, { isArchived: false });
-      // Update atom state immediately for instant feedback (optimistic update)
-      updateSessionStore({ sessionId, updates: { isArchived: false } });
-      // Also update filtered list for immediate feedback
-      setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, isArchived: false } : s));
-    } catch (err) {
-      console.error('[SessionHistory] Failed to unarchive session:', err);
-    }
   };
 
-  const handleUnarchiveMetaAgentSession = useCallback(async (metaSessionId: string) => {
-    const sessionIds = getMetaAgentGroupSessionIds(metaSessionId);
-    try {
-      await Promise.all(
-        sessionIds.map(sessionId => window.electronAPI.invoke('sessions:update-metadata', sessionId, { isArchived: false }))
-      );
-      sessionIds.forEach(sessionId => {
-        updateSessionStore({ sessionId, updates: { isArchived: false } });
-      });
-      setSessions(prev => prev.map(session => (
-        sessionIds.includes(session.id)
-          ? { ...session, isArchived: false }
-          : session
-      )));
-    } catch (err) {
-      console.error('[SessionHistory] Failed to unarchive meta-agent session:', err);
-    }
-  }, [getMetaAgentGroupSessionIds, updateSessionStore]);
-
-  const handleDeleteMetaAgentSession = useCallback(async (metaSessionId: string) => {
-    if (!onSessionDelete) return;
-
-    const sessionIds = getMetaAgentGroupSessionIds(metaSessionId);
-    const childSessionIds = sessionIds.filter(sessionId => sessionId !== metaSessionId);
-
-    for (const sessionId of childSessionIds) {
-      await onSessionDelete(sessionId);
-    }
-    await onSessionDelete(metaSessionId);
-    await loadAllSessions();
-  }, [getMetaAgentGroupSessionIds, loadAllSessions, onSessionDelete]);
+  const handleUnarchiveSession = async (sessionId: string) => {
+    if (!(await saveSessionArchived(sessionId, false))) return;
+    // Update atom state immediately for instant feedback (optimistic update)
+    const restoredIds = new Set(sessionArchiveSubtreeIds(sessionRegistry, [sessionId]));
+    restoredIds.forEach(id => updateSessionStore({ sessionId: id, updates: { isArchived: false } }));
+    // Also update filtered list for immediate feedback
+    setSessions(prev => prev.map(s => restoredIds.has(s.id) ? { ...s, isArchived: false } : s));
+  };
 
   const toggleShowArchived = async () => {
     const newValue = !showArchived;
@@ -1421,21 +1286,21 @@ const SessionHistoryComponent: React.FC = () => {
   };
 
   // Clear selection when clicking elsewhere
-  const clearSelection = useCallback(() => {
+  const clearSelection = () => {
     setSelectedSessionIds(new Set());
     setSelectedGroupIds(new Set());
     lastSelectedIdRef.current = null;
-  }, []);
+  };
 
   // Refs for shift-click range selection. Using refs instead of state means handleSessionClick
   // has a stable identity and memoized child components won't hold stale references.
-  const visualOrderRef = useRef<string[]>([]);
+  const visualOrderRef = useRef<() => string[]>(() => []);
   const activeSessionIdRef = useRef(activeSessionId);
   activeSessionIdRef.current = activeSessionId;
 
   // Handle session click with multi-select support
   // Stable callback: reads all volatile state from refs so memoized children never hold a stale reference.
-  const handleSessionClick = useCallback((sessionId: string, e: Pick<React.MouseEvent, 'metaKey' | 'ctrlKey' | 'shiftKey'>) => {
+  const handleSessionClick = (sessionId: string, e: Pick<React.MouseEvent, 'metaKey' | 'ctrlKey' | 'shiftKey'>) => {
     const isMetaKey = e.metaKey || e.ctrlKey;
     const isShiftKey = e.shiftKey;
 
@@ -1459,7 +1324,7 @@ const SessionHistoryComponent: React.FC = () => {
       // Shift+click: range selection
       const anchorId = lastSelectedIdRef.current || activeSessionIdRef.current;
       if (anchorId) {
-        const ids = visualOrderRef.current;
+        const ids = visualOrderRef.current();
         const anchorIndex = ids.indexOf(anchorId);
         const currentIndex = ids.indexOf(sessionId);
 
@@ -1484,7 +1349,7 @@ const SessionHistoryComponent: React.FC = () => {
       lastSelectedIdRef.current = sessionId;
       onSessionSelect(sessionId);
     }
-  }, [onSessionSelect]);
+  };
 
   // Determine the group key that the currently active session belongs to.
   // Used to auto-include the "focused" group when starting multi-select from empty.
@@ -1521,16 +1386,8 @@ const SessionHistoryComponent: React.FC = () => {
       return `blitz:${activeSession.parentSessionId}`;
     }
 
-    // Meta-agent session or child of meta-agent
-    if (activeSession.agentRole === 'meta-agent') {
-      return `meta-agent:${activeSession.id}`;
-    }
-    if (activeSession.createdBySessionId) {
-      const parentSession = allSessions.find(s => s.id === activeSession.createdBySessionId);
-      if (parentSession?.agentRole === 'meta-agent') {
-        return `meta-agent:${parentSession.id}`;
-      }
-    }
+    const treeRootId = sessionTreeRootId(activeSession.id, sessionRegistry);
+    if (treeRootId !== activeSession.id && !activeSession.worktreeId) return `workstream:${treeRootId}`;
 
     // Workstream (has children, no worktreeId)
     if (!activeSession.worktreeId && (activeSession.childCount ?? 0) > 0) {
@@ -1538,10 +1395,10 @@ const SessionHistoryComponent: React.FC = () => {
     }
 
     return null;
-  }, [activeSessionId, allSessions, blitzCache, superLoops, sessions]);
+  }, [activeSessionId, allSessions, blitzCache, superLoops, sessions, sessionRegistry]);
 
   // Handle Cmd+click on group headers (blitz, worktree, workstream, superloop)
-  const handleGroupMultiSelect = useCallback((groupKey: string) => {
+  const handleGroupMultiSelect = (groupKey: string) => {
     setSelectedGroupIds(prev => {
       const next = new Set(prev);
       // When starting multi-select from empty, include the currently active group
@@ -1556,10 +1413,10 @@ const SessionHistoryComponent: React.FC = () => {
       }
       return next;
     });
-  }, [activeGroupKey]);
+  };
 
   // Perform the actual bulk archive (called directly or after dialog confirmation)
-  const performBulkArchive = useCallback(async (params: {
+  const performBulkArchive = async (params: {
     worktreeIds: string[];
     regularSessionIds: string[];
     blitzIds: string[];
@@ -1642,27 +1499,24 @@ const SessionHistoryComponent: React.FC = () => {
       }
     }
 
-    // Archive workstream sessions and regular sessions via metadata update
-    const allSessionIds = [...regularSessionIds, ...workstreamIds];
-    if (allSessionIds.length > 0) {
-      const promises = allSessionIds.map(id =>
-        window.electronAPI.invoke('sessions:update-metadata', id, { isArchived: true })
-      );
-      await Promise.all(promises);
-      allSessionIds.forEach(id => {
-        updateSessionStore({ sessionId: id, updates: { isArchived: true } });
-      });
-      setSessions(prev => prev.filter(s => !allSessionIds.includes(s.id)));
-      if (onSessionArchive) {
-        allSessionIds.forEach(id => onSessionArchive(id));
-      }
+    // The server archives each selected subtree. Reconcile all descendants only
+    // after success, so nested tabs close and rejected requests stay visible.
+    const archivedIds: string[] = [];
+    for (const id of [...regularSessionIds, ...workstreamIds]) {
+      if (!(await saveSessionArchived(id, true))) continue;
+      archivedIds.push(...sessionArchiveSubtreeIds(sessionRegistry, [id]));
+    }
+    if (archivedIds.length > 0) {
+      archivedIds.forEach(id => updateSessionStore({ sessionId: id, updates: { isArchived: true } }));
+      setSessions(prev => prev.filter(s => !archivedIds.includes(s.id)));
+      archivedIds.forEach(id => onSessionArchive?.(id));
     }
 
     clearSelection();
-  }, [workspacePath, cleanupAfterWorktreeArchive, updateSessionStore, onSessionArchive, clearSelection, allSessions, removeSessionFromAtom, superLoops, removeSuperLoop]);
+  };
 
   // Collect all worktree IDs from selected items (sessions, groups, blitzes, super loops)
-  const collectAllWorktreeIds = useCallback((params: {
+  const collectAllWorktreeIds = (params: {
     worktreeIds: string[];
     blitzIds: string[];
     superLoopIds: string[];
@@ -1687,52 +1541,11 @@ const SessionHistoryComponent: React.FC = () => {
     }
 
     return Array.from(allIds);
-  }, [allSessions, superLoops]);
+  };
 
   // Bulk archive all selected items (sessions + groups)
   const handleBulkArchive = async () => {
-    const selectedSessions = sessions.filter(s => selectedSessionIds.has(s.id));
-
-    // Separate worktree and regular sessions from selectedSessionIds
-    const worktreeIds = new Set<string>();
-    const regularSessionIds: string[] = [];
-
-    for (const session of selectedSessions) {
-      if (session.worktreeId) {
-        worktreeIds.add(session.worktreeId);
-      } else {
-        regularSessionIds.push(session.id);
-      }
-    }
-
-    // Collect group IDs by type from selectedGroupIds
-    const blitzIds: string[] = [];
-    const superLoopIds: string[] = [];
-    const workstreamIds: string[] = [];
-    const groupWorktreeIds: string[] = [];
-
-    for (const key of selectedGroupIds) {
-      const [type, id] = key.split(':');
-      switch (type) {
-        case 'blitz': blitzIds.push(id); break;
-        case 'superloop': superLoopIds.push(id); break;
-        case 'workstream': workstreamIds.push(id); break;
-        case 'worktree': groupWorktreeIds.push(id); break;
-      }
-    }
-
-    // Merge worktree IDs from sessions and from group selection
-    for (const id of groupWorktreeIds) {
-      worktreeIds.add(id);
-    }
-
-    const archiveParams = {
-      worktreeIds: Array.from(worktreeIds),
-      regularSessionIds,
-      blitzIds,
-      superLoopIds,
-      workstreamIds,
-    };
+    const archiveParams = resolveSessionArchiveSelection(sessionRegistry, selectedSessionIds, selectedGroupIds);
 
     // Collect all worktree IDs that will be archived (including from blitzes and super loops)
     const allWorktreeIds = collectAllWorktreeIds(archiveParams);
@@ -1802,30 +1615,31 @@ const SessionHistoryComponent: React.FC = () => {
   };
 
   // Handle confirmation from bulk archive dialog
-  const handleConfirmBulkArchive = useCallback(async () => {
+  const handleConfirmBulkArchive = async () => {
     if (!bulkArchiveState) return;
     const { hasUncommittedChanges: _, uncommittedFileCount: _1, uncommittedWorktreeCount: _2,
             hasUnmergedChanges: _3, unmergedCommitCount: _4, unmergedWorktreeCount: _5,
             totalWorktreeCount: _6, ...archiveParams } = bulkArchiveState;
     await performBulkArchive(archiveParams);
     setBulkArchiveState(null);
-  }, [bulkArchiveState, performBulkArchive]);
+  };
 
-  const handleCancelBulkArchive = useCallback(() => {
+  const handleCancelBulkArchive = () => {
     setBulkArchiveState(null);
-  }, []);
+  };
 
   // Bulk unarchive selected sessions
   const handleBulkUnarchive = async () => {
-    const promises = Array.from(selectedSessionIds).map(sessionId =>
-      window.electronAPI.invoke('sessions:update-metadata', sessionId, { isArchived: false })
-    );
-    await Promise.all(promises);
+    const selectedIds = Array.from(selectedSessionIds);
+    const saved = await Promise.all(selectedIds.map(sessionId => saveSessionArchived(sessionId, false)));
+    // Only restore the sessions the backend actually saved (failures already showed an error)
+    const savedIds = selectedIds.filter((_, index) => saved[index]);
     // Update atom state for each unarchived session
-    selectedSessionIds.forEach(sessionId => {
+    const restoredIds = new Set(sessionArchiveSubtreeIds(sessionRegistry, savedIds));
+    restoredIds.forEach(sessionId => {
       updateSessionStore({ sessionId, updates: { isArchived: false } });
     });
-    setSessions(prev => prev.map(s => selectedSessionIds.has(s.id) ? { ...s, isArchived: false } : s));
+    setSessions(prev => prev.map(s => restoredIds.has(s.id) ? { ...s, isArchived: false } : s));
     clearSelection();
   };
 
@@ -1834,7 +1648,12 @@ const SessionHistoryComponent: React.FC = () => {
     if (!onSessionDelete) return;
 
     const count = selectedSessionIds.size;
-    const confirmed = window.confirm(`Are you sure you want to permanently delete ${count} session${count > 1 ? 's' : ''}? This cannot be undone.`);
+    const confirmed = await requestConfirmation({
+      title: 'Delete Sessions',
+      message: `Are you sure you want to permanently delete ${count} session${count > 1 ? 's' : ''}? This cannot be undone.`,
+      confirmLabel: 'Delete',
+      destructive: true,
+    });
     if (!confirmed) return;
 
     for (const sessionId of selectedSessionIds) {
@@ -1845,7 +1664,7 @@ const SessionHistoryComponent: React.FC = () => {
   };
 
   // Toggle pin status for a session
-  const handleSessionPinToggle = useCallback(async (sessionId: string, isPinned: boolean) => {
+  const handleSessionPinToggle = async (sessionId: string, isPinned: boolean) => {
     try {
       await reconcileSessionPinToggle({
         sessionId,
@@ -1858,10 +1677,10 @@ const SessionHistoryComponent: React.FC = () => {
     } catch (error) {
       console.error('[SessionHistory] Failed to toggle session pin:', error);
     }
-  }, [updateSessionStore]);
+  };
 
   // Toggle pin status for a worktree
-  const handleWorktreePinToggle = useCallback(async (worktreeId: string, isPinned: boolean) => {
+  const handleWorktreePinToggle = async (worktreeId: string, isPinned: boolean) => {
     try {
       await window.electronAPI.invoke('worktree:update-pinned', worktreeId, isPinned);
       // Update worktree cache
@@ -1876,10 +1695,10 @@ const SessionHistoryComponent: React.FC = () => {
     } catch (error) {
       console.error('[SessionHistory] Failed to toggle worktree pin:', error);
     }
-  }, []);
+  };
 
   // Rename a worktree
-  const handleWorktreeRename = useCallback(async (worktreeId: string, newName: string) => {
+  const handleWorktreeRename = async (worktreeId: string, newName: string) => {
     try {
       await window.electronAPI.invoke('worktree:update-display-name', worktreeId, newName);
       // Update worktree cache
@@ -1894,10 +1713,10 @@ const SessionHistoryComponent: React.FC = () => {
     } catch (error) {
       console.error('[SessionHistory] Failed to rename worktree:', error);
     }
-  }, []);
+  };
 
   // Rename a blitz
-  const handleBlitzRename = useCallback(async (blitzId: string, newName: string) => {
+  const handleBlitzRename = async (blitzId: string, newName: string) => {
     try {
       await window.electronAPI.invoke('blitz:update-display-name', blitzId, newName);
       setBlitzCache(prev => {
@@ -1911,10 +1730,10 @@ const SessionHistoryComponent: React.FC = () => {
     } catch (error) {
       console.error('[SessionHistory] Failed to rename blitz:', error);
     }
-  }, []);
+  };
 
   // Toggle pin status for a blitz
-  const handleBlitzPinToggle = useCallback(async (blitzId: string, isPinned: boolean) => {
+  const handleBlitzPinToggle = async (blitzId: string, isPinned: boolean) => {
     try {
       await window.electronAPI.invoke('blitz:update-pinned', blitzId, isPinned);
       setBlitzCache(prev => {
@@ -1928,10 +1747,10 @@ const SessionHistoryComponent: React.FC = () => {
     } catch (error) {
       console.error('[SessionHistory] Failed to toggle blitz pin:', error);
     }
-  }, []);
+  };
 
   // Archive a blitz and all its worktrees
-  const handleBlitzArchive = useCallback(async (blitzId: string) => {
+  const handleBlitzArchive = async (blitzId: string) => {
     try {
       // Find all worktrees and sessions belonging to this blitz
       const blitzWorktreeIds = new Set<string>();
@@ -2000,10 +1819,10 @@ const SessionHistoryComponent: React.FC = () => {
     } catch (error) {
       console.error('[SessionHistory] Failed to archive blitz:', error);
     }
-  }, [workspacePath, allSessions, removeSessionFromAtom, onSessionArchive, superLoops, removeSuperLoop]);
+  };
 
   // Archive all worktrees in a blitz except the one to keep
-  const handleArchiveOtherBlitzWorktrees = useCallback(async (blitzId: string, keepWorktreeId: string) => {
+  const handleArchiveOtherBlitzWorktrees = async (blitzId: string, keepWorktreeId: string) => {
     try {
       // Find worktree IDs belonging to this blitz from sessions with parentSessionId === blitzId
       const blitzWorktreeIds = new Set<string>();
@@ -2035,10 +1854,10 @@ const SessionHistoryComponent: React.FC = () => {
     } catch (error) {
       console.error('[SessionHistory] Failed to archive other blitz worktrees:', error);
     }
-  }, [sessions, worktreeCache, workspacePath]);
+  };
 
   // Super Loop handlers
-  const handleSuperLoopUpdate = useCallback(async (
+  const handleSuperLoopUpdate = async (
     loopId: string,
     updates: { title?: string; isArchived?: boolean; isPinned?: boolean }
   ) => {
@@ -2050,9 +1869,9 @@ const SessionHistoryComponent: React.FC = () => {
     } catch (error) {
       console.error('[SessionHistory] Failed to update super loop:', error);
     }
-  }, [upsertSuperLoop]);
+  };
 
-  const handleSuperLoopArchive = useCallback(async (loop: SuperLoop) => {
+  const handleSuperLoopArchive = async (loop: SuperLoop) => {
     // Super loops own a dedicated worktree - archive via the worktree archive dialog
     // which queues deletion of the actual git worktree
     try {
@@ -2074,15 +1893,15 @@ const SessionHistoryComponent: React.FC = () => {
     } catch (error) {
       console.error('[SessionHistory] Failed to archive super loop:', error);
     }
-  }, [showArchiveWorktreeDialog, workspacePath, cleanupAfterWorktreeArchive]);
+  };
 
-  const handleSuperLoopRename = useCallback((loopId: string, newName: string) => {
+  const handleSuperLoopRename = (loopId: string, newName: string) => {
     handleSuperLoopUpdate(loopId, { title: newName });
-  }, [handleSuperLoopUpdate]);
+  };
 
-  const handleSuperLoopPinToggle = useCallback((loopId: string, isPinned: boolean) => {
+  const handleSuperLoopPinToggle = (loopId: string, isPinned: boolean) => {
     handleSuperLoopUpdate(loopId, { isPinned });
-  }, [handleSuperLoopUpdate]);
+  };
 
   const toggleSortDropdown = () => {
     setSortDropdownOpen(!sortDropdownOpen);
@@ -2099,11 +1918,11 @@ const SessionHistoryComponent: React.FC = () => {
 
   // Open the worktree picker modal. It drives creation by calling
   // onNewWorktreeSession({ baseBranch, name }).
-  const openWorktreeBaseBranchPicker = useCallback(() => {
+  const openWorktreeBaseBranchPicker = () => {
     if (isNotGitRepo || !onNewWorktreeSession) return;
     newDropdownMenu.setIsOpen(false);
     setWorktreeBaseBranchPickerOpen(true);
-  }, [isNotGitRepo, onNewWorktreeSession, newDropdownMenu]);
+  };
 
   // Publish the session variants for the title bar's left create control. The
   // gating (git availability, alpha flags) stays here with the handlers it
@@ -2194,12 +2013,14 @@ const SessionHistoryComponent: React.FC = () => {
       mode: 'agent',
       menuTestId: 'new-dropdown-button',
       primaryTrailing: getShortcutDisplay(KeyboardShortcuts.file.newSession),
-      items,
+      items: selectedRemoteHost ? items.map(item => ({...item, disabled: true, disabledReason: 'This operation is not available on the selected remote machine.'})) : items,
+      destination: selectedRemoteHost ? 'Selected remote machine' : null,
       onPrimary: () => createHandlersRef.current.onNewSession?.(),
     });
     return () => setTitleBarCreateMenu('agent', null);
   }, [
     setTitleBarCreateMenu,
+    selectedRemoteHost,
     hasWorktreeOption,
     hasBlitzOption,
     hasTerminalOption,
@@ -2246,10 +2067,29 @@ const SessionHistoryComponent: React.FC = () => {
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [sortDropdownOpen]);
 
+  // One pass over the registry: each session's tree root, and the non-root members of
+  // each tree. Scanning the registry once per workstream was quadratic in session count.
+  const sessionTreeIndex = useMemo(() => {
+    const rootOf = new Map<string, string>();
+    const membersByRoot = new Map<string, SessionItem[]>();
+    for (const session of sessionRegistry.values()) {
+      const rootId = sessionTreeRootId(session.id, sessionRegistry);
+      rootOf.set(session.id, rootId);
+      if (rootId === session.id) continue;
+      const members = membersByRoot.get(rootId);
+      if (members) members.push(session);
+      else membersByRoot.set(rootId, [session]);
+    }
+    return { rootOf, membersByRoot };
+  }, [sessionRegistry]);
+
   // Group worktree sessions by worktreeId and compute worktree timestamps
   const worktreeGroupsData = useMemo(() => {
     const groups = new Map<string, { sessions: SessionItem[]; timestamp: number }>();
-    for (const session of sessions) {
+    const allowedRoots = new Set(sessions.map(session => session.id));
+    for (const session of sessionRegistry.values()) {
+      if (!allowedRoots.has(sessionTreeIndex.rootOf.get(session.id) ?? session.id)) continue;
+      if (!showArchived && session.isArchived) continue;
       if (session.worktreeId) {
         const existing = groups.get(session.worktreeId);
         if (existing) {
@@ -2267,36 +2107,8 @@ const SessionHistoryComponent: React.FC = () => {
       }
     }
 
-    // Include child sessions of worktree-group members that don't have a worktreeId themselves.
-    // This handles the case where a worktree session is also a workstream parent (has children
-    // created via mobile/sync with parentSessionId but no worktreeId). Without this, those
-    // children are invisible - filtered out of the root list by parentSessionId, but not
-    // included in any worktree group by worktreeId.
-    const worktreeSessionIds = new Set<string>();
-    for (const [, group] of groups) {
-      for (const s of group.sessions) {
-        worktreeSessionIds.add(s.id);
-      }
-    }
-    for (const child of sessionRegistry.values()) {
-      if (child.parentSessionId && worktreeSessionIds.has(child.parentSessionId) && !child.worktreeId) {
-        // Find which worktree group the parent belongs to
-        const parent = sessions.find(s => s.id === child.parentSessionId);
-        if (parent?.worktreeId) {
-          const group = groups.get(parent.worktreeId);
-          if (group) {
-            group.sessions.push(child);
-            if (sortBy === 'updated') {
-              const childTimestamp = getDisplayedOrderTimestamp(child);
-              group.timestamp = Math.max(group.timestamp, childTimestamp);
-            }
-          }
-        }
-      }
-    }
-
     return groups;
-  }, [sessions, sortBy, sessionRegistry, getDisplayedOrderTimestamp]);
+  }, [sessions, sortBy, sessionRegistry, sessionTreeIndex, showArchived, getDisplayedOrderTimestamp]);
 
   // Get all worktree IDs for batch fetching
   const sortedWorktreeIds = useMemo(() => {
@@ -2308,72 +2120,23 @@ const SessionHistoryComponent: React.FC = () => {
     const timestampField = sortBy === 'updated' ? 'updatedAt' : 'createdAt';
     const items: UnifiedListItem[] = [];
     const pinnedItems: UnifiedListItem[] = [];
-    const metaAgentItems: UnifiedListItem[] = [];
-
-    // Identify meta-agent sessions and their child sessions
-    const metaAgentSessionIds = new Set<string>();
-    const metaAgentChildSessionIds = new Set<string>();
-    if (isMetaAgentEnabled) {
-      for (const session of sessions) {
-        if (session.agentRole === 'meta-agent') {
-          metaAgentSessionIds.add(session.id);
-        }
-      }
-      // Collect children (sessions created by meta-agent sessions)
-      for (const session of sessions) {
-        if (session.createdBySessionId && metaAgentSessionIds.has(session.createdBySessionId)) {
-          metaAgentChildSessionIds.add(session.id);
-        }
-      }
-      // Build meta-agent group items (always at top)
-      for (const session of sessions) {
-        if (session.agentRole === 'meta-agent') {
-          const childSessions = sessions
-            .filter(s => s.createdBySessionId === session.id)
-            .sort(compareSessionOrder);
-          const latestChildTimestamp = childSessions.length > 0
-            ? Math.max(...childSessions.map(s => getDisplayedOrderTimestamp(s)))
-            : 0;
-          const rank = Math.min(
-            getDisplayedOrderRank(session.id),
-            ...childSessions.map(s => getDisplayedOrderRank(s.id)),
-          );
-          const timestamp = Math.max(
-            timestampField === 'updatedAt' ? getDisplayedOrderTimestamp(session) : session.createdAt,
-            latestChildTimestamp
-          );
-          metaAgentItems.push({
-            type: 'metaAgent' as const,
-            metaSession: session,
-            childSessions,
-            timestamp,
-            rank,
-          });
-        }
-      }
-      // Sort meta-agent items by timestamp (newest first)
-      metaAgentItems.sort(compareUnifiedItems);
-    }
-
     // Add regular sessions and workstreams (those without worktreeId)
     for (const session of sessions) {
       // Skip blitz sessions - they're rendered via BlitzGroup, not as individual items
       if (session.sessionType === 'blitz') continue;
-      // Skip meta-agent sessions and their children - they're rendered via MetaAgentGroup
-      if (metaAgentSessionIds.has(session.id) || metaAgentChildSessionIds.has(session.id)) continue;
 
       if (!session.worktreeId) {
         // Check if this is a workstream (has children)
         const isWorkstream = (session.childCount ?? 0) > 0;
         if (isWorkstream) {
           // Create workstream item with cached children (or empty array if not loaded yet)
-          const cachedChildren = workstreamChildrenCache.get(session.id) || [];
+          const cachedChildren = (sessionTreeIndex.membersByRoot.get(session.id) ?? []).filter(child => showArchived || !child.isArchived);
 
           // For workstreams, use the maximum updatedAt from all children for sorting
           // This ensures workstreams appear based on their most recent activity
           let timestamp: number;
           if (timestampField === 'updatedAt' && cachedChildren.length > 0) {
-            timestamp = Math.max(...cachedChildren.map(child => getDisplayedOrderTimestamp(child)));
+            timestamp = Math.max(getDisplayedOrderTimestamp(session), ...cachedChildren.map(child => getDisplayedOrderTimestamp(child)));
           } else {
             timestamp = timestampField === 'updatedAt' ? getDisplayedOrderTimestamp(session) : session.createdAt;
           }
@@ -2416,10 +2179,7 @@ const SessionHistoryComponent: React.FC = () => {
         continue;
       }
 
-      // Skip worktrees whose sessions are all meta-agent children
-      if (metaAgentChildSessionIds.size > 0 && data.sessions.every(s => metaAgentChildSessionIds.has(s.id))) {
-        continue;
-      }
+
 
       // Check if any session in this worktree has a parentSessionId pointing to a blitz session
       const blitzParentId = data.sessions.find(s => s.parentSessionId && blitzCache.has(s.parentSessionId))?.parentSessionId;
@@ -2559,13 +2319,11 @@ const SessionHistoryComponent: React.FC = () => {
     // Sort pinned items by timestamp (newest first)
     pinnedItems.sort(compareUnifiedItems);
 
-    // Build the result with meta-agent items always first
+    // Build pinned and time groups
     const result: Record<string, UnifiedListItem[]> = {};
 
     // Meta-agent sessions always appear at the very top
-    if (metaAgentItems.length > 0) {
-      result['Meta Agent'] = metaAgentItems;
-    }
+
 
     // If we have pinned items, add them as a "Pinned" group
     if (pinnedItems.length > 0) {
@@ -2580,37 +2338,69 @@ const SessionHistoryComponent: React.FC = () => {
     }
 
     return result as Record<TimeGroupKey | 'Pinned' | 'Meta Agent', UnifiedListItem[]>;
-  }, [sessions, worktreeGroupsData, sortBy, worktreeCache, workstreamChildrenCache, blitzCache, superLoops, showArchived, isMetaAgentEnabled, getDisplayedOrderRank, getDisplayedOrderTimestamp, compareSessionOrder, compareUnifiedItems]);
+  }, [sessions, worktreeGroupsData, sortBy, worktreeCache, workstreamChildrenCache, sessionTreeIndex, blitzCache, superLoops, showArchived, isMetaAgentEnabled, getDisplayedOrderRank, getDisplayedOrderTimestamp, compareSessionOrder, compareUnifiedItems]);
 
-  const groupKeys = Object.keys(groupedItems) as (TimeGroupKey | 'Pinned' | 'Meta Agent')[];
+  const groupKeys = useMemo(
+    () => Object.keys(groupedItems) as (TimeGroupKey | 'Pinned' | 'Meta Agent')[],
+    [groupedItems],
+  );
 
   // Flatten groups and their visible items into a single array for Virtuoso.
   // Group headers are included as items; collapsed groups omit their children.
+  // Workstream trees are flattened to one Virtuoso item per visible row.
   type FlatVirtuosoItem =
-    | { kind: 'group-header'; groupKey: string; itemCount: number; isExpanded: boolean }
-    | { kind: 'item'; groupKey: string; item: UnifiedListItem };
+    | { kind: 'group-header'; key: string; groupKey: string; itemCount: number; isExpanded: boolean }
+    | { kind: 'item'; key: string; groupKey: string; item: UnifiedListItem }
+    | { kind: 'tree-row'; key: string; groupKey: string; row: VisibleSessionTreeRow };
+
+  const workstreamTrees = useMemo(() => {
+    const trees: { key: string; rows: SessionItem[] }[] = [];
+    for (const groupKey of groupKeys) {
+      if (collapsedGroups.includes(groupKey)) continue;
+      for (const item of groupedItems[groupKey]) {
+        if (item.type !== 'workstream') continue;
+        const root = sessionRegistry.get(item.session.id) ?? item.session;
+        trees.push({ key: item.session.id, rows: [root, ...item.sessions] });
+      }
+    }
+    return trees;
+  }, [groupKeys, groupedItems, collapsedGroups, sessionRegistry]);
+  const workstreamTreeRows = useVisibleSessionTreeRows(workstreamTrees, activeSessionId, workspacePath);
 
   const flatVirtuosoItems = useMemo(() => {
     const flat: FlatVirtuosoItem[] = [];
     for (const groupKey of groupKeys) {
       const items = groupedItems[groupKey];
       const isExpanded = !collapsedGroups.includes(groupKey);
-      flat.push({ kind: 'group-header', groupKey, itemCount: items.length, isExpanded });
+      flat.push({ kind: 'group-header', key: `group:${groupKey}`, groupKey, itemCount: items.length, isExpanded });
       if (isExpanded) {
         for (const item of items) {
-          flat.push({ kind: 'item', groupKey, item });
+          if (item.type === 'workstream') {
+            for (const row of workstreamTreeRows.get(item.session.id) ?? []) {
+              flat.push({ kind: 'tree-row', key: `tree:${row.node.session.id}`, groupKey, row });
+            }
+            continue;
+          }
+          flat.push({ kind: 'item', key: `${item.type}:${unifiedItemId(item)}`, groupKey, item });
         }
       }
     }
     return flat;
-  }, [groupKeys, groupedItems, collapsedGroups]);
+  }, [groupKeys, groupedItems, collapsedGroups, workstreamTreeRows]);
 
   // Keep visual order ref in sync with the flattened list for shift-click range selection.
   // Must include ALL visible session IDs in exact visual order -- including sessions nested
-  // inside worktree, workstream, blitz, superLoop, and metaAgent groups.
-  visualOrderRef.current = useMemo(() => {
+  // inside worktree, workstream, blitz, superLoop groups.
+  visualOrderRef.current = () => {
     const ids: string[] = [];
+    const treeOrder = (rows: SessionItem[]) => visibleSessionTreeIds(rows.map(row => ({...row, updatedAt: Math.max(row.updatedAt, workspaceTurnActivity.get(row.id) ?? 0)})), node =>
+      store.get(workstreamStateAtom(node.session.id)).treeExpanded ?? node.ids.some(id => id === activeSessionId || store.get(sessionProcessingAtom(id)) || store.get(sessionUnreadAtom(id)) || store.get(sessionHasPendingInteractivePromptAtom(id)))
+    );
     for (const entry of flatVirtuosoItems) {
+      if (entry.kind === 'tree-row') {
+        ids.push(entry.row.node.session.id);
+        continue;
+      }
       if (entry.kind !== 'item') continue;
       const item = entry.item;
       switch (item.type) {
@@ -2618,12 +2408,9 @@ const SessionHistoryComponent: React.FC = () => {
           ids.push(item.session.id);
           break;
         case 'workstream':
-          // Workstream header session + its children
-          ids.push(item.session.id);
-          for (const child of item.sessions) ids.push(child.id);
           break;
         case 'worktree':
-          for (const s of item.sessions) ids.push(s.id);
+          if (!collapsedGroups.includes(`worktree:${item.worktreeId}`)) ids.push(...treeOrder(item.sessions));
           break;
         case 'blitz':
           for (const wt of item.worktrees) {
@@ -2638,15 +2425,12 @@ const SessionHistoryComponent: React.FC = () => {
           }
           break;
         }
-        case 'metaAgent':
-          ids.push(item.metaSession.id);
-          for (const child of item.childSessions) ids.push(child.id);
-          break;
+
       }
     }
     // console.log('[SessionHistory] visualOrderRef updated:', ids.length, 'session IDs (from', flatVirtuosoItems.filter(e => e.kind === 'item').length, 'items). First 5:', ids.slice(0, 5).map(id => id.slice(0, 8)));
     return ids;
-  }, [flatVirtuosoItems, worktreeGroupsData]);
+  };
 
   // Ref for Virtuoso to support scroll-to-active
   const virtuosoRef = useRef<VirtuosoHandle>(null);
@@ -2747,17 +2531,18 @@ const SessionHistoryComponent: React.FC = () => {
   useEffect(() => {
     const cache = workstreamChildrenCacheRef.current;
     const registrySnapshot = store.get(sessionRegistryAtom);
+    const registryDescendants = countRegistryDescendants(registrySnapshot);
 
-    // Find workstream sessions that are expanded
+    // Find workstream sessions whose subtree is not already in the registry
     const workstreamSessionsNeedingFetch = sessions.filter(s =>
-      !s.worktreeId &&
       (s.childCount ?? 0) > 0 &&
-      !collapsedGroups.includes(`workstream:${s.id}`) &&
       !pendingWorkstreamChildrenFetchesRef.current.has(s.id) &&
       workstreamChildrenNeedRefresh(
         cache.get(s.id),
-        s.childCount ?? 0,
+        s.descendantCount ?? s.childCount ?? 0,
         registrySnapshot,
+        registryDescendants.get(s.id),
+        workstreamChildrenFetchedForRef.current.get(`${s.id}|${showArchived}`),
       )
     );
 
@@ -2770,8 +2555,9 @@ const SessionHistoryComponent: React.FC = () => {
       sessionIds.forEach(sessionId => pendingWorkstreamChildrenFetchesRef.current.add(sessionId));
 
       try {
-        const results = await Promise.all(
-          workstreamSessionsNeedingFetch.map(async (session) => {
+        // At most four in flight: an unbounded burst queued dozens of calls
+        // behind the database worker and stalled sessions:list for seconds.
+        const fetchOne = async (session: SessionItem) => {
             try {
               const result = await window.electronAPI.invoke(
                 'sessions:list-children',
@@ -2799,6 +2585,8 @@ const SessionHistoryComponent: React.FC = () => {
                 worktreeId: c.worktreeId || null,
                 parentSessionId: c.parentSessionId || null,
                 childCount: c.childCount || 0,
+                descendantCount: c.descendantCount || 0,
+                createdBySessionId: c.createdBySessionId || null,
                 uncommittedCount: c.uncommittedCount || 0,
                 // Metadata fields for TrackerPanel and kanban
                 ...(c.phase && { phase: c.phase }),
@@ -2806,13 +2594,18 @@ const SessionHistoryComponent: React.FC = () => {
                 ...(c.linkedTrackerItemIds && { linkedTrackerItemIds: c.linkedTrackerItemIds }),
               }));
 
+              workstreamChildrenFetchedForRef.current.set(`${session.id}|${showArchived}`, session.descendantCount ?? session.childCount ?? 0);
               return { sessionId: session.id, children };
             } catch (err) {
               console.error(`[SessionHistory] Failed to fetch children for workstream ${session.id}:`, err);
               return null;
             }
-          })
-        );
+        };
+        const results: Array<{ sessionId: string; children: SessionItem[] } | null> = [];
+        const queue = [...workstreamSessionsNeedingFetch];
+        await Promise.all(Array.from({ length: Math.min(4, queue.length) }, async () => {
+          for (let next = queue.shift(); next; next = queue.shift()) results.push(await fetchOne(next));
+        }));
 
         const successfulResults = results.filter((result): result is { sessionId: string; children: SessionItem[] } => result !== null);
         if (successfulResults.length === 0) {
@@ -2861,7 +2654,7 @@ const SessionHistoryComponent: React.FC = () => {
     return (
       <div className="session-history flex flex-col h-full bg-[var(--nim-bg)] overflow-hidden">
         <div className="workspace-color-accent h-[3px] w-full opacity-90 shrink-0" style={{ backgroundColor: workspaceColor }} />
-        <WorkspaceSummaryHeader
+        <WorkspaceSummaryHeader showMachineSelector
           workspacePath={workspacePath}
           workspaceName={workspaceName}
           showAccent={false}
@@ -2973,7 +2766,7 @@ const SessionHistoryComponent: React.FC = () => {
     return (
       <div className="session-history flex flex-col h-full bg-[var(--nim-bg)] overflow-hidden">
         <div className="workspace-color-accent h-[3px] w-full opacity-90 shrink-0" style={{ backgroundColor: workspaceColor }} />
-        <WorkspaceSummaryHeader
+        <WorkspaceSummaryHeader showMachineSelector
           workspacePath={workspacePath}
           workspaceName={workspaceName}
           showAccent={false}
@@ -3026,7 +2819,7 @@ const SessionHistoryComponent: React.FC = () => {
     return (
       <div className="session-history flex flex-col h-full bg-[var(--nim-bg)] overflow-hidden">
         <div className="workspace-color-accent h-[3px] w-full opacity-90 shrink-0" style={{ backgroundColor: workspaceColor }} />
-        <WorkspaceSummaryHeader
+        <WorkspaceSummaryHeader showMachineSelector
           workspacePath={workspacePath}
           workspaceName={workspaceName}
           showAccent={false}
@@ -3081,7 +2874,7 @@ const SessionHistoryComponent: React.FC = () => {
   return (
     <div className="session-history flex flex-col h-full bg-[var(--nim-bg)] overflow-hidden">
       <div className="workspace-color-accent h-[3px] w-full opacity-90 shrink-0" style={{ backgroundColor: workspaceColor }} />
-      <WorkspaceSummaryHeader
+      <WorkspaceSummaryHeader showMachineSelector
         workspacePath={workspacePath}
         workspaceName={workspaceName}
         showAccent={false}
@@ -3430,6 +3223,20 @@ const SessionHistoryComponent: React.FC = () => {
                   </svg>
                 )}
               </button>
+              <div className="session-history-sort-divider border-t border-[var(--nim-border)]" />
+              <button
+                className={`session-history-compact-option flex items-center justify-between w-full px-3 py-2 text-[13px] border-none text-[var(--nim-text)] cursor-pointer transition-colors duration-150 text-left gap-2 hover:bg-[var(--nim-bg-hover)] [&>span]:flex-1 [&_svg]:shrink-0 [&_svg]:text-[var(--nim-primary)] ${compactRows ? 'bg-[var(--nim-bg-selected)] font-medium' : ''}`}
+                onClick={() => { setCompactRows(!compactRows); setSortDropdownOpen(false); }}
+                role="menuitemcheckbox"
+                aria-checked={compactRows}
+              >
+                <span>Compact rows</span>
+                {compactRows && (
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M13 4L6 11L3 8" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                )}
+              </button>
             </div>
           )}
         </div>
@@ -3469,7 +3276,9 @@ const SessionHistoryComponent: React.FC = () => {
           </div>
         </div>
       )}
-      <div className="session-history-list nim-scrollbar flex-1 overflow-y-auto overflow-x-hidden py-2 scroll-smooth" ref={scrollContainerCallbackRef}>
+      {/* No scroll-smooth here: Virtuoso corrects scrollTop as rows are measured, and an
+          animated correction reads back mid-flight, which makes the list jump. */}
+      <div className="session-history-list nim-scrollbar flex-1 overflow-y-auto overflow-x-hidden py-2" ref={scrollContainerCallbackRef}>
         {groupKeys.length === 0 && (hasSearchQuery || hasTagFilter) ? (
           // No results for the active search/tag filter - offer a clear affordance
           <div className="session-history-empty flex flex-col items-center justify-center px-4 py-8 text-center text-[var(--nim-text-faint)] text-[13px]">
@@ -3495,13 +3304,33 @@ const SessionHistoryComponent: React.FC = () => {
               ref={virtuosoRef}
               customScrollParent={scrollContainerEl}
               totalCount={flatVirtuosoItems.length}
+              computeItemKey={(index) => flatVirtuosoItems[index]?.key ?? index}
+              defaultItemHeight={46}
               overscan={400}
               itemContent={(index) => {
                 const entry = flatVirtuosoItems[index];
-                if (entry.kind === 'group-header') {
-                  // Render inline group header (same markup as CollapsibleGroup)
+                if (entry.kind === 'tree-row') {
                   return (
-                    <div className="collapsible-group mb-1">
+                    <SessionTreeRow
+                      {...entry.row}
+                      activeSessionId={activeSessionId}
+                      projectPath={workspacePath}
+                      onSessionSelect={handleSessionClick}
+                      onSessionDelete={handleDeleteSession}
+                      onSessionArchive={handleArchiveSession}
+                      onSessionUnarchive={handleUnarchiveSession}
+                      onSessionPinToggle={handleSessionPinToggle}
+                      onSessionRename={onSessionRename}
+                      onSessionBranch={onSessionBranch}
+                    />
+                  );
+                }
+                if (entry.kind === 'group-header') {
+                  // Render inline group header (same markup as CollapsibleGroup).
+                  // Padding, not margin: Virtuoso measures the item box, and a child
+                  // margin collapses outside it.
+                  return (
+                    <div className="collapsible-group pb-1">
                       <button
                         className="collapsible-group-header flex items-center gap-2 w-full py-2 px-3 bg-transparent border-none cursor-pointer text-xs font-semibold text-nim-muted text-left transition-colors duration-150 hover:bg-nim-hover"
                         onClick={() => handleToggleGroup(entry.groupKey)}
@@ -3567,6 +3396,7 @@ const SessionHistoryComponent: React.FC = () => {
                   return (
                     <WorkstreamGroup
                       type="worktree"
+                      projectPath={workspacePath}
                       id={item.worktreeId}
                       title={worktreeData?.displayName || worktreeData?.name || 'Loading...'}
                       isExpanded={isWorktreeExpanded}
@@ -3648,34 +3478,6 @@ const SessionHistoryComponent: React.FC = () => {
                     />
                   );
                 }
-                if (item.type === 'metaAgent') {
-                  const isMetaExpanded = !collapsedGroups.includes(`meta-agent:${item.metaSession.id}`);
-                  const isMetaActive = item.metaSession.id === activeSessionId
-                    || item.childSessions.some(s => s.id === activeSessionId);
-
-                  return (
-                    <MetaAgentGroup
-                      metaSession={item.metaSession}
-                      childSessions={item.childSessions}
-                      isExpanded={isMetaExpanded}
-                      isActive={isMetaActive}
-                      isSelected={selectedGroupIds.has(`meta-agent:${item.metaSession.id}`)}
-                      onToggle={() => handleToggleGroup(`meta-agent:${item.metaSession.id}`)}
-                      onMultiSelect={() => handleGroupMultiSelect(`meta-agent:${item.metaSession.id}`)}
-                      activeSessionId={activeSessionId}
-                      onSessionSelect={handleSessionClick}
-                      onSessionArchive={handleArchiveSession}
-                      onSessionUnarchive={handleUnarchiveSession}
-                      onSessionDelete={handleDeleteSession}
-                      onMetaSessionArchive={handleArchiveMetaAgentSession}
-                      onMetaSessionUnarchive={handleUnarchiveMetaAgentSession}
-                      onMetaSessionDelete={handleDeleteMetaAgentSession}
-                      onSessionPinToggle={handleSessionPinToggle}
-                      onSessionBranch={onSessionBranch}
-                      onWorktreeArchive={handleArchiveWorktree}
-                    />
-                  );
-                }
                 if (item.type === 'superLoop') {
                   const isSuperExpanded = !collapsedGroups.includes(`super-loop:${item.loop.id}`);
                   const superWorktreeSessions = worktreeGroupsData.get(item.loop.worktreeId);
@@ -3737,6 +3539,7 @@ const SessionHistoryComponent: React.FC = () => {
                     uncommittedCount={session.uncommittedCount}
                     branchedAt={session.branchedAt}
                     phase={session.phase}
+                    compact={compactRows}
                   />
                 );
               }}

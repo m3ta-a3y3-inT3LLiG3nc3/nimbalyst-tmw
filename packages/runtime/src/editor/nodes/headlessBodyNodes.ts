@@ -25,6 +25,11 @@
  *
  * Kept in sync by `headlessBodyNodes.test.ts`, which converts representative
  * markdown and asserts no "not registered" error escapes.
+ *
+ * The graph must also stay React-, DOM- and CSS-free: the collab worker and
+ * the CLI load it through `@nimbalyst/markdown-ydoc`. Decorator nodes are
+ * therefore imported from their `*Core.ts` modules, never the `.tsx` ones that
+ * attach the editor's decorator (see `nodeDecoratorSlot.ts`).
  */
 
 import type { Klass, LexicalNode } from 'lexical';
@@ -33,12 +38,26 @@ import { LinkNode, AutoLinkNode } from '@lexical/link';
 import { HorizontalRuleNode } from '@lexical/extension';
 
 import EditorNodes from './EditorNodes';
-import { ImageNode } from '../plugins/ImagesPlugin';
-import { PageBreakNode } from '../plugins/PageBreakPlugin';
-import { MermaidNode } from '../plugins/MermaidPlugin';
-import { EmbeddedFileNode } from '../plugins/EmbedPlugin/EmbeddedFileNode';
+import { ImageNode } from '../plugins/ImagesPlugin/ImageNodeCore';
+import { PageBreakNode } from '../plugins/PageBreakPlugin/PageBreakNodeCore';
+import { MermaidNode } from '../plugins/MermaidPlugin/MermaidNodeCore';
+import { QuadrantNode } from '../plugins/QuadrantPlugin/QuadrantNodeCore';
+import { ChartNode } from '../plugins/ChartPlugin/ChartNodeCore';
+import { CodeExcerptNode } from '../plugins/CodeExcerptPlugin/CodeExcerptNodeCore';
+import { CalloutNode } from '../plugins/CalloutPlugin/CalloutNode';
+import { LayoutContainerNode } from '../plugins/LayoutPlugin/LayoutContainerNode';
+import { LayoutItemNode } from '../plugins/LayoutPlugin/LayoutItemNode';
+import { TocNode } from '../plugins/TocPlugin/TocNodeCore';
+import { TransclusionNode } from '../plugins/TransclusionPlugin/TransclusionNodeCore';
+import { MentionNode } from '../plugins/MentionPlugin/MentionNodeCore';
+import { TabPanelNode, TabsNode } from '../plugins/TabsPlugin/TabsNodes';
+import { ActionButtonNode } from '../plugins/ActionButtonPlugin/ActionButtonNodeCore';
+import { DecisionNode } from '../plugins/DecisionPlugin/DecisionNodeCore';
+import { EmbeddedFileNode } from '../plugins/EmbedPlugin/EmbeddedFileNodeCore';
 import { DocumentReferenceNode } from '../../plugins/DocumentLinkPlugin/DocumentLinkNode';
-import { TrackerReferenceNode } from '../../plugins/TrackerLinkPlugin/TrackerReferenceNode';
+import { TrackerReferenceNode } from '../../plugins/TrackerLinkPlugin/TrackerReferenceNodeCore';
+import { PageMarkNode } from '../plugins/PageMarkPlugin/PageMarkNode';
+import { CitationNode } from '../plugins/CitationPlugin/CitationNodeCore';
 
 const HeadlessBodyNodes: Array<Klass<LexicalNode>> = [
   ...EditorNodes,
@@ -50,9 +69,24 @@ const HeadlessBodyNodes: Array<Klass<LexicalNode>> = [
   PageBreakNode,
   ImageNode,
   MermaidNode,
+  QuadrantNode,
+  ChartNode,
+  CodeExcerptNode,
+  CalloutNode,
+  LayoutContainerNode,
+  LayoutItemNode,
+  TocNode,
+  TransclusionNode,
+  MentionNode,
+  TabsNode,
+  TabPanelNode,
+  ActionButtonNode,
+  DecisionNode,
   EmbeddedFileNode,
   DocumentReferenceNode,
   TrackerReferenceNode,
+  PageMarkNode,
+  CitationNode,
 ];
 
 export default HeadlessBodyNodes;

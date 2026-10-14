@@ -13,8 +13,14 @@ import {
   categorizeDownloadDuration,
   classifyUpdateError,
   isWindowsRenameLockError,
+  planDownloadCompletedEmit,
+  planUpdateErrorEmit,
+  EMPTY_UPDATE_ANALYTICS_STATE,
+  type UpdateAnalyticsState,
 } from './autoUpdaterUtils';
 import { installAtomFeedFilter } from './electronUpdaterPatch';
+import { createWindowsSignatureVerifier } from './windowsSignatureVerifier';
+import type { NsisUpdater } from 'electron-updater';
 
 // Install the atom-feed filter before any AutoUpdaterService is constructed
 // (which is the first thing that triggers electron-updater to read the feed).
@@ -47,11 +53,13 @@ export class AutoUpdaterService {
   private pendingUpdateInfo: { version: string; releaseNotes?: string; releaseDate?: string } | null = null;
   private downloadStartTime: number | null = null; // Track download start time for duration analytics
   private downloadRetryAttempted = false; // Windows EPERM rename retry guard (one retry per user-initiated download)
-  // Dedup `update_error` analytics: the hourly background check produces a
-  // fresh `error` event every poll on networks that can't reach the update
-  // endpoint, which buries any real signal. Only emit when the
-  // (stage, error_type) tuple changes within a process lifetime.
-  private lastUpdateErrorKey: string | null = null;
+  // Dedup for the two analytics events driven by the hourly poll rather than by
+  // a user action -- `update_error` and `update_download_completed`. Both fired
+  // once per poll before this: a flapping network re-emitted every hour, and a
+  // pending-but-uninstalled update re-emitted `update-downloaded` from cache
+  // every hour. Transitions are pure and live in autoUpdaterUtils so they can be
+  // tested without an Electron app global.
+  private updateAnalytics: UpdateAnalyticsState = EMPTY_UPDATE_ANALYTICS_STATE;
 
   constructor() {
     // Configure electron-updater logger
@@ -63,6 +71,12 @@ export class AutoUpdaterService {
     // single "Ready to install" toast. Per maintainer direction on #327.
     autoUpdater.autoDownload = true;
     autoUpdater.autoInstallOnAppQuit = true;
+
+    // electron-updater's stock Authenticode check times out at 20s, which a
+    // freshly downloaded installer can exceed while Defender scans it.
+    if (process.platform === 'win32') {
+      (autoUpdater as NsisUpdater).verifyUpdateCodeSignature = createWindowsSignatureVerifier(log);
+    }
 
     // Configure feed URL based on release channel
     this.configureFeedURL();
@@ -77,17 +91,13 @@ export class AutoUpdaterService {
   private configureFeedURL() {
     const channel = getReleaseChannel();
 
-    if (channel === 'alpha') {
-      log.info('Configuring alpha channel updates from GitHub prereleases');
-      autoUpdater.allowPrerelease = true;
-      autoUpdater.channel = 'alpha';
-      autoUpdater.setFeedURL(GITHUB_UPDATE_PROVIDER);
-    } else {
-      log.info('Configuring stable channel updates from GitHub releases');
-      autoUpdater.allowPrerelease = false;
-      autoUpdater.channel = 'latest';
-      autoUpdater.setFeedURL(GITHUB_UPDATE_PROVIDER);
-    }
+    log.info(`Configuring ${channel} channel updates from GitHub`);
+    autoUpdater.allowPrerelease = channel === 'alpha';
+    autoUpdater.channel = channel === 'alpha' ? 'alpha' : 'latest';
+    // electron-updater's channel setter enables downgrades. Reset AFTER the
+    // assignment on every launch and channel change (the policy from PR #811).
+    autoUpdater.allowDowngrade = false;
+    autoUpdater.setFeedURL(GITHUB_UPDATE_PROVIDER);
   }
 
   private setupEventHandlers() {
@@ -100,7 +110,9 @@ export class AutoUpdaterService {
     autoUpdater.on('update-available', async (info) => {
       log.info('Update available:', info);
       this.isCheckingForUpdate = false;
-      this.lastUpdateErrorKey = null;
+      // Deliberately does NOT clear the error dedup key. Clearing it here is
+      // what let a flapping network re-emit `update_error` on every hourly
+      // poll (error -> success -> error -> ...), for 182,624 events in 30 days.
       this.isManualCheck = false;
 
       let releaseNotes = info.releaseNotes as string | undefined;
@@ -127,7 +139,8 @@ export class AutoUpdaterService {
     autoUpdater.on('update-not-available', (info) => {
       log.info('Update not available:', info);
       this.isCheckingForUpdate = false;
-      this.lastUpdateErrorKey = null;
+      // See the note in `update-available`: a successful check must not re-arm
+      // the `update_error` dedup key.
       // Only show up-to-date toast for manual (user-initiated) checks
       if (this.isManualCheck) {
         this.sendToFrontmostWindow('update-toast:up-to-date');
@@ -164,9 +177,9 @@ export class AutoUpdaterService {
       // If downloadStartTime is set, we were downloading; otherwise it was a check error
       const stage = wasDownloading ? 'download' : 'check';
       const errorType = classifyUpdateError(err);
-      const errorKey = `${stage}:${errorType}`;
-      if (this.lastUpdateErrorKey !== errorKey) {
-        this.lastUpdateErrorKey = errorKey;
+      const errorPlan = planUpdateErrorEmit(this.updateAnalytics, stage, errorType);
+      this.updateAnalytics = errorPlan.next;
+      if (errorPlan.emit) {
         AnalyticsService.getInstance().sendEvent('update_error', {
           stage,
           error_type: errorType,
@@ -228,13 +241,20 @@ export class AutoUpdaterService {
     autoUpdater.on('update-downloaded', (info) => {
       log.info('Update downloaded:', info);
 
-      // Track download completed with duration
+      // Track download completed with duration. Deduped per version: once a
+      // download is pending, electron-updater re-emits this event from cache on
+      // every hourly poll until the user restarts to install, so an undeduped
+      // emit is one event per hour of uptime rather than one per download.
       const downloadDuration = this.downloadStartTime ? Date.now() - this.downloadStartTime : 0;
-      AnalyticsService.getInstance().sendEvent('update_download_completed', {
-        release_channel: getReleaseChannel(),
-        new_version: info.version,
-        duration_category: getDurationCategory(downloadDuration)
-      });
+      const downloadPlan = planDownloadCompletedEmit(this.updateAnalytics, info.version);
+      this.updateAnalytics = downloadPlan.next;
+      if (downloadPlan.emit) {
+        AnalyticsService.getInstance().sendEvent('update_download_completed', {
+          release_channel: getReleaseChannel(),
+          new_version: info.version,
+          duration_category: getDurationCategory(downloadDuration)
+        });
+      }
       this.downloadStartTime = null;
 
       // Reset retry guard now that we have a successful download in pending
@@ -459,12 +479,19 @@ export class AutoUpdaterService {
       } catch (error) {
         log.error('Failed to download update from toast:', error);
 
-        // Track download error
-        AnalyticsService.getInstance().sendEvent('update_error', {
-          stage: 'download',
-          error_type: classifyUpdateError(error instanceof Error ? error : new Error(String(error))),
-          release_channel: getReleaseChannel()
-        });
+        // Track download error. Shares the dedup state with the `error` handler
+        // above -- this path had none, so a user retrying a failing download
+        // from the toast emitted one event per click.
+        const errorType = classifyUpdateError(error instanceof Error ? error : new Error(String(error)));
+        const errorPlan = planUpdateErrorEmit(this.updateAnalytics, 'download', errorType);
+        this.updateAnalytics = errorPlan.next;
+        if (errorPlan.emit) {
+          AnalyticsService.getInstance().sendEvent('update_error', {
+            stage: 'download',
+            error_type: errorType,
+            release_channel: getReleaseChannel()
+          });
+        }
 
         this.sendToFrontmostWindow('update-toast:error', {
           message: error instanceof Error ? error.message : 'Unknown error'

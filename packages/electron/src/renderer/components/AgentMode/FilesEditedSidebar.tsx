@@ -1,3 +1,4 @@
+import { ShellTrackingNotice } from './ShellTrackingNotice';
 /**
  * FilesEditedSidebar - Shows files edited by AI in the current workstream.
  *
@@ -57,6 +58,32 @@ import { TodoPanel } from './TodoPanel';
 import { TaskListPanel } from './TaskListPanel';
 import { TeammatePanel } from './TeammatePanel';
 import { TrackerPanel } from './TrackerPanel';
+
+// Keep cached predicates outside the panel's render scope: old predicates
+// must not retain previous callbacks and their session-message props.
+function useWorkspaceFileFilter(committableRoots: string[]) {
+  return useCallback(
+    (filePath: string) => committableRoots.some(root => isPathInWorkspace(filePath, root)),
+    [committableRoots]
+  );
+}
+
+function useUncommittedFileFilter(
+  sessionFilesGitStatus: Record<string, { status: string }>,
+  workspacePath: string,
+  worktreePath?: string | null,
+) {
+  return useCallback((filePath: string): boolean => {
+    const effectiveWorkspacePath = worktreePath || workspacePath;
+    let relativePath = filePath;
+    if (filePath.startsWith(effectiveWorkspacePath)) {
+      relativePath = filePath.slice(effectiveWorkspacePath.length + 1);
+    }
+    const status = sessionFilesGitStatus[relativePath];
+    // File has uncommitted changes if it has a status and status is not 'unchanged'
+    return status !== undefined && status.status !== 'unchanged';
+  }, [sessionFilesGitStatus, workspacePath, worktreePath]);
+}
 
 interface FilesEditedSidebarProps {
   /** The workstream ID (parent session ID) - files from all child sessions will be shown */
@@ -131,10 +158,7 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
   /** False while `committableRoots` is still the primary-root-only fallback. */
   const rootsLoaded = Boolean(worktreePath) || workspaceRootPaths.length > 0;
 
-  const isWorkspaceCommittableFile = useCallback(
-    (filePath: string) => committableRoots.some(root => isPathInWorkspace(filePath, root)),
-    [committableRoots]
-  );
+  const isWorkspaceCommittableFile = useWorkspaceFileFilter(committableRoots);
 
   const workspaceScopedFileEdits = useMemo(
     () => allFileEdits.filter((edit) => isWorkspaceCommittableFile(edit.filePath)),
@@ -151,9 +175,6 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
 
   // Lazy load file state for all child sessions in the workstream
   useEffect(() => {
-    // Debug logging - uncomment if needed
-    // console.log('[FilesEditedSidebar] Loading file state for workstream', workstreamId, 'with', workstreamSessions.length, 'child sessions');
-
     // Load file state for the workstream itself (parent)
     loadInitialSessionFileState(workstreamId, effectiveWorkspacePath);
 
@@ -239,27 +260,18 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
     ) as { unifiedDiff: string; isBinary: boolean };
   }, [activeSessionId, worktreePath, workspacePath]);
 
-  const setGroupByDirectory = useCallback((value: boolean) => {
+  const setGroupByDirectory = (value: boolean) => {
     if (effectiveWorkspacePath) {
       setDiffTreeGroupByDirectory({ groupByDirectory: value, workspacePath: effectiveWorkspacePath });
     }
-  }, [effectiveWorkspacePath, setDiffTreeGroupByDirectory]);
+  };
 
-  const setFileScopeMode = useCallback((mode: AgentFileScopeMode) => {
+  const setFileScopeMode = (mode: AgentFileScopeMode) => {
     setFileScopeModeAction({ fileScopeMode: mode, workspacePath: effectiveWorkspacePath });
-  }, [effectiveWorkspacePath, setFileScopeModeAction]);
+  };
 
   // Helper to check if a file has uncommitted git changes
-  const isFileUncommitted = useCallback((filePath: string): boolean => {
-    const effectiveWorkspacePath = worktreePath || workspacePath;
-    let relativePath = filePath;
-    if (filePath.startsWith(effectiveWorkspacePath)) {
-      relativePath = filePath.slice(effectiveWorkspacePath.length + 1);
-    }
-    const status = sessionFilesGitStatus[relativePath];
-    // File has uncommitted changes if it has a status and status is not 'unchanged'
-    return status !== undefined && status.status !== 'unchanged';
-  }, [sessionFilesGitStatus, workspacePath, worktreePath]);
+  const isFileUncommitted = useUncommittedFileFilter(sessionFilesGitStatus, workspacePath, worktreePath);
 
   // Calculate total session files count (deduplicated by filepath)
   const totalSessionFilesCount = useMemo(() => {
@@ -357,12 +369,12 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
   }, [fileEdits, isWorkspaceCommittableFile, worktreeId, worktreeChangedFiles]);
 
   // Helper to convert absolute path to relative path for worktree comparisons
-  const toRelativePath = useCallback((absolutePath: string) => {
+  const toRelativePath = (absolutePath: string) => {
     if (worktreePath && absolutePath.startsWith(worktreePath)) {
       return absolutePath.slice(worktreePath.length + 1);
     }
     return absolutePath;
-  }, [worktreePath]);
+  };
 
   // For worktrees: compute the set of staged files from worktreeChangedFiles
   // Convert relative paths to absolute for matching with fileEdits
@@ -374,7 +386,7 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
 
 
   // Handle worktree file staging toggle
-  const handleWorktreeToggleStaged = useCallback(async (filePath: string) => {
+  const handleWorktreeToggleStaged = async (filePath: string) => {
     if (!worktreePath || !worktreeId) {
       return;
     }
@@ -397,10 +409,10 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
     } catch (error) {
       console.error('[FilesEditedSidebar] Failed to toggle worktree file staging:', error);
     }
-  }, [worktreePath, worktreeId, worktreeChangedFiles, toRelativePath]);
+  };
 
   // Handle worktree stage all / unstage all
-  const handleWorktreeToggleAllStaged = useCallback(async (stage: boolean) => {
+  const handleWorktreeToggleAllStaged = async (stage: boolean) => {
     if (!worktreePath || !worktreeId) return;
 
     try {
@@ -410,12 +422,12 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
     } catch (error) {
       console.error('[FilesEditedSidebar] Failed to toggle all worktree file staging:', error);
     }
-  }, [worktreePath, worktreeId]);
+  };
 
   // Handle file selection change (checkbox toggle)
   // For worktrees, this stages/unstages the file in git
   // For regular sessions, this updates the workstream staged files state
-  const handleSelectionChange = useCallback((filePath: string, selected: boolean) => {
+  const handleSelectionChange = (filePath: string, selected: boolean) => {
     if (worktreeId && worktreePath) {
       // For worktrees, use git staging
       handleWorktreeToggleStaged(filePath);
@@ -426,10 +438,10 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
         : stagedFilesArr.filter(f => f !== filePath);
       setStagedFilesAction({ workstreamId, files: newFiles });
     }
-  }, [worktreeId, worktreePath, stagedFilesArr, setStagedFilesAction, workstreamId, handleWorktreeToggleStaged]);
+  };
 
   // Handle select all files
-  const handleSelectAll = useCallback((selected: boolean) => {
+  const handleSelectAll = (selected: boolean) => {
     if (worktreeId && worktreePath) {
       // For worktrees, stage/unstage all files
       handleWorktreeToggleAllStaged(selected);
@@ -441,10 +453,10 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
         setStagedFilesAction({ workstreamId, files: [] });
       }
     }
-  }, [worktreeId, worktreePath, editedFilePaths, setStagedFilesAction, workstreamId, handleWorktreeToggleAllStaged]);
+  };
 
   // Handle bulk selection change (for folder checkboxes)
-  const handleBulkSelectionChange = useCallback(async (filePaths: string[], selected: boolean) => {
+  const handleBulkSelectionChange = async (filePaths: string[], selected: boolean) => {
     if (worktreeId && worktreePath) {
       // For worktrees, stage/unstage each file individually
       for (const filePath of filePaths) {
@@ -465,7 +477,7 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
       }
       setStagedFilesAction({ workstreamId, files: Array.from(currentSet) });
     }
-  }, [worktreeId, worktreePath, worktreeChangedFiles, stagedFilesArr, setStagedFilesAction, workstreamId, toRelativePath]);
+  };
 
   // NOTE: Git status pruning of committed files is now handled by central listener in fileStateListeners.ts
 
@@ -484,7 +496,7 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
   // NOTE: Pending review file updates are now handled by central listener in fileStateListeners.ts
 
   // Handle "Keep All" button click - clear pending for all sessions in workstream
-  const handleKeepAll = useCallback(async () => {
+  const handleKeepAll = async () => {
     if (!workspacePath || isClearing || workstreamSessions.length === 0) return;
 
     setIsClearing(true);
@@ -503,10 +515,10 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
     } finally {
       setIsClearing(false);
     }
-  }, [workspacePath, workstreamSessions, isClearing]);
+  };
 
   // Context menu handlers
-  const handleOpenInFiles = useCallback((filePath: string) => {
+  const handleOpenInFiles = (filePath: string) => {
     // Navigate to the file in Files mode (main editor)
     if (onOpenInFilesMode) {
       onOpenInFilesMode(filePath);
@@ -514,9 +526,9 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
       // Fallback to opening in agent mode if no Files mode handler provided
       onFileClick(filePath);
     }
-  }, [onOpenInFilesMode, onFileClick]);
+  };
 
-  const handleViewDiff = useCallback(async (filePath: string) => {
+  const handleViewDiff = async (filePath: string) => {
     // Open diff view for the file
     if (typeof window !== 'undefined' && window.electronAPI) {
       try {
@@ -525,33 +537,33 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
         console.error('[FilesEditedSidebar] Failed to open diff:', error);
       }
     }
-  }, [workspacePath]);
+  };
 
-  const handleCopyPath = useCallback((filePath: string) => {
+  const handleCopyPath = (filePath: string) => {
     copyFilePath(filePath);
-  }, [copyFilePath]);
+  };
 
-  const handleRevealInFinder = useCallback((filePath: string) => {
+  const handleRevealInFinder = (filePath: string) => {
     revealInFinder(filePath);
-  }, [revealInFinder]);
+  };
 
-  const handleOpenInExternalEditor = useCallback((filePath: string) => {
+  const handleOpenInExternalEditor = (filePath: string) => {
     openInExternalEditor(filePath);
-  }, [openInExternalEditor]);
+  };
 
-  const handleShowSessionFiles = useCallback(() => {
+  const handleShowSessionFiles = () => {
     // Switch to session-files mode
     setFileScopeMode('session-files');
-  }, [setFileScopeMode]);
+  };
 
-  const handleShowAllUncommitted = useCallback(() => {
+  const handleShowAllUncommitted = () => {
     // Switch to all-changes mode
     setFileScopeMode('all-changes');
-  }, [setFileScopeMode]);
+  };
 
   return (
     <div className="files-edited-sidebar shrink-0 flex flex-col h-full bg-[var(--nim-bg-secondary)]" style={{ width }}>
-      {/* Header with scope dropdown and controls */}
+      <ShellTrackingNotice sessionIds={filterToCurrentSession && activeSessionId ? [activeSessionId] : [workstreamId, ...workstreamSessions]} />
       <div className="files-edited-sidebar__header flex items-center gap-2 px-3 py-2 border-b border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] shrink-0">
         <FilesScopeDropdown
           fileScopeMode={fileScopeMode}

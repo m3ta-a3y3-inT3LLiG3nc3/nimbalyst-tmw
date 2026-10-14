@@ -30,6 +30,12 @@ See [the docs](https://example.com/docs) and \`inlineCode\`.
 const x = 1;
 \`\`\`
 
+\`\`\`decision
+id: dcn-7f3a2c
+ask: Do we ship the fix in this release?
+type: confirm
+\`\`\`
+
 ---
 
 Done.`;
@@ -57,12 +63,35 @@ describe('HeadlessBodyNodes', () => {
     // And the body actually parsed into multiple block nodes (not empty).
     let childCount = 0;
     let hasList = false;
+    let hasDecision = false;
     editor.getEditorState().read(() => {
       const children = $getRoot().getChildren();
       childCount = children.length;
       hasList = children.some((c) => c.getType() === 'list');
+      hasDecision = children.some((c) => c.getType() === 'decision');
     });
     expect(childCount).toBeGreaterThan(3);
     expect(hasList).toBe(true);
+    // A decision can live in a tracker item body, which the main process seeds
+    // through this headless path -- so an unregistered DecisionNode here would
+    // blank the body rather than degrade it.
+    expect(hasDecision).toBe(true);
+  });
+
+  it('registers page marks and citations, which an agent or teammate can write into any body', () => {
+    const errors: Error[] = [];
+    const editor = createHeadlessEditor({
+      namespace: 'headless-body-test',
+      nodes: [...HeadlessBodyNodes],
+      onError: (err: Error) => errors.push(err),
+    });
+    const markdown = '[Ship it.[GH](nimbalyst://cite/s/prompt/p "by=Greg")]{decided by="Greg"} and [Docs](https://x.dev "cite")';
+    editor.update(() => {
+      $convertFromEnhancedMarkdownString(markdown, getEditorTransformers(), undefined, true, false);
+    }, { discrete: true });
+    expect(errors.filter((e) => /not registered/i.test(e.message))).toEqual([]);
+    const json = JSON.stringify(editor.getEditorState().toJSON());
+    expect(json).toContain('"type":"page-mark"');
+    expect(json.match(/"type":"citation"/g)).toHaveLength(2);
   });
 });

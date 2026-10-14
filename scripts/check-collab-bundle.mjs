@@ -25,16 +25,61 @@ export const COLLAB_BUNDLE_EAGER_GZIP_BUDGET_BYTES = {
   // hands to a pinned extension, and nothing else. If this jumps, the comment
   // UI has grown an editor or transport dependency it should not have.
   // Initially 29,203 gzip bytes; same ~26% headroom as the shells above.
-  'commenting-ui': 37_000,
+  // Measured at 39,571 gzip bytes on 2026-09-12: the comment UI itself did not
+  // change, but its static path includes the shared floating-ui chunk, which
+  // grew when the canvas selection bar and context menu started using
+  // FloatingFocusManager and useListNavigation. Reset with ~11% headroom.
+  'commenting-ui': 44_000,
   // Project Canvas: React Flow, the card tree, the binding, and the SDK's
   // collaborative-editor hook. Measured at 94,278 gzip bytes on first build;
   // same ~26% headroom as the shells above. This entry is never eager in a
   // host -- the console imports it only when a board opens -- so the ceiling
   // is about the board's own cost, not the console's first paint.
-  canvas: 118_000,
-  editor: 320_000,
-  'docs-ui': 70_000,
-  'feedback-ui': 35_000,
+  // Measured at 145,660 gzip bytes on 2026-09-12 after the canvas controls
+  // landed (command registry, selection bar, context menu, zoom widget, tool
+  // rail, keyboard map, lock/group, plus the floating-ui focus and list
+  // navigation hooks their menus use). Reset with ~10% headroom.
+  canvas: 160_000,
+  // Measured at 322,230 gzip bytes on 2026-10-03 after decision and
+  // open-question marks, citations, the 2x2 block and console link parsing
+  // landed. Their popovers, chips and chart already load on demand; what is
+  // left (node cores, transformers, link parsers) must register before a page
+  // is read. Raised from 320,000 with ~2% headroom.
+  // 2026-10-05: 332,074 after the link hover card (FloatingLinkEditorPlugin
+  // rewrite) and Pages navigation; raised from 330,000 with ~2% headroom.
+  // 2026-10-09: 342,147 after the chart, callout, columns and inline TOC
+  // blocks registered their node cores and transformers. Vega loads lazily
+  // in its own chunk. Raised from 339,000 with ~2% headroom.
+  // 2026-10-09: 351,752 after transclusion, mentions, link previews and code
+  // excerpts registered their node cores and transformers. Raised from
+  // 349,000 with ~2% headroom.
+  // 2026-10-09: 362,835 after the wiki blocks gained bottom-right resize
+  // grips and block-menu items (type, title, columns, depth, reset size).
+  // Raised from 359,000 with ~2% headroom.
+  editor: 370_000,
+  // Measured at 70,625 gzip bytes on 2026-09-08, when the list took over
+  // folder browsing from the tree for the browser console (folder rows, the
+  // browse scope, the row "more" action). The row context menu itself is
+  // lazy-loaded from the list and is not in this graph; a static import of
+  // `SharedDocsItemMenu` is what would push this over again.
+  // Measured at 75,122 gzip bytes on 2026-09-12. The docs UI did not change;
+  // its static path includes the shared floating-ui chunk, which grew when the
+  // canvas menus started using FloatingFocusManager and useListNavigation.
+  // Reset with ~6% headroom.
+  // 2026-10-02: 81,044 bytes. The Pages tree lets pages nest and typed pages
+  // sit under any page; the page menu, move dialog and tree builder are lazy,
+  // and what remains is the sidebar's page-row and drag handling. Reset with
+  // ~3.5% headroom.
+  // 2026-10-02: 83,980 bytes after typed pages became parents, plain pages got
+  // a sort order and the native confirms became an in-app dialog (lazy, own
+  // root). Reset with ~5% headroom so small Pages changes need no shuffling.
+  // 2026-10-04: 88,122 bytes after Pages became per project (the session keeps
+  // other projects' pages in a separate link-only index and refuses writes to
+  // them). Raised with ~4% headroom.
+  'docs-ui': 92_000,
+  // Sep 5 privacy-aware document transport graph measured 35,049 bytes.
+  // Keep a narrow allowance for the supported response/refresh contract.
+  'feedback-ui': 35_500,
   // The tracker surfaces plus the headless selectors and the in-page engine
   // they read through. Measured at 100,654 gzip bytes on first build; the
   // ceiling carries the same ~26% headroom as the shells above.
@@ -44,7 +89,34 @@ export const COLLAB_BUNDLE_EAGER_GZIP_BUDGET_BYTES = {
   // (with `OutboxDrainer`, which brings js-yaml) are all eager here. The grid
   // alone is several times `docs-ui`'s remaining headroom, which is why this is
   // a separate entry rather than a line item added there.
-  'trackers-ui': 128_000,
+  //
+  // Measured at 129,651 gzip bytes on 2026-09-22, over the previous 128,000
+  // ceiling. The check did its job first: the citation field editor's
+  // `@floating-ui/react` import landed eager here (160,086 bytes) and was made
+  // lazy rather than budgeted for. What remains had to be eager. 1,978 of those
+  // bytes are the three knowledge-scopes evidence
+  // builtins (`source`, `capture`, `citation`), measured by building with and
+  // without them: builtin schemas are resolved synchronously, so a lazily
+  // loaded builtin would be a builtin that is absent on first paint. The rest
+  // is the citation locator validator, which `TrackerDataModel.validate` calls
+  // directly and which exists precisely so the browser rejects a locator the
+  // same way the desktop does. Reset with ~5% headroom.
+  // StatusBar field-pill header exported for the web console knowledge wiki: 171,945 gzip bytes + ~3% headroom.
+  // 2026-09-24: 178,920 bytes. The ontology inspector (208,658 with it eager)
+  // was made lazy and its inspector-only helpers left the entry. What remains
+  // is the wiki home's content-health check and the schema store's predicate
+  // registry read, both needed on first paint. Reset with ~2% headroom.
+  // 2026-10-02: 182,664 bytes. No new eager module: the predicate registry
+  // lost its qualifiers and the label registry's property qualifiers moved to
+  // their own module with their own error codes, which costs a few hundred
+  // bytes of strings. Reset with ~2% headroom.
+  // 2026-10-03: 188,280 bytes after typed pages and type pages moved into
+  // collab-client for the web console, console links, and the page links
+  // query; their views and editors load on demand. Reset with ~4% headroom.
+  // 2026-10-13: 196,016 bytes. No new eager module: schema define refusals
+  // now always settle with a readable reason (a new `serverError` notice
+  // string and the store's settle paths). Reset with ~2% headroom.
+  'trackers-ui': 200_000,
   // Deliberately tight. This entry is a WebSocket client over the protocol
   // package and nothing else; anything that makes it jump has dragged a UI
   // graph in behind it.
@@ -423,6 +495,12 @@ function checkSingletonPeerContract() {
 }
 
 function checkPublicJwtTypeBoundary() {
+  // This checks the public editor facade's re-export path and rejects brands
+  // declared directly in that facade. The internal runtime jwtScopes declaration
+  // now re-exports from @nimbalyst/collab-protocol; types/ no longer owns the
+  // unique-symbol declarations. This check does not follow that re-export or
+  // verify that consumers resolve one canonical protocol brand identity. Passing
+  // it is not proof that the transitive JWT declarations are self-contained.
   const publicTypesPath = path.join(packageRoot, 'types/editor.d.ts');
   const publicTypes = fs.readFileSync(publicTypesPath, 'utf8');
   const bundledRuntimeBrandPath = './internal/runtime/src/auth/jwtScopes';

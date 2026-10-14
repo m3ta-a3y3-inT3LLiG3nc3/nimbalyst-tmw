@@ -55,9 +55,10 @@ packages/ios/
 - **Storage**: GRDB (SQLite) with reactive `ValueObservation` for live UI updates
 - **Transcript**: WKWebView loads bundled React app, communicates via `webkit.messageHandlers.bridge`
 
-### iPad Support
-- `NavigationSplitView` for regular size class (sidebar + detail)
-- `NavigationStack` for compact size class (iPhone)
+### iPhone and iPad Navigation
+- One `NavigationSplitView` and `WorkspaceNavigationState` on every device and orientation: the session/file sidebar sits beside the detail on wide screens and collapses into a stack on narrow screens.
+- Never replace the navigation tree based on size class; rotation and window resizing must preserve the active session and unsent compose state. Sidebar rows use List tags with stable `WorkspaceSelection` values, including sessions opened by notification or voice. Do not mix `NavigationLink(value:)` pushes with the selection-driven detail stack: the duplicate navigation can disappear the visible transcript and cancel its session connection.
+- SwiftUI may remount the detail while collapsing columns. Keep `SessionComposeState` (text, pending attachments, and draft timestamps) in `WorkspaceNavigationState`, above the split view, and clear that cache when the account changes.
 
 ### Session Fleet Live Activity
 
@@ -80,8 +81,8 @@ Anything user-facing on the card that can be expressed as a pure function belong
 ### Commands
 ```bash
 # From monorepo root:
-npm run ios:test:swift          # Run all 68 Swift tests
-npm run ios:build:transcript    # Build transcript web bundle
+pnpm run ios:test:swift          # Run all 68 Swift tests
+pnpm run ios:build:transcript    # Build transcript web bundle
 
 # From packages/ios/:
 cd NimbalystNative && swift test                    # Run tests directly
@@ -93,7 +94,7 @@ open NimbalystApp/NimbalystApp.xcodeproj            # Open in Xcode
 The Xcode pre-build script in `project.yml` automatically builds the transcript with Vite and copies it to `Resources/transcript-dist/`. You can also build manually:
 
 ```bash
-npm run ios:build:transcript
+pnpm run ios:build:transcript
 ```
 
 Output: `dist-transcript/transcript.html` + `dist-transcript/assets/` (JS bundle + Material Symbols font).
@@ -113,7 +114,7 @@ Rules for editing `TranscriptApp` in `main.tsx`:
 - **All hooks (`useState`, `useRef`, `useCallback`, `useMemo`, `useEffect`) must come BEFORE any early returns.** React requires the same hooks to run in the same order on every render. An early `return` before a hook means that hook runs on some renders but not others, crashing React with "Rendered more hooks than during the previous render."
 - **The `TranscriptErrorBoundary` wraps the app** to catch render errors and display them on screen + report to the native bridge. Do not remove it.
 - **The `postErrorToNative` helper** sends error details through `webkit.messageHandlers.bridge` so they appear in Xcode console logs with full stack traces. Use it in any new try-catch blocks.
-- **Test after any change**: Always rebuild the transcript (`npm run ios:build:transcript`), copy to Xcode resources, and rebuild in Xcode. Vite build success does NOT mean React will render correctly at runtime.
+- **Test after any change**: Always rebuild the transcript (`pnpm run ios:build:transcript`), copy to Xcode resources, and rebuild in Xcode. Vite build success does NOT mean React will render correctly at runtime.
 
 ## Key Files
 

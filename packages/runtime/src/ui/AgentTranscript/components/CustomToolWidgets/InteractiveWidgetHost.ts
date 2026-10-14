@@ -94,6 +94,8 @@ export interface FeedbackRequestSendResult {
    * notified through no other channel.
    */
   shareUrl?: string;
+  /** A non-blocking integration limitation to show with the sent confirmation. */
+  warning?: string;
   error?: string;
 }
 
@@ -338,6 +340,19 @@ export interface InteractiveWidgetHost {
   setAutoCommitEnabled(enabled: boolean): void;
 
   // ============================================================
+  // Usage-limit auto-resume
+  // ============================================================
+
+  /** Whether sessions resume on their own once a Claude usage limit resets. Optional: desktop only. */
+  usageLimitAutoResumeEnabled?: boolean;
+
+  /**
+   * The usage-limit card's switch. Enabling also schedules this session's
+   * resume for `resetsAtMs`; disabling cancels every pending resume.
+   */
+  setUsageLimitAutoResume?(enabled: boolean, resetsAtMs: number | null): Promise<void>;
+
+  // ============================================================
   // Super Loop Blocked Feedback
   // ============================================================
 
@@ -381,6 +396,14 @@ export interface InteractiveWidgetHost {
    * Open a file in the editor
    */
   openFile(filePath: string): Promise<void>;
+
+  /**
+   * Open a page an agent edited: a shared page (`collab://`), a typed page
+   * (`tracker://<itemId>` or `collab://tracker-content/<itemId>`) or a Personal
+   * page (`personal://...`). Optional: a host without a page tree (mobile) leaves
+   * the "Updated <page>" line as plain text.
+   */
+  openPage?(uri: string): Promise<void>;
 
   /**
    * Track an analytics event

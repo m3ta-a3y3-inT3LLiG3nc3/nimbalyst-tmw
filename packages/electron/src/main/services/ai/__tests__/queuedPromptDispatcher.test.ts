@@ -13,6 +13,67 @@ describe('queuedPromptDispatcher', () => {
     vi.useRealTimers();
   });
 
+  it.each([false, true])('serializes send-now and FIFO continuation while claiming (drain bypass: %s)', async (bypass) => {
+    vi.useFakeTimers();
+    let pending: ClaimedQueuedPrompt[] = [
+      { id: 'agent', prompt: 'agent follow-up' },
+      { id: 'human', prompt: 'human follow-up' },
+    ];
+    let releaseClaim!: () => void;
+    let claimStarted!: () => void;
+    const started = new Promise<void>((resolve) => { claimStarted = resolve; });
+    const blocked = new Promise<void>((resolve) => { releaseClaim = resolve; });
+    const queueStore: QueuedPromptStoreLike = {
+      listPending: vi.fn(async () => [...pending]),
+      claim: vi.fn(async (id) => {
+        const row = pending.find((prompt) => prompt.id === id) ?? null;
+        pending = pending.filter((prompt) => prompt.id !== id);
+        if (id === 'agent') {
+          claimStarted();
+          await blocked;
+        }
+        return row;
+      }),
+      complete: vi.fn(async () => {}),
+      fail: vi.fn(async () => {}),
+    };
+    const processingSet = new SessionProcessingGuard();
+    const sendMessageHandler = vi.fn(async () => ({ content: 'ok' }));
+    const options = {
+      queueStore, processingSet, sendMessageHandler,
+      continueQueuedPromptChain: vi.fn(async () => {}),
+      logError: vi.fn(), logInfo: vi.fn(), onPromptClaimed: vi.fn(),
+      startSession: vi.fn(async () => {}),
+      targetWindow: { isDestroyed: () => false, webContents: { mainFrame: {} } } as unknown as Electron.BrowserWindow,
+      sessionId: 'session', workspacePath: '/workspace', source: 'send-now',
+      canBypassChainGuard: () => bypass,
+    };
+    const first = tryClaimAndDispatchNextQueuedPrompt(options);
+    await started;
+    const reserved = processingSet.has('session');
+    const competing = await tryClaimAndDispatchNextQueuedPrompt({ ...options, source: 'FIFO continuation' });
+    releaseClaim();
+    await first;
+    await vi.runAllTimersAsync();
+
+    expect(competing).toBe(false);
+    expect(reserved).toBe(true);
+    expect(sendMessageHandler).toHaveBeenCalledTimes(1);
+    expect(pending.map((row) => row.id)).toEqual(['human']);
+    expect(processingSet.has('session')).toBe(false);
+    expect(await tryClaimAndDispatchNextQueuedPrompt(options)).toBe(true);
+    await vi.runAllTimersAsync();
+    expect(sendMessageHandler).toHaveBeenCalledTimes(2);
+    expect(queueStore.fail).not.toHaveBeenCalled();
+
+    // A storage failure must release the reservation and let a later retry run.
+    vi.mocked(queueStore.listPending).mockRejectedValueOnce(new Error('storage unavailable'));
+    await expect(tryClaimAndDispatchNextQueuedPrompt(options)).rejects.toThrow('storage unavailable');
+    expect(processingSet.has('session')).toBe(false);
+    expect(await tryClaimAndDispatchNextQueuedPrompt(options)).toBe(false);
+    expect(processingSet.has('session')).toBe(false);
+  });
+
   it('starts the session before dispatching a claimed queued prompt', async () => {
     vi.useFakeTimers();
 
@@ -80,6 +141,108 @@ describe('queuedPromptDispatcher', () => {
     expect(processingSet.has('session-1')).toBe(false);
   });
 
+  describe('agent-authored coalescing', () => {
+    const agentPrompt = (id: string, prompt: string): ClaimedQueuedPrompt => ({
+      id,
+      prompt,
+      attachments: null,
+      documentContext: {
+        promptProvenance: { actor: 'agent', origin: 'child-session-update' },
+      } as any,
+    });
+
+    const humanPrompt = (id: string, prompt: string): ClaimedQueuedPrompt => ({
+      id,
+      prompt,
+      attachments: null,
+      documentContext: {
+        promptProvenance: { actor: 'human', origin: 'composer' },
+      } as any,
+    });
+
+    async function drain(pending: ClaimedQueuedPrompt[]) {
+      vi.useFakeTimers();
+      const completed: string[] = [];
+      const sent: string[] = [];
+
+      const queueStore: QueuedPromptStoreLike = {
+        listPending: vi.fn(async () => pending),
+        claim: vi.fn(async (id: string) => pending.find((p) => p.id === id) ?? null),
+        complete: vi.fn(async (id: string) => {
+          completed.push(id);
+        }),
+        fail: vi.fn(async () => {}),
+      };
+
+      const targetWindow = {
+        isDestroyed: () => false,
+        webContents: { send: vi.fn(), mainFrame: {} },
+      } as unknown as Electron.BrowserWindow;
+
+      await tryClaimAndDispatchNextQueuedPrompt({
+        continueQueuedPromptChain: vi.fn(async () => {}),
+        logError: vi.fn(),
+        logInfo: vi.fn(),
+        onPromptClaimed: () => {},
+        processingSet: new SessionProcessingGuard(),
+        queueStore,
+        sendMessageHandler: vi.fn(async (_e, message: string) => {
+          sent.push(message);
+          return { content: 'ok' };
+        }),
+        sessionId: 'session-1',
+        source: 'test queue',
+        startSession: vi.fn(async () => {}),
+        targetWindow,
+        workspacePath: '/workspace/project',
+      });
+
+      await vi.runAllTimersAsync();
+      return { completed, sent };
+    }
+
+    // The orchestration bottleneck: N children reporting cost the parent N
+    // turns, because the drain took pendingPrompts[0] and nothing else.
+    it('merges a run of agent-authored prompts into one turn and completes every row', async () => {
+      const { completed, sent } = await drain([
+        agentPrompt('a', 'first report'),
+        agentPrompt('b', 'second report'),
+        agentPrompt('c', 'third report'),
+      ]);
+
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toContain('first report');
+      expect(sent[0]).toContain('second report');
+      expect(sent[0]).toContain('third report');
+      expect([...completed].sort()).toEqual(['a', 'b', 'c']);
+    });
+
+    // A human message is a hard boundary: it must never be silently folded in
+    // with agent chatter, and nothing behind it may be pulled forward.
+    it('stops the run at a human-authored prompt', async () => {
+      const { completed, sent } = await drain([
+        agentPrompt('a', 'agent one'),
+        humanPrompt('h', 'stop and do this instead'),
+        agentPrompt('c', 'agent two'),
+      ]);
+
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toBe('agent one');
+      expect(sent[0]).not.toContain('stop and do this instead');
+      expect(completed).toEqual(['a']);
+    });
+
+    it('leaves a human-authored head as its own turn', async () => {
+      const { completed, sent } = await drain([
+        humanPrompt('h', 'do the thing'),
+        agentPrompt('a', 'agent report'),
+      ]);
+
+      expect(sent).toEqual(['do the thing']);
+      expect(completed).toEqual(['h']);
+    });
+  });
+
   it('fires onChainSettled when no follow-on prompt is dispatched', async () => {
     vi.useFakeTimers();
 
@@ -132,6 +295,96 @@ describe('queuedPromptDispatcher', () => {
       workspacePath: '/workspace/project',
       source: 'test queue',
     });
+  });
+
+  // NIM-7428: a turn that ends with settled background work wakes the session
+  // with a turn the chain does not own. Settling the chain then ended a running
+  // session and woke the parent mid-turn; continuing it sent a second prompt that
+  // aborted the wake turn and dropped the task results it carried.
+  it('leaves the session to a wake turn the lead started instead of settling or continuing', async () => {
+    vi.useFakeTimers();
+    const claimedPrompt: ClaimedQueuedPrompt = { id: 'prompt-1', prompt: 'continue', attachments: null, documentContext: null };
+    const queueStore: QueuedPromptStoreLike = {
+      listPending: vi.fn(async () => [claimedPrompt]),
+      claim: vi.fn(async () => claimedPrompt),
+      complete: vi.fn(async () => {}),
+      fail: vi.fn(async () => {}),
+    };
+    const processingSet = new SessionProcessingGuard();
+    const targetWindow = {
+      isDestroyed: () => false,
+      webContents: { send: vi.fn(), mainFrame: {} },
+    } as unknown as Electron.BrowserWindow;
+    const continueQueuedPromptChain = vi.fn(async () => {});
+    const onChainSettled = vi.fn(async () => {});
+    const onAfterSettled = vi.fn(async () => {});
+
+    await tryClaimAndDispatchNextQueuedPrompt({
+      continueQueuedPromptChain,
+      logError: vi.fn(),
+      logInfo: vi.fn(),
+      onAfterSettled,
+      onChainSettled,
+      onPromptClaimed: () => {},
+      processingSet,
+      queueStore,
+      sendMessageHandler: vi.fn(async () => ({ content: 'ok' })),
+      sessionId: 'session-1',
+      source: 'test queue',
+      startSession: vi.fn(async () => {}),
+      targetWindow,
+      workspacePath: '/workspace/project',
+      isLeadTurnPending: () => true,
+    });
+    await vi.runAllTimersAsync();
+
+    expect(queueStore.complete).toHaveBeenCalledWith('prompt-1');
+    expect(processingSet.has('session-1')).toBe(false);
+    expect(continueQueuedPromptChain).not.toHaveBeenCalled();
+    expect(onChainSettled).not.toHaveBeenCalled();
+    expect(onAfterSettled).not.toHaveBeenCalled();
+  });
+
+  it('dispatches past the guard a draining turn holds, only when its live query can take the prompt', async () => {
+    vi.useFakeTimers();
+    const claimedPrompt = { id: 'prompt-1', sessionId: 'session-1', prompt: 'follow up', status: 'executing' } as never;
+    const queueStore: QueuedPromptStoreLike = {
+      listPending: vi.fn(async () => [claimedPrompt]),
+      claim: vi.fn(async () => claimedPrompt),
+      complete: vi.fn(async () => {}),
+      fail: vi.fn(async () => {}),
+    };
+    const processingSet = new SessionProcessingGuard();
+    const drainingTurnToken = processingSet.acquire('session-1');
+    const targetWindow = {
+      isDestroyed: () => false,
+      webContents: { send: vi.fn(), mainFrame: {} },
+    } as unknown as Electron.BrowserWindow;
+    const sendMessageHandler = vi.fn(async () => ({ content: 'ok' }));
+    const dispatch = (canBypassChainGuard: () => boolean) => tryClaimAndDispatchNextQueuedPrompt({
+      continueQueuedPromptChain: vi.fn(async () => {}),
+      logError: vi.fn(),
+      logInfo: vi.fn(),
+      onPromptClaimed: () => {},
+      processingSet,
+      queueStore,
+      sendMessageHandler,
+      sessionId: 'session-1',
+      source: 'test queue',
+      startSession: vi.fn(async () => {}),
+      targetWindow,
+      workspacePath: '/workspace/project',
+      canBypassChainGuard,
+    });
+
+    expect(await dispatch(() => false)).toBe(false);
+    expect(await dispatch(() => true)).toBe(true);
+    await vi.runAllTimersAsync();
+
+    expect(sendMessageHandler).toHaveBeenCalledOnce();
+    // The draining turn's later release must not drop the follow-up's guard.
+    expect(processingSet.releaseIfOwner('session-1', drainingTurnToken)).toBe(false);
+    vi.useRealTimers();
   });
 
   it('dispatches once to a replacement window when the original window is destroyed', async () => {
@@ -376,8 +629,10 @@ describe('queuedPromptDispatcher', () => {
       },
     );
 
+    const onAfterSettled = vi.fn(async () => {});
     const dispatchOptions = () => ({
       continueQueuedPromptChain,
+      onAfterSettled,
       logError: vi.fn(),
       onPromptClaimed: () => {},
       processingSet,
@@ -425,6 +680,7 @@ describe('queuedPromptDispatcher', () => {
     expect(processingSet.has('session-1')).toBe(true);
     expect(queueStore.claim).not.toHaveBeenCalledWith('prompt-fifo');
     expect(sendMessageHandler).toHaveBeenCalledTimes(2);
+    expect(onAfterSettled).not.toHaveBeenCalled();
 
     // Once the priority turn settles it releases its own guard, and the FIFO
     // prompt is claimed by the normal continuation.

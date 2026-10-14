@@ -7,10 +7,12 @@
  * items in the same order.
  */
 
-import React, { useMemo } from 'react';
+import React, { useCallback, useMemo, useSyncExternalStore } from 'react';
+import { globalRegistry } from '@nimbalyst/tracker-schema';
 import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
 import type { TrackerRecord } from '@nimbalyst/runtime/core/TrackerRecord';
 import type { TrackerGroupBy } from '@nimbalyst/runtime/plugins/TrackerPlugin/models';
+import { getTrackerTypeLabel } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerGrouping';
 import { getStatusColor, getTypeColor } from '@nimbalyst/runtime/plugins/TrackerPlugin/components/trackerColumns';
 import {
   getFieldByRole,
@@ -20,17 +22,25 @@ import {
 } from '@nimbalyst/runtime/plugins/TrackerPlugin/trackerRecordAccessors';
 import { UserAvatar } from '@nimbalyst/runtime/plugins/TrackerPlugin/components/UserAvatar';
 import { groupTrackerItems } from '@nimbalyst/collab-client/trackers';
+import { collabOpenOptions, type CollabOpenOptions } from '@nimbalyst/collab-client/core';
 import { TrackerSurfaceMessage } from './primitives/TrackerSurfaceMessage';
 import { TrackerSwatchBadge } from './primitives/TrackerSwatchBadge';
 import { NEUTRAL_SWATCH, PRIORITY_COLORS } from './board/trackerBoardTokens';
 import './trackerList.css';
+import { TrackerStackedRow } from './TrackerStackedRow';
+
+const subscribeSchema = (listener: () => void) => globalRegistry.onChange(listener);
 
 export interface TrackerListViewProps {
   rows: TrackerRecord[];
   groupBy: TrackerGroupBy;
   selectedItemId?: string | null;
-  onOpenItem: (itemId: string) => void;
+  /** `options` carries Cmd/Ctrl from the click, so a host can open a new tab. */
+  onOpenItem: (itemId: string, options?: CollabOpenOptions) => void;
   loaded: boolean;
+  /** Host opts into a touch-first row without changing desktop consumers. */
+  stacked?: boolean;
+  showType?: boolean;
   /**
    * Per-row unread dot. Personal lane, so a host with team auth only omits it
    * and the dot's module never enters that host's bundle graph.
@@ -53,7 +63,7 @@ function TrackerListRow({
   item: TrackerRecord;
   selected: boolean;
   unreadSlot: React.ReactNode;
-  onOpen: () => void;
+  onOpen: (event: React.MouseEvent) => void;
   onContextMenu?: (event: React.MouseEvent) => void;
 }) {
   const status = getRecordStatus(item);
@@ -85,7 +95,7 @@ function TrackerListRow({
       ) : null}
       <span className="min-w-0 flex-1 truncate text-sm text-nim">{getRecordTitle(item)}</span>
       <TrackerSwatchBadge
-        label={item.primaryType}
+        label={getTrackerTypeLabel(item.primaryType)}
         color={getTypeColor(item.primaryType)}
         className="tracker-swatch-badge-column"
       />
@@ -111,8 +121,19 @@ export function TrackerListView({
   loaded,
   renderUnreadSlot,
   onRowContextMenu,
+  stacked = false,
+  showType = true,
 }: TrackerListViewProps) {
-  const groups = useMemo(() => groupTrackerItems(rows, groupBy), [rows, groupBy]);
+  // Cached rows may arrive before their schema. Track the registry's existing
+  // change signal without requiring a provider for this presentational leaf.
+  const getSchemaNames = useCallback(() => JSON.stringify(
+    [...new Set(rows.map(row => row.primaryType))].map(type => {
+      const model = globalRegistry.get(type);
+      return [type, model?.displayName, model?.displayNamePlural];
+    }),
+  ), [rows]);
+  const schemaNames = useSyncExternalStore(subscribeSchema, getSchemaNames, getSchemaNames);
+  const groups = useMemo(() => groupTrackerItems(rows, groupBy), [rows, groupBy, schemaNames]);
 
   if (!loaded) {
     return (
@@ -146,13 +167,15 @@ export function TrackerListView({
               <span>{group.items.length}</span>
             </div>
           )}
-          {group.items.map((item) => (
+          {group.items.map((item) => stacked ? (
+            <TrackerStackedRow key={item.id} item={item} selected={selectedItemId === item.id} showType={showType} onOpen={(event) => onOpenItem(item.id, collabOpenOptions(event))} />
+          ) : (
             <TrackerListRow
               key={item.id}
               item={item}
               selected={selectedItemId === item.id}
               unreadSlot={renderUnreadSlot?.(item.id)}
-              onOpen={() => onOpenItem(item.id)}
+              onOpen={(event) => onOpenItem(item.id, collabOpenOptions(event))}
               onContextMenu={onRowContextMenu
                 ? (event) => onRowContextMenu(item.id, event)
                 : undefined}

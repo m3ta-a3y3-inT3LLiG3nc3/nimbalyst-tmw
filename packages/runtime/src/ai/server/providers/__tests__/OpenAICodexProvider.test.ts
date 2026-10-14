@@ -1,3 +1,4 @@
+import { codexSandboxSetupCompleted } from '../../protocols/codexAppServer/windowsSandbox';
 import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
@@ -231,7 +232,7 @@ describe('OpenAICodexProvider', () => {
   });
 
   it('returns fallback models when SDK model discovery is unavailable', async () => {
-    expect(OpenAICodexProvider.DEFAULT_MODEL).toBe('openai-codex:gpt-5.6-sol');
+    expect(OpenAICodexProvider.DEFAULT_MODEL).toBe('openai-codex:gpt-6.1-sol');
 
     const models = await OpenAICodexProvider.getModels(undefined, {
       loadSdkModule: async () => {
@@ -252,8 +253,12 @@ describe('OpenAICodexProvider', () => {
     ]));
   });
 
-  it('keeps the static Codex and ACP fallback rosters in parity', async () => {
-    const expectedModelIds = [
+  it('leads the Codex roster with the GPT-6 models and keeps them out of the ACP roster', async () => {
+    const expectedCodexModelIds = [
+      'gpt-6.1-sol',
+      'gpt-6-sol',
+      'gpt-6-astra',
+      'gpt-6-luna',
       'gpt-5.6-sol',
       'gpt-5.6-terra',
       'gpt-5.6-luna',
@@ -261,6 +266,10 @@ describe('OpenAICodexProvider', () => {
       'gpt-5.4',
       'gpt-5.4-mini',
     ];
+    // The ACP transport is deprecated for OpenAI and runs a separate, much
+    // older codex build with no GPT-6 catalog entries, so offering them there
+    // would hand users a model that build cannot start.
+    const expectedAcpModelIds = expectedCodexModelIds.filter((id) => !/^gpt-6[.-]/.test(id));
     const codexModels = await OpenAICodexProvider.getModels(undefined, {
       loadSdkModule: async () => {
         throw new Error('sdk unavailable');
@@ -269,17 +278,17 @@ describe('OpenAICodexProvider', () => {
     const acpModels = await OpenAICodexACPProvider.getModels();
 
     expect(codexModels.map((model) => model.id)).toEqual(
-      expectedModelIds.map((modelId) => `openai-codex:${modelId}`)
+      expectedCodexModelIds.map((modelId) => `openai-codex:${modelId}`)
     );
     expect(acpModels.map((model) => model.id)).toEqual(
-      expectedModelIds.map((modelId) => `openai-codex-acp:${modelId}`)
+      expectedAcpModelIds.map((modelId) => `openai-codex-acp:${modelId}`)
     );
   });
 
-  it('normalizes legacy codex default aliases to the GPT-5.6 Sol default', () => {
-    expect(OpenAICodexProvider.normalizeModelSelection('openai-codex:openai-codex-cli')).toBe('openai-codex:gpt-5.6-sol');
-    expect(OpenAICodexProvider.normalizeModelSelection('openai-codex:default')).toBe('openai-codex:gpt-5.6-sol');
-    expect(OpenAICodexProvider.normalizeModelSelection('cli')).toBe('openai-codex:gpt-5.6-sol');
+  it('normalizes legacy codex default aliases to the GPT-6.1 Sol default', () => {
+    expect(OpenAICodexProvider.normalizeModelSelection('openai-codex:openai-codex-cli')).toBe('openai-codex:gpt-6.1-sol');
+    expect(OpenAICodexProvider.normalizeModelSelection('openai-codex:default')).toBe('openai-codex:gpt-6.1-sol');
+    expect(OpenAICodexProvider.normalizeModelSelection('cli')).toBe('openai-codex:gpt-6.1-sol');
   });
 
   it.each([
@@ -349,7 +358,7 @@ describe('OpenAICodexProvider', () => {
         provider: 'openai-codex',
       }),
     ]));
-    expect(models).toHaveLength(6);
+    expect(models).toHaveLength(10);
   });
 
   it('preserves CLI auth when initialized without an API key', async () => {
@@ -1504,8 +1513,10 @@ describe('OpenAICodexProvider', () => {
     expect(cleanupSession).toHaveBeenCalledWith(turn1Session);
   });
 
-  it('reattaches a live Codex thread when Agent-verified is enabled', async () => {
+  it.each(['reviewer', 'roots', 'sandbox'])('reattaches a live Codex thread when %s changes', async change => {
     let classifierEnabled = false;
+    let roots = ['/parent'];
+    OpenAICodexProvider.setAdditionalDirectoriesLoader(() => roots);
     OpenAICodexProvider.setTrustChecker(() => ({
       trusted: true,
       mode: 'bypass-all',
@@ -1560,7 +1571,9 @@ describe('OpenAICodexProvider', () => {
       raw: expect.objectContaining({ agentVerified: false }),
     }));
 
-    classifierEnabled = true;
+    if (change === 'reviewer') classifierEnabled = true;
+    else if (change === 'roots') roots = ['/parent', '/new-worktree'];
+    else codexSandboxSetupCompleted();
     for await (const _chunk of provider.sendMessage(
       'verified turn',
       undefined,
@@ -1575,10 +1588,11 @@ describe('OpenAICodexProvider', () => {
     expect(resumeSession).toHaveBeenCalledWith(
       'thread-permission-change',
       expect.objectContaining({
-        raw: expect.objectContaining({ agentVerified: true }),
+        raw: expect.objectContaining({ agentVerified: classifierEnabled, additionalDirectories: roots }),
       }),
     );
     expect(sendMessage.mock.calls[1]![0]).toBe(secondSession);
+    OpenAICodexProvider.setAdditionalDirectoriesLoader(() => []);
     provider.cleanupSession('session-permission-change');
   });
 
@@ -1705,7 +1719,7 @@ describe('OpenAICodexProvider', () => {
     expect(errorChunk?.error).toContain('permission mode');
   });
 
-  it('maps default codex cli aliases to gpt-5.6-sol when starting a thread', async () => {
+  it('maps default codex cli aliases to gpt-6.1-sol when starting a thread', async () => {
     const startThread = vi.fn((config: { model: string }) => ({
       id: 'thread-legacy',
       runStreamed: async () => ({
@@ -1745,7 +1759,7 @@ describe('OpenAICodexProvider', () => {
 
     expect(startThread).toHaveBeenCalledTimes(1);
     const startArgs = (startThread.mock.calls as unknown as [Record<string, unknown>][])[0][0];
-    expect(startArgs.model).toBe('gpt-5.6-sol');
+    expect(startArgs.model).toBe('gpt-6.1-sol');
   });
 
   it('maps removed codex aliases to supported model ids', async () => {

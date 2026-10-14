@@ -6,7 +6,8 @@ import { describe, expect, it, vi } from 'vitest';
 // StytchAuthService, WindowManager). For these invariants we only need the
 // exported constants, so stub the heavy modules to keep the test fast.
 
-vi.mock('electron', () => ({
+vi.mock('electron', async () => ({
+  app: (await import('../../../../test-stubs/privateUserData')).testApp,
   BrowserWindow: { getAllWindows: () => [] },
 }));
 
@@ -78,12 +79,40 @@ vi.mock('../../extensions/backendModuleLifecycle', () => ({
   getDefaultBackendModuleLifecycleDeps: vi.fn(() => ({})),
 }));
 
+import { ALPHA_FEATURES } from '../../../shared/alphaFeatures';
+import { DEVELOPER_FEATURES } from '../../../shared/developerFeatures';
+import { getAppSetting, setAppSetting } from '../../utils/store';
 import {
   ALLOWED_APP_KEYS,
   ALLOWED_WORKSPACE_KEYS,
   DENIED_APP_KEYS,
   SettingsControlService,
 } from '../SettingsControlService';
+import { getWorkspaceState, type WorkspaceState } from '../../utils/store';
+
+describe('SettingsControlService permission diagnostics', () => {
+  it.each([
+    [{ permissionMode: 'bypass-all', allowAllUsesClassifier: true }, 'Agent-verified', true],
+    [{ permissionMode: 'bypass-all', allowAllUsesClassifier: false }, 'Allow everything', false],
+    [{ permissionMode: 'bypass-all' }, 'Allow everything', false],
+    [{ permissionMode: 'allow-all', allowAllUsesClassifier: true }, 'Allow edits only', true],
+    [{ permissionMode: 'ask', allowAllUsesClassifier: true }, 'Ask every time', true],
+    [{ permissionMode: null, allowAllUsesClassifier: true }, 'Untrusted', true],
+    [undefined, 'Untrusted', false],
+  ] as const)('distinguishes the workspace policy for %j', (agentPermissions, agentTrustLabel, allowAllUsesClassifier) => {
+    vi.mocked(getWorkspaceState).mockReturnValueOnce({ agentPermissions } as WorkspaceState);
+
+    expect(SettingsControlService.getInstance().getOverview('/workspace').workspace).toMatchObject({
+      agentPermissionMode: agentPermissions?.permissionMode ?? null,
+      allowAllUsesClassifier,
+      agentTrustLabel,
+    });
+  });
+
+  it('does not invent workspace permissions without a workspace', () => {
+    expect(SettingsControlService.getInstance().getOverview(undefined)).not.toHaveProperty('workspace');
+  });
+});
 
 describe('SettingsControlService allowlist invariants', () => {
   it('does not include any DENIED_APP_KEYS in ALLOWED_APP_KEYS', () => {
@@ -178,5 +207,111 @@ describe('SettingsControlService.setIssueKeyPrefix', () => {
       ok: false,
       message: 'Prefix NIM is already used by project "Nimbalyst Core". Try NIMA.',
     });
+  });
+});
+
+describe('SettingsControlService.toggleFeature', () => {
+  // Developer Mode on, so the gate is never what a failure below is about.
+  function developerModeOn() {
+    vi.mocked(getAppSetting).mockImplementation((key: string) =>
+      key === 'developerMode' ? (true as never) : (undefined as never),
+    );
+  }
+
+  it('refuses a tag this build does not register instead of writing a dead key', async () => {
+    // #1501: `alphaFeatures.session-fleet: true` was persisted and shown as
+    // enabled, while no such feature exists -- so the flag "had no effect".
+    developerModeOn();
+    vi.mocked(setAppSetting).mockClear();
+
+    const result = await SettingsControlService.getInstance().toggleFeature('session-unknown-tag', {
+      bucket: 'alpha',
+      tag: 'session-fleet',
+      enabled: true,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain('session-fleet');
+    // The caller is told what it could have asked for.
+    for (const feature of ALPHA_FEATURES) {
+      expect(result.message).toContain(feature.tag);
+    }
+    expect(setAppSetting).not.toHaveBeenCalled();
+  });
+
+  it('still toggles every registered tag', async () => {
+    developerModeOn();
+
+    for (const [bucket, registry, key] of [
+      ['alpha', ALPHA_FEATURES, 'alphaFeatures'],
+      ['developer', DEVELOPER_FEATURES, 'developerFeatures'],
+    ] as const) {
+      for (const feature of registry) {
+        vi.mocked(setAppSetting).mockClear();
+        const result = await SettingsControlService.getInstance().toggleFeature(
+          `session-${bucket}-${feature.tag}`,
+          { bucket, tag: feature.tag, enabled: true },
+        );
+
+        expect(result, `${bucket}/${feature.tag} must remain toggleable`).toMatchObject({
+          ok: true,
+          after: true,
+        });
+        expect(setAppSetting).toHaveBeenCalledWith(key, { [feature.tag]: true });
+      }
+    }
+  });
+
+  it('rejects an unknown bucket rather than writing it into developerFeatures', async () => {
+    developerModeOn();
+    vi.mocked(setAppSetting).mockClear();
+
+    const result = await SettingsControlService.getInstance().toggleFeature('session-bad-bucket', {
+      // The MCP tool schema declares an enum but nothing enforces it at runtime,
+      // and the old key fallback made every unknown bucket a developer write.
+      bucket: 'gamma' as 'alpha',
+      tag: 'worktrees',
+      enabled: true,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain('gamma');
+    expect(setAppSetting).not.toHaveBeenCalled();
+  });
+
+  it.each(['constructor', '__proto__', 'toString'])(
+    'rejects inherited object property "%s" as a bucket',
+    async (bucket) => {
+      developerModeOn();
+      vi.mocked(setAppSetting).mockClear();
+
+      const result = await SettingsControlService.getInstance().toggleFeature(`session-proto-${bucket}`, {
+        bucket: bucket as 'alpha',
+        tag: 'worktrees',
+        enabled: true,
+      });
+
+      expect(result).toMatchObject({ ok: false });
+      expect(result.message).toContain('Unknown feature bucket');
+      expect(setAppSetting).not.toHaveBeenCalled();
+    },
+  );
+
+  it('reports the missing tag before asking the user for Developer Mode', async () => {
+    // Developer Mode off: an unregistered tag can never be toggled, so sending
+    // the user to Settings > Advanced first would be a dead end.
+    vi.mocked(getAppSetting).mockImplementation(() => undefined as never);
+    vi.mocked(setAppSetting).mockClear();
+
+    const result = await SettingsControlService.getInstance().toggleFeature('session-no-devmode', {
+      bucket: 'alpha',
+      tag: 'session-fleet',
+      enabled: true,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.requiresUserAction).toBeUndefined();
+    expect(result.message).toContain('session-fleet');
+    expect(setAppSetting).not.toHaveBeenCalled();
   });
 });

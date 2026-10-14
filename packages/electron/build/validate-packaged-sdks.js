@@ -43,6 +43,7 @@
  */
 
 const fs = require('fs');
+const { validateClaudeRuntime, locations: claudeLocations } = require('./claude-runtime.js');
 const os = require('os');
 const path = require('path');
 const { pathToFileURL } = require('url');
@@ -256,13 +257,11 @@ function nativeBinaryChecks() {
   const out = [];
   const nmRel = (...parts) => path.join(nodeModulesPath, ...parts);
 
-  // 1. claude binary -- @anthropic-ai/claude-agent-sdk-<plat>-<arch>/claude(.exe)
-  const claudePlatDir = `claude-agent-sdk-${targetPlatform === 'win32' ? 'win32' : targetPlatform}-${targetArch}`;
+  // #1476: the executable must be outside node_modules/@anthropic-ai.
+  validateClaudeRuntime(resourcesRoot, targetPlatform, targetArch);
   out.push({
-    label: 'claude binary (@anthropic-ai/claude-agent-sdk)',
-    candidates: [
-      nmRel('@anthropic-ai', claudePlatDir, targetPlatform === 'win32' ? 'claude.exe' : 'claude'),
-    ],
+    label: 'claude bundled runtime',
+    candidates: [claudeLocations(resourcesRoot, targetPlatform, targetArch).destination],
   });
 
   // 2. codex binary -- @openai/codex-<plat>-<arch>/vendor/<triple>/<bin|codex>/codex(.exe)
@@ -444,6 +443,20 @@ const WORKER_BUNDLES = [
     externals: [],
     nativeBinaries: [],
   },
+  {
+    // The memory backend is a utility-process module under Resources/extensions.
+    // Its local embedder is externalized and must resolve from Resources/node_modules.
+    name: 'memory-backend',
+    bundle: 'extensions/nimbalyst-memory/dist/backend.js',
+    externals: ['@huggingface/transformers', 'onnxruntime-node', 'onnxruntime-common'],
+    nativeBinaries: (targetArch === 'universal' ? ['x64', 'arm64'] : [targetArch]).map(
+      (arch) => ({
+        candidateRelPaths: [
+          `node_modules/onnxruntime-node/bin/napi-v3/${targetPlatform}/${arch}/onnxruntime_binding.node`,
+        ],
+      }),
+    ),
+  },
 ];
 
 console.log('\n[validate-packaged-sdks] Checking worker bundle externals...');
@@ -583,6 +596,12 @@ if (canBootCheck) {
         const r = db.prepare('select sqlite_version() as v').get();
         db.close();
         if (!r || !r.v) throw new Error('better-sqlite3 returned no sqlite_version');
+      `,
+      'onnxruntime-node': `
+        const ort = req('onnxruntime-node');
+        if (!ort || typeof ort.InferenceSession !== 'function') {
+          throw new Error('onnxruntime-node did not expose InferenceSession');
+        }
       `,
     };
 

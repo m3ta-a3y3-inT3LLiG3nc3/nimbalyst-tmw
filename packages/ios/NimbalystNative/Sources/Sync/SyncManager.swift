@@ -12,19 +12,22 @@ import os
 ///   - SwiftUI views observe the database for reactive updates
 @MainActor
 public final class SyncManager: ObservableObject {
-    private let logger = Logger(subsystem: "com.nimbalyst.app", category: "SyncManager")
+    let logger = Logger(subsystem: "com.nimbalyst.app", category: "SyncManager")
 
-    private let crypto: CryptoManager
+    let crypto: CryptoManager
     private let database: DatabaseManager
-    private let indexClient: WebSocketClient = {
+    let indexClient: WebSocketClient = {
         let client = WebSocketClient()
         client.sendsDeviceAnnounce = true
         return client
     }()
     private let sessionClient = WebSocketClient()
-    private let decoder = JSONDecoder()
+    let decoder = JSONDecoder()
+    /// Decodes index-room JSON away from the main actor. See IndexMessageDecoder.
+    private let indexDecoder = IndexMessageDecoder()
 
     @Published public var isConnected = false
+    @Published public private(set) var indexLoadState: IndexLoadState = .loading
     @Published public var connectedDevices: [DeviceInfo] = []
 
     /// The session ID currently connected to the session room, if any.
@@ -36,9 +39,10 @@ public final class SyncManager: ObservableObject {
     /// The desktop's default model ID (e.g., "claude-code:opus").
     @Published public var desktopDefaultModel: String?
 
-    /// When true, most or all encrypted data failed to decrypt, indicating
-    /// the encryption key is wrong and the user needs to re-pair.
+    /// A complete full index had no decryptable entries, so pairing may need
+    /// attention. Partial sync and database failures cannot establish this.
     @Published public var encryptionKeyMismatch = false
+    private var hasDecryptedIndexEntry = false
 
     /// Called when a session transitions from executing to idle (isExecuting: true -> false).
     /// Parameters: (sessionId, lastAssistantMessageSummary)
@@ -47,11 +51,87 @@ public final class SyncManager: ObservableObject {
     /// Called when settings are synced from the desktop (e.g., OpenAI API key, voice mode config).
     public var onSettingsSynced: ((SyncedSettings) -> Void)?
 
-    /// Called when the desktop confirms a create-session request succeeded.
-    /// Parameters: (requestId, sessionId). The `requestId` lets the caller match
-    /// the response to a request it originated (this broadcast reaches every
-    /// paired device), so only the requesting device navigates to the new session.
+    /// Called once a locally requested session is available in the database.
+    /// Parameters: (requestId, sessionId). Other devices' responses are ignored.
     public var onSessionCreated: ((String, String) -> Void)?
+    public lazy var sessionCreation: SessionCreationRequests = {
+        let requests = SessionCreationRequests()
+        requests.onFailure = { [weak self] requestId, message in
+            self?.pendingCreationDrafts.removeValue(forKey: requestId)
+            self?.sessionCreations.receive(CreateSessionResponse(requestId: requestId,
+                success: false, sessionId: nil, error: message))
+        }
+        return requests
+    }()
+    lazy var sessionCreations = SessionCreationTracker(
+        database: database,
+        lookup: { [weak self] in self?.requestSessionIndexLookup(sessionId: $0) },
+        onReady: { [weak self] requestId, sessionId in
+            // #NIM-5925: the tracker fires on the committed GRDB row, which is
+            // the only moment that is guaranteed to exist. Waiting for the next
+            // bulk ingestion outcome dropped the draft whenever the row arrived
+            // on a lookup page instead.
+            self?.applyPendingCreationDrafts()
+            self?.onSessionCreated?(requestId, sessionId)
+        }
+    )
+    private var pendingCreationDrafts: [String: String] = [:]
+    private var pendingSessionDrafts: [String: String] = [:]
+
+    /// The last sync failure worth showing the user, or nil once it clears.
+    /// Fed by the request registry and the decrypt/storage paths.
+    @Published public private(set) var syncError: SyncError?
+
+    /// Collapses a burst of same-kind failures into one banner. See
+    /// SyncErrorCoalescer -- alternating draft and read-receipt failures against
+    /// one dead socket are a single interruption.
+    private var errorCoalescer = SyncErrorCoalescer()
+    private var errorAnalytics = SyncErrorAnalyticsThrottle()
+
+    /// The only way `syncError` is set. Every failure path goes through here so
+    /// the coalescing rule cannot be bypassed by a new call site. Each report is
+    /// also kept for "Copy diagnostics" and, throttled, sent to analytics.
+    func report(_ error: SyncError) {
+        errorAnalytics.observe(error)
+        guard let published = errorCoalescer.accept(error) else { return }
+        syncError = published
+    }
+
+    public func clearSyncError() {
+        syncError = nil
+        errorCoalescer.clear()
+    }
+
+    /// Every outbound message that is not fire-and-forget. See SyncRequestRegistry.
+    private(set) lazy var requests: SyncRequestRegistry = {
+        let registry = SyncRequestRegistry(timeout: requestTimeout) { [weak self] channel, json, completion in
+            guard let self else {
+                completion(NSError(domain: "SyncManager", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Sync stopped"]))
+                return
+            }
+            if let sender = self.sender {
+                sender(channel, json, completion)
+                return
+            }
+            switch channel {
+            case .index: self.indexClient.sendRaw(json, completion: completion)
+            case .session: self.sessionClient.sendRaw(json, completion: completion)
+            }
+        }
+        registry.onOutcome = { [weak self] outcome in
+            guard let self, let error = outcome.error else { return }
+            if outcome.kind == .voiceTool {
+                // The caller is suspended on a continuation, not watching a
+                // banner; resuming it is the whole report.
+                self.voiceTools.fail(outcome.requestId, message: error.message)
+                return
+            }
+            guard outcome.kind.isUserVisible else { return }
+            self.report(error)
+        }
+        return registry
+    }()
 
     /// Called with diagnostic info when session message sync completes (success or failure).
     /// Parameters: (sessionId, diagnostic).
@@ -100,16 +180,231 @@ public final class SyncManager: ObservableObject {
     /// Buffer for paginated sync responses before committing to DB.
     private var sessionSyncBuffer: [ServerMessageEntry] = []
 
-    public init(crypto: CryptoManager, database: DatabaseManager, serverUrl: String, userId: String) {
+    /// The room the session socket is joined to, readable from the socket's own
+    /// queue. #NIM-5924: session-room traffic carries no session id, so it used
+    /// to be attributed to `activeSessionId` -- read on the main actor one hop
+    /// later, by which time navigation may have moved on. Capturing the room at
+    /// arrival is the closest thing to keying on the broadcast's own session
+    /// that the wire currently allows.
+    private let sessionRoom = SessionRoomBox()
+
+    /// Last applied metadata timestamp per session, so a late or replayed
+    /// metadata broadcast cannot re-run the executing -> idle transition.
+    private var lastMetadataUpdatedAt: [String: Int] = [:]
+
+    // MARK: - Index Ingestion
+
+    /// The serial owner of index decode/decrypt/apply work for the current
+    /// connection generation. See `IndexIngestion`.
+    private var ingestion: IndexIngestion!
+    private var ingestionGeneration = 0
+    /// The index room the current generation belongs to.
+    private var connectedIndexRoomId: String?
+    /// Correlates a bulk response with the load state it owns, so a stale
+    /// response cannot report completion for a newer request.
+    private var indexResponseCounter = 0
+    private var awaitedIndexResponseId: Int?
+
+    /// Counters from the most recent ingestion outcome. Durations and counts
+    /// only; exposed for measurement and tests.
+    private(set) var lastIndexIngestionMetrics: IndexIngestionMetrics?
+
+    /// Work submitted but not yet applied, for tests and diagnostics.
+    var pendingIndexIngestionCount: Int { ingestion.pendingCount }
+
+    /// Whether the last index response was decoded off the main actor. The
+    /// production path must always be true; the synchronous entry point is not.
+    private(set) var lastIndexDecodeWasOffMainActor = false
+
+    // MARK: - Versioned Replication
+
+    /// Drives versioned index replication for the current generation.
+    private var replication: IndexReplicationClient?
+
+    /// What the local index has actually proven. The list reads this to decide
+    /// whether "no results" means "nothing matches" or "we are still checking
+    /// older history".
+    @Published public private(set) var indexCoverage = IndexCoverage()
+
+    /// Compatibility accessor for the session list.
+    public var historyComplete: Bool { indexCoverage.historyComplete }
+
+    public convenience init(crypto: CryptoManager, database: DatabaseManager, serverUrl: String, userId: String) {
+        self.init(crypto: crypto, database: database, serverUrl: serverUrl, userId: userId, registerDeviceCallbacks: true)
+    }
+
+    /// Replaces both sockets for tests. Production leaves this nil.
+    private let sender: SyncRequestRegistry.Sender?
+    /// Last settings broadcast accepted per desktop. See SettingsSyncApplier.
+    private let settingsVersions: AppliedSettingsVersionStore
+
+    /// Whether this manager may touch UNUserNotificationCenter and ActivityKit.
+    ///
+    /// Both trap with `bundleProxyForCurrentProcess is nil` outside an app
+    /// bundle, which is every `swift test` run on macOS. The flag used to gate
+    /// only the init-time callback wiring, so a test that merely called
+    /// `connect` still crashed on the first `NotificationManager.shared` touch
+    /// in the connection-state handler.
+    let registersDeviceTokens: Bool
+    private let requestTimeout: Duration
+
+    /// Allows index import tests to run without an application notification center.
+    init(
+        crypto: CryptoManager,
+        database: DatabaseManager,
+        serverUrl: String,
+        userId: String,
+        registerDeviceCallbacks: Bool,
+        requestTimeout: Duration = .seconds(30),
+        sender: SyncRequestRegistry.Sender? = nil,
+        settingsVersions: AppliedSettingsVersionStore = AppliedSettingsVersionStore()
+    ) {
         self.crypto = crypto
         self.database = database
         self.serverUrl = serverUrl
         self.userId = userId
+        self.sender = sender
+        self.requestTimeout = requestTimeout
+        self.settingsVersions = settingsVersions
+        self.registersDeviceTokens = registerDeviceCallbacks
 
+        startIndexIngestionGeneration()
         setupIndexClient()
         setupSessionClient()
-        setupPushTokenForwarding()
-        setupLiveActivityForwarding()
+        if registerDeviceCallbacks {
+            setupPushTokenForwarding()
+            setupLiveActivityForwarding()
+        }
+    }
+
+    /// Retire the current ingestion owner and start one for a new connection
+    /// generation. Queued work from the old generation is dropped and its late
+    /// outcomes are ignored: it was decrypted for an identity we may no longer
+    /// be writing for, and the fresh connection re-requests the index anyway.
+    private func startIndexIngestionGeneration() {
+        ingestion?.cancel()
+        ingestionGeneration += 1
+        awaitedIndexResponseId = nil
+        let generation = ingestionGeneration
+        ingestion = IndexIngestion(
+            generation: generation,
+            crypto: crypto,
+            database: database,
+            onOutcome: { [weak self] outcome in
+                self?.applyIndexIngestionOutcome(outcome)
+            },
+            onPageOutcome: { [weak self] outcome in
+                self?.replication?.handle(outcome: outcome)
+            },
+            onMaintenanceOutcome: { [weak self] outcome in
+                self?.replication?.handle(maintenance: outcome)
+            }
+        )
+
+        replication?.cancel()
+        replication = IndexReplicationClient(
+            generation: generation,
+            send: { [weak self] json in
+                // Not user-visible: the replication client re-drives its own
+                // cursor from `start()` on the next connect, so a failed page
+                // request is recorded and retried by its owner, not by a banner.
+                self?.requests.send(kind: .indexRequest, channel: .index, json: json)
+            },
+            submitPage: { [weak self] response, request in
+                guard let self else { return }
+                self.ingestion.submit(.page(response, request: request), byteCount: 0)
+            },
+            submitMaintenance: { [weak self] request, id in
+                guard let self else { return }
+                self.ingestion.submit(.maintenance(request, id: id), byteCount: 0)
+            },
+            onCoverageChanged: { [weak self] coverage in
+                guard let self else { return }
+                self.indexCoverage = coverage
+                if coverage.hasError {
+                    // Sync failed. Cached rows stay on screen -- a failure is not
+                    // an empty account -- but the list must stop reporting that
+                    // it is still loading, or a v2 failure leaves the sidebar
+                    // spinning forever.
+                    self.indexLoadState = .failed
+                    return
+                }
+                switch coverage.compatibility {
+                case .v2 where self.indexLoadState != .loaded:
+                    // At least one page applied, so the list has real data.
+                    self.indexLoadState = .loaded
+                case .unsupported where self.indexLoadState == .loading:
+                    self.indexLoadState = .failed
+                default:
+                    break
+                }
+            },
+            onLegacyServer: { [weak self] in
+                // The server predates versioned replication: fall back to the
+                // legacy index request rather than showing an empty list.
+                self?.requestIndexSync()
+            }
+        )
+        replication?.onRequestTimeout = { [weak self] in
+            guard let self else { return }
+            if let recover = self.onReconnectNeeded { recover() }
+            else { self.indexClient.reconnect() }
+        }
+    }
+
+    // MARK: - Versioned Replication Handling
+
+    /// Index-room errors carry an optional requestId on a v2 server. An
+    /// `unknown_message_type` with no requestId, answering our first probe, is
+    /// the one and only signal that the server predates versioned replication.
+    private func handleIndexError(_ data: Data) {
+        struct IndexErrorMessage: Decodable {
+            let code: String
+            let message: String?
+            let requestId: String?
+        }
+        guard let error = try? decoder.decode(IndexErrorMessage.self, from: data) else {
+            if indexLoadState == .loading { indexLoadState = .failed }
+            handleServerError(data)
+            return
+        }
+        logger.error("Index server error [\(error.code)]: \(error.message ?? "")")
+        replication?.handle(errorCode: error.code, requestId: error.requestId)
+        if indexLoadState == .loading, error.code != "unknown_message_type" {
+            indexLoadState = .failed
+        }
+    }
+
+    private func handleIndexPageResponse(_ response: IndexPageResponse, decoded: DecodedIndexMessageResult) {
+        lastIndexDecodeWasOffMainActor = decoded.decodedOffMainActor
+        guard replication?.handle(page: response) == true else { return }
+    }
+
+    private func handleIndexChangesAvailable(revision: Int) {
+        replication?.handle(changesAvailable: revision)
+    }
+
+    private func applyIndexIngestionOutcome(_ outcome: IndexIngestionOutcome) {
+        guard outcome.generation == ingestionGeneration else {
+            logger.info("Ignoring index outcome from retired generation \(outcome.generation)")
+            return
+        }
+        applyPendingCreationDrafts()
+        lastIndexIngestionMetrics = outcome.metrics
+
+        // Successful decryption clears earlier suspicion. A failed delta
+        // cannot create a new device-wide pairing warning.
+        if outcome.summary.decryptedEntryCount > 0 {
+            hasDecryptedIndexEntry = true
+            encryptionKeyMismatch = false
+        } else if !outcome.isIncremental {
+            encryptionKeyMismatch = outcome.summary.shouldSuggestRepair && !hasDecryptedIndexEntry
+        }
+
+        // Only the response the current load state is waiting on may end it.
+        guard outcome.responseId == awaitedIndexResponseId else { return }
+        awaitedIndexResponseId = nil
+        indexLoadState = outcome.summary.failed ? .failed : .loaded
     }
 
     // MARK: - Activity Tracking
@@ -120,45 +415,37 @@ public final class SyncManager: ObservableObject {
         indexClient.reportActivity()
     }
 
-    /// Update whether the app is in the foreground.
-    /// Coming to foreground counts as user activity.
-    /// When returning to foreground, reconnects WebSockets if they were dropped while backgrounded.
-    public func setAppInForeground(_ inForeground: Bool) {
+    /// AppState coordinates credentials before recovery. Direct callers retain
+    /// foreground recovery for standalone sync clients and transport tests.
+    public func setAppInForeground(_ inForeground: Bool, recover: Bool = true) {
         indexClient.setAppInForeground(inForeground)
-        if inForeground {
-            reconnectIfNeeded()
-            // Defense in depth: even if the reconnect's onConnectionStateChanged
-            // callback fires the sync request, also trigger one explicitly
-            // here. Two sync requests are harmless (database appends are
-            // idempotent on message ID), and this guarantees a catch-up
-            // happens even if the reconnect callback chain ever changes.
-            if activeSessionId != nil {
-                requestSessionSync()
-            }
+        sessionClient.setAppInForeground(inForeground)
+        replication?.setForeground(inForeground)
+        if inForeground && registersDeviceTokens { FleetActivityController.shared.resendTokens() }
+        if inForeground && recover {
+            indexClient.reconnect()
+            if activeSessionId != nil { sessionClient.reconnect() }
         }
     }
 
-    /// Reconnect the index WebSocket if it was dropped (e.g., by iOS suspending the app).
-    /// Also reconnects the active session room if one was open.
-    ///
-    /// The session client is reconnected unconditionally (not gated on
-    /// `isConnected`) because URLSessionWebSocketTask can hold a backgrounded
-    /// task in `.running` state long after the underlying TCP connection has
-    /// died, so `isConnected` would lie and the user would be left with a
-    /// silently-dead transcript channel until they navigate away and back.
-    /// Forcing a fresh socket here is cheap; missing transcript broadcasts
-    /// is not. The session client also re-issues `requestSessionSync` on
-    /// reconnect (via `onConnectionStateChanged`), so any broadcasts dropped
-    /// while we were backgrounded are caught up via the syncResponse cursor.
-    private func reconnectIfNeeded() {
-        if !indexClient.isConnected {
-            logger.info("[Reconnect] Index client disconnected, reconnecting...")
-            indexClient.reconnect()
-        }
-        if let sessionId = activeSessionId {
-            logger.info("[Reconnect] Forcing session client reconnect for \(sessionId)")
-            sessionClient.reconnect()
-        }
+    /// The app owns index retries so credentials are refreshed before connecting.
+    public var onReconnectNeeded: (@MainActor () -> Void)? {
+        didSet { indexClient.onReconnectNeeded = onReconnectNeeded }
+    }
+
+    /// The session room retries on its own, so it reads the token per attempt
+    /// instead of reusing the one from the last index connect.
+    public var freshToken: (@MainActor () async -> String?)? {
+        didSet { sessionClient.freshToken = freshToken }
+    }
+
+    func waitForConnection() async -> Bool { await indexClient.waitForReady() }
+
+    /// Retire transport before awaiting auth, so creation cannot use a stale
+    /// connected flag. Keep the selected session, cache and navigation intents.
+    func prepareForRecovery() {
+        indexClient.disconnect()
+        sessionClient.disconnect()
     }
 
     // MARK: - Connection
@@ -172,6 +459,11 @@ public final class SyncManager: ObservableObject {
         self.authUserId = authUserId
         self.orgId = orgId
         let roomId = "org:\(orgId):user:\(effectiveUserId):index"
+        // A different room is a different identity: index work decrypted for the
+        // previous one must never reach this account's database.
+        if roomId != connectedIndexRoomId {
+            connectedIndexRoomId = roomId
+        }
         logger.info("[Connect] IndexRoom roomId=\(roomId), orgId=\(orgId), effectiveUserId=\(self.effectiveUserId), authUserId=\(authUserId ?? "nil"), pairingUserId=\(self.userId)")
         indexClient.connect(serverUrl: serverUrl, roomId: roomId, authToken: authToken)
 
@@ -192,8 +484,22 @@ public final class SyncManager: ObservableObject {
 
     /// Disconnect from all rooms.
     public func disconnect() {
+        sessionCreation.disconnect()
+        // A deliberate disconnect drops the parked writes too: on reconnect the
+        // account may be a different one, and replaying a draft for an identity
+        // we are no longer writing for would publish it to the wrong index.
+        requests.cancel()
+        connectedDevices = []
+        pendingCreationDrafts.removeAll()
+        pendingSessionDrafts.removeAll()
+        sessionCreations.cancel()
         leaveSessionRoom()
         indexClient.disconnect()
+        // Drop the backlog this connection produced. A reconnect requests the
+        // index again from the last committed cursor, so nothing is lost, and a
+        // late outcome cannot report completion for a connection that is gone.
+        connectedIndexRoomId = nil
+        startIndexIngestionGeneration()
     }
 
     // MARK: - Session Room
@@ -210,6 +516,7 @@ public final class SyncManager: ObservableObject {
         }
 
         activeSessionId = sessionId
+        sessionRoom.sessionId = sessionId
         sessionSyncBuffer = []
 
         let roomId = "org:\(orgId ?? ""):user:\(effectiveUserId):session:\(sessionId)"
@@ -239,53 +546,101 @@ public final class SyncManager: ObservableObject {
             return
         }
         sessionClient.disconnect()
+        if let leaving = activeSessionId { lastMetadataUpdatedAt.removeValue(forKey: leaving) }
         activeSessionId = nil
+        sessionRoom.sessionId = nil
         sessionSyncBuffer = []
     }
 
     // MARK: - Index Client Setup
 
     private func setupIndexClient() {
+        indexClient.onWillConnect = { [weak self] in
+            guard let self else { return }
+            let lookups = self.replication?.pendingNavigationIds ?? []
+            self.startIndexIngestionGeneration()
+            self.replication?.restoreNavigation(lookups)
+        }
         indexClient.onConnectionStateChanged = { [weak self] connected in
-            Task { @MainActor in
-                self?.isConnected = connected
-                if connected {
-                    self?.requestIndexSync()
-                    if NotificationManager.shared.shouldRegisterForPush,
-                       let token = NotificationManager.shared.deviceToken {
-                        self?.registerPushToken(token)
-                    } else {
-                        self?.unregisterPushToken()
-                    }
-                    // ActivityKit hands out a push-to-start token once per
-                    // launch, which is routinely before the socket is up. A
-                    // token that only existed while we were disconnected is a
-                    // card that never appears, with nothing to see in any log.
-                    if FleetActivityController.shared.shouldRegister {
-                        FleetActivityController.shared.resendTokens()
-                    } else {
-                        self?.unregisterLiveActivityToken(kind: nil)
-                    }
-                }
+            self?.isConnected = connected
+            if !connected {
+                self?.sessionCreation.disconnect()
+                self?.requests.disconnect()
+                self?.connectedDevices = []
+            }
+            if connected {
+                // A transport error is what this reconnect answers. Parked
+                // writes re-publish next; one that fails again reports again.
+                if self?.syncError?.kind == .transport { self?.clearSyncError() }
+                self?.requests.reconnect()
+                // Versioned replication probes first; the probe's
+                // unknown_message_type answer is what falls back to the
+                // legacy index request (see IndexReplicationClient).
+                self?.indexLoadState = .loading
+                self?.replication?.start()
+                // ActivityKit hands out a push-to-start token once per
+                // launch, which is routinely before the socket is up. A
+                // token that only existed while we were disconnected is a
+                // card that never appears, with nothing to see in any log.
+                self?.registerDeviceTokensOnConnect()
             }
         }
 
-        indexClient.onMessage = { [weak self] data in
-            Task { @MainActor in
-                self?.handleIndexMessage(data)
-            }
+        // The awaited handler (as used by document sync) reads one message at a
+        // time. Handling stays cheap -- decode, then hand the entry to the
+        // ingestion queue -- and only suspends while that queue is over its
+        // byte budget, so a history burst throttles the socket instead of
+        // growing an unbounded backlog. Command responses and session control
+        // are handled inline and never wait behind history work.
+        indexClient.onMessageAsync = { [weak self] data in
+            guard let self else { return }
+            await self.receiveIndexMessage(data)
+            await self.ingestion.awaitCapacity()
         }
     }
 
+    /// Fetch one session and its ancestors immediately, whatever the list has
+    /// paged in. Used by notification, deep-link and voice navigation.
+    ///
+    /// Navigation takes priority over history fill: the request goes out at the
+    /// next page boundary and the bootstrap resumes afterwards from where it
+    /// left off. It never advances the replication cursor. On a legacy server
+    /// this falls back to a full index sync, which is the only way that protocol
+    /// can fetch a row it has not seen.
+    public func requestSessionIndexLookup(sessionId: String) {
+        guard indexCoverage.compatibility == .v2 else {
+            // Legacy has no way to ask for one row, so this is a full index
+            // sync. Coalesced against the one already running: a navigation
+            // poller must not restart the whole index on every tick.
+            guard awaitedIndexResponseId == nil else {
+                logger.info("Session lookup for \(sessionId) folded into the index sync already in flight")
+                return
+            }
+            requestIndexSync(fullSync: true)
+            return
+        }
+        replication?.lookup(sessionIds: [sessionId])
+    }
+
     /// Request a full index sync (ignoring watermark). Called by AppState on pull-to-refresh.
+    ///
+    /// On a versioned server this restarts replication -- a bounded recent seed
+    /// followed by whatever coverage is still owed -- rather than pulling the
+    /// whole unbounded legacy envelope again.
     public func requestFullSync() {
-        requestIndexSync(fullSync: true)
+        if indexCoverage.compatibility == .v2 {
+            indexLoadState = .loading
+            replication?.start()
+        } else {
+            requestIndexSync(fullSync: true)
+        }
     }
 
     /// Request the index from the server.
     /// By default, sends the last sync watermark for incremental sync.
     /// Pass `fullSync: true` to request everything (e.g., pull-to-refresh).
     private func requestIndexSync(fullSync: Bool = false, attempt: Int = 0) {
+        indexLoadState = .loading
         let since: Int? = fullSync ? nil : (try? database.syncState(forRoom: "index"))?.lastSyncedAt
 
         let request = IndexSyncRequest(projectId: nil, since: since)
@@ -294,33 +649,74 @@ public final class SyncManager: ObservableObject {
 
         indexClient.sendRaw(json) { [weak self] error in
             guard let self = self, error != nil else { return }
-            guard attempt < 3 else { return }
+            guard attempt < 3 else {
+                self.indexLoadState = .failed
+                return
+            }
 
             self.logger.info("Index sync request failed, retrying (attempt \(attempt + 1))")
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                self?.requestIndexSync(attempt: attempt + 1)
+                self?.requestIndexSync(fullSync: fullSync, attempt: attempt + 1)
             }
         }
     }
 
     // MARK: - Message Handling
 
-    private func handleIndexMessage(_ data: Data) {
-        // First, determine the message type
-        guard let envelope = try? decoder.decode(ServerMessage.self, from: data) else {
-            logger.warning("Could not decode message type")
-            return
-        }
+    /// Production entry point. The JSON decode -- thousands of entry structs for
+    /// a cold index -- runs on the decoder actor, and only the routing decision
+    /// comes back to the main actor. The socket handler awaits this before
+    /// reading the next message, so arrival order is preserved without a
+    /// detached task per message.
+    func receiveIndexMessage(_ data: Data) async {
+        let decoded = await indexDecoder.decode(data)
+        route(decoded)
+    }
 
-        switch envelope.type {
-        case "indexSyncResponse":
-            handleIndexSyncResponse(data)
-        case "indexBroadcast":
-            handleIndexBroadcast(data)
-        case "indexDeleteBroadcast":
-            handleIndexDeleteBroadcast(data)
-        case "projectBroadcast":
-            handleProjectBroadcast(data)
+    /// Synchronous entry point kept for callers that cannot await. It runs the
+    /// same decode on the caller's thread and the same routing, so the two paths
+    /// cannot drift apart.
+    func handleIndexMessage(_ data: Data) {
+        route(IndexMessageDecoder.decode(data))
+    }
+
+    /// A v2 server suppresses legacy index broadcasts. One that arrives anyway
+    /// is late traffic from before negotiation: it carries no revision, so
+    /// applying it could overwrite a newer versioned row with an older one.
+    private var ignoresLegacyIndexTraffic: Bool {
+        indexCoverage.compatibility == .v2
+    }
+
+    private func route(_ decoded: DecodedIndexMessageResult) {
+        switch decoded.message {
+        case .syncResponse(let response):
+            handleIndexSyncResponse(response, decoded: decoded)
+        case .session(let entry):
+            guard !ignoresLegacyIndexTraffic else { return }
+            ingestion.submit(.session(entry), byteCount: decoded.byteCount)
+        case .delete(let sessionId):
+            guard !ignoresLegacyIndexTraffic else { return }
+            logger.info("Session deleted: \(sessionId)")
+            ingestion.submit(.delete(sessionId: sessionId), byteCount: decoded.byteCount)
+        case .project(let entry):
+            guard !ignoresLegacyIndexTraffic else { return }
+            ingestion.submit(.project(entry), byteCount: decoded.byteCount)
+        case .page(let response):
+            handleIndexPageResponse(response, decoded: decoded)
+        case .changesAvailable(let revision):
+            handleIndexChangesAvailable(revision: revision)
+        case .undecodable(let type, let detail):
+            logger.warning("Could not decode index message\(type.map { " of type \($0)" } ?? ""): \(detail, privacy: .public)")
+            if type == "indexSyncResponse" || type == "indexPageResponse" {
+                indexLoadState = .failed
+            }
+        case .control(let type, let data):
+            routeControl(type: type, data: data)
+        }
+    }
+
+    private func routeControl(type: String, data: Data) {
+        switch type {
         case "createSessionResponseBroadcast":
             handleCreateSessionResponse(data)
         case "devicesList":
@@ -332,25 +728,22 @@ public final class SyncManager: ObservableObject {
         case "settingsSyncBroadcast":
             handleSettingsSyncBroadcast(data)
         case "createWorktreeResponseBroadcast":
-            // Response to our worktree creation request - the worktree session
-            // will appear via indexBroadcast, so no special handling needed
-            break
+            handleCreateWorktreeResponse(data)
         case "voiceToolResponseBroadcast":
-            handleVoiceToolResponse(data)
+            if let requestId = voiceTools.receive(data) { requests.resolve(requestId: requestId) }
+        case "sessionContextBroadcast":
+            liveContext.apply(data)
         case "error":
-            handleServerError(data)
+            handleIndexError(data)
         default:
-            logger.info("Unhandled message type: \(envelope.type)")
+            logger.info("Unhandled message type: \(type)")
         }
     }
 
     // MARK: - Index Sync Response
 
-    private func handleIndexSyncResponse(_ data: Data) {
-        guard let response = try? decoder.decode(IndexSyncResponse.self, from: data) else {
-            logger.error("Failed to decode index_sync_response")
-            return
-        }
+    private func handleIndexSyncResponse(_ response: IndexSyncResponse, decoded: DecodedIndexMessageResult) {
+        indexLoadState = .loading
 
         let isIncremental = response.since != nil
         if !isIncremental, let total = response.totalSessionCount, total != response.sessions.count {
@@ -358,662 +751,128 @@ public final class SyncManager: ObservableObject {
         }
         logger.info("Index sync received: \(response.sessions.count) sessions, \(response.projects.count) projects\(isIncremental ? " (incremental)" : "") (server total: \(response.totalSessionCount.map(String.init) ?? "unknown"))")
 
-        // Heavy crypto + DB work runs off the main thread to avoid UI freezes
-        let crypto = self.crypto
-        let database = self.database
-        Task.detached {
-            // Process projects
-            for serverProject in response.projects {
-                Self.processServerProjectBackground(serverProject, crypto: crypto, database: database)
-            }
-
-            // Process sessions - track success/failure/skip counts
-            var processedCount = 0
-            var skippedCount = 0
-            var failedDecryptCount = 0
-            for serverSession in response.sessions {
-                let result = Self.processServerSessionBackground(serverSession, crypto: crypto, database: database)
-                switch result {
-                case .updated: processedCount += 1
-                case .skipped: skippedCount += 1
-                case .failed: failedDecryptCount += 1
-                }
-            }
-            if failedDecryptCount > 0 || skippedCount > 0 {
-                let logger = Logger(subsystem: "com.nimbalyst.app", category: "SyncManager")
-                logger.info("Session processing: \(processedCount) updated, \(skippedCount) unchanged, \(failedDecryptCount) failed")
-            }
-
-            // If the vast majority of sessions failed to decrypt, the encryption key is wrong.
-            // This happens when the pairing encryption seed or userId salt is out of sync
-            // with the desktop. The user needs to re-pair.
-            let totalAttempted = processedCount + failedDecryptCount
-            let isMismatch = totalAttempted > 5 && failedDecryptCount > (totalAttempted * 80 / 100)
-            if isMismatch {
-                let logger = Logger(subsystem: "com.nimbalyst.app", category: "SyncManager")
-                logger.error("Encryption key mismatch detected: \(failedDecryptCount)/\(totalAttempted) sessions failed to decrypt")
-                await MainActor.run { [weak self] in
-                    self?.encryptionKeyMismatch = true
-                }
-            }
-
-            // Recalculate project stats from session data (more reliable than server-side stats)
-            do {
-                try database.refreshAllProjectStats()
-            } catch {
-                let logger = Logger(subsystem: "com.nimbalyst.app", category: "SyncManager")
-                logger.error("Failed to refresh project stats: \(error.localizedDescription)")
-            }
-
-            // Update sync state watermark using the max updatedAt from received sessions.
-            // This ensures the `since` parameter on the next request matches server timestamps exactly.
-            let maxUpdatedAt = response.sessions.map(\.updatedAt).max()
-            if let watermark = maxUpdatedAt {
-                let syncState = SyncState(roomId: "index", lastCursor: nil, lastSequence: 0, lastSyncedAt: watermark)
-                try? database.updateSyncState(syncState)
-            }
-        }
-    }
-
-    // MARK: - Background Processing Helpers
-
-    private enum SyncResult {
-        case updated, skipped, failed
-    }
-
-    /// Process a server project entry on a background thread.
-    private nonisolated static func processServerProjectBackground(_ entry: ServerProjectEntry, crypto: CryptoManager, database: DatabaseManager) {
-        let logger = Logger(subsystem: "com.nimbalyst.app", category: "SyncManager")
-
-        guard let projectId = crypto.decryptOrNil(
-            encryptedBase64: entry.encryptedProjectId,
-            ivBase64: entry.projectIdIv
-        ) else {
-            logger.warning("Failed to decrypt project ID")
-            return
-        }
-
-        // Decrypt project config if present
-        var commandsJson: String? = nil
-        if let encryptedConfig = entry.encryptedConfig,
-           let configIv = entry.configIv,
-           let configJson = crypto.decryptOrNil(encryptedBase64: encryptedConfig, ivBase64: configIv),
-           let configData = configJson.data(using: .utf8),
-           let config = try? JSONDecoder().decode(ProjectConfig.self, from: configData) {
-            // Encode just the commands array as JSON for storage
-            if let encoded = try? JSONEncoder().encode(config.commands),
-               let jsonStr = String(data: encoded, encoding: .utf8) {
-                commandsJson = jsonStr
-            }
-        }
-
-        let name = (projectId as NSString).lastPathComponent
-        let project = Project(
-            id: projectId,
-            name: name,
-            sessionCount: entry.sessionCount ?? 0,
-            lastUpdatedAt: entry.lastActivityAt,
-            commandsJson: commandsJson,
-            gitRemoteHash: entry.gitRemoteHash
+        // Decryption and every database write happen on the ingestion queue,
+        // in arrival order with the live broadcasts around them.
+        indexResponseCounter += 1
+        awaitedIndexResponseId = indexResponseCounter
+        lastIndexDecodeWasOffMainActor = decoded.decodedOffMainActor
+        ingestion.submit(
+            .syncResponse(response, id: indexResponseCounter, decodeMs: decoded.decodeMs),
+            byteCount: decoded.byteCount
         )
-
-        do {
-            try database.upsertProject(project)
-            // Server's sessionCount includes archived sessions; recompute locally
-            // so the displayed count matches what SessionListView actually shows.
-            try database.refreshSessionCount(forProject: projectId)
-        } catch {
-            logger.error("Failed to upsert project: \(error.localizedDescription)")
-        }
-    }
-
-    /// Process a server session entry on a background thread.
-    @discardableResult
-    private nonisolated static func processServerSessionBackground(_ entry: ServerSessionEntry, crypto: CryptoManager, database: DatabaseManager) -> SyncResult {
-        let logger = Logger(subsystem: "com.nimbalyst.app", category: "SyncManager")
-
-        let existing = try? database.session(byId: entry.sessionId)
-
-        // Skip if the session hasn't changed since we last wrote it
-        if let existing = existing, existing.updatedAt == entry.updatedAt {
-            return .skipped
-        }
-
-        guard let projectId = crypto.decryptOrNil(
-            encryptedBase64: entry.encryptedProjectId,
-            ivBase64: entry.projectIdIv
-        ) else {
-            logger.warning("Failed to decrypt project ID for session \(entry.sessionId)")
-            return .failed
-        }
-
-        // Ensure the project exists
-        if (try? database.writer.read({ db in try Project.fetchOne(db, id: projectId) })) == nil {
-            let projectName = (projectId as NSString).lastPathComponent
-            let project = Project(id: projectId, name: projectName, lastUpdatedAt: entry.updatedAt)
-            try? database.upsertProject(project)
-        }
-
-        let titleDecrypted = crypto.decryptOrNil(
-            encryptedBase64: entry.encryptedTitle,
-            ivBase64: entry.titleIv
-        )
-
-        var clientMeta: ClientMetadata?
-        if let encryptedMeta = entry.encryptedClientMetadata,
-           let metaIv = entry.clientMetadataIv,
-           let metaJson = crypto.decryptOrNil(encryptedBase64: encryptedMeta, ivBase64: metaIv),
-           let metaData = metaJson.data(using: .utf8) {
-            clientMeta = try? JSONDecoder().decode(ClientMetadata.self, from: metaData)
-        }
-
-        // Encode tags array to JSON string for storage
-        var tagsJson: String? = nil
-        if let tags = clientMeta?.tags, !tags.isEmpty,
-           let data = try? JSONEncoder().encode(tags) {
-            tagsJson = String(data: data, encoding: .utf8)
-        }
-
-        let session = Session(
-            id: entry.sessionId,
-            projectId: projectId,
-            titleEncrypted: entry.encryptedTitle,
-            titleIv: entry.titleIv,
-            titleDecrypted: titleDecrypted,
-            // Preserve local provider/model/mode when the server omits them.
-            // Older server rows can be missing these fields, and overwriting
-            // with nil wipes the session's identity (e.g. the session-list
-            // badge would lose "Opus 4.7" because the incoming entry had a
-            // null model column). Matches the pattern used for every other
-            // field below.
-            provider: entry.provider ?? existing?.provider,
-            model: entry.model ?? existing?.model,
-            mode: entry.mode ?? existing?.mode,
-            sessionType: entry.sessionType ?? existing?.sessionType,
-            parentSessionId: entry.parentSessionId ?? existing?.parentSessionId,
-            agentRole: entry.agentRole ?? existing?.agentRole,
-            createdBySessionId: entry.createdBySessionId ?? existing?.createdBySessionId,
-            phase: clientMeta?.phase ?? existing?.phase,
-            tagsJson: tagsJson ?? existing?.tagsJson,
-            worktreeId: entry.worktreeId ?? existing?.worktreeId,
-            hostDeviceId: entry.hostDeviceId ?? existing?.hostDeviceId,
-            isArchived: entry.isArchived ?? existing?.isArchived ?? false,
-            isPinned: entry.isPinned ?? existing?.isPinned ?? false,
-            branchedFromSessionId: entry.branchedFromSessionId ?? existing?.branchedFromSessionId,
-            branchPointMessageId: entry.branchPointMessageId ?? existing?.branchPointMessageId,
-            branchedAt: entry.branchedAt ?? existing?.branchedAt,
-            isExecuting: entry.isExecuting ?? existing?.isExecuting ?? false,
-            hasQueuedPrompts: clientMeta?.hasPendingPrompt ?? entry.hasPendingPrompt ?? existing?.hasQueuedPrompts ?? false,
-            contextTokens: clientMeta?.currentContext?.tokens ?? existing?.contextTokens,
-            contextWindow: clientMeta?.currentContext?.contextWindow ?? existing?.contextWindow,
-            createdAt: entry.createdAt,
-            updatedAt: entry.updatedAt,
-            lastSyncedSeq: entry.messageCount ?? existing?.lastSyncedSeq ?? 0,
-            lastReadAt: entry.lastReadAt ?? existing?.lastReadAt,
-            lastMessageAt: entry.lastMessageAt ?? existing?.lastMessageAt,
-            // "" from remote means "cleared" -> nil locally; nil means "not sent" -> keep existing
-            draftInput: clientMeta?.draftInput != nil ? (clientMeta!.draftInput!.isEmpty ? nil : clientMeta!.draftInput!) : existing?.draftInput,
-            draftUpdatedAt: clientMeta?.draftUpdatedAt ?? existing?.draftUpdatedAt
-        )
-
-        do {
-            try database.upsertSession(session)
-            try database.updateProjectLastActivity(projectId: projectId, activityAt: entry.updatedAt)
-
-            // Decrypt and store queued prompts from remote for display
-            if let encryptedPrompts = entry.encryptedQueuedPrompts, !encryptedPrompts.isEmpty {
-                var decrypted: [QueuedPrompt] = []
-                for ep in encryptedPrompts {
-                    guard let plaintext = crypto.decryptOrNil(encryptedBase64: ep.encryptedPrompt, ivBase64: ep.iv) else {
-                        continue
-                    }
-                    decrypted.append(QueuedPrompt(
-                        id: ep.id,
-                        sessionId: entry.sessionId,
-                        promptTextEncrypted: ep.encryptedPrompt,
-                        iv: ep.iv,
-                        createdAt: ep.timestamp,
-                        sentAt: nil,
-                        promptTextDecrypted: plaintext,
-                        source: ep.source ?? "desktop"
-                    ))
-                }
-                try? database.replaceQueuedPrompts(forSession: entry.sessionId, with: decrypted)
-            } else if entry.queuedPromptCount == 0 || entry.encryptedQueuedPrompts?.isEmpty == true {
-                try? database.deleteRemoteQueuedPrompts(forSession: entry.sessionId)
-            }
-
-            return .updated
-        } catch {
-            logger.error("Failed to upsert session: \(error.localizedDescription)")
-            return .failed
-        }
-    }
-
-    // MARK: - Process Server Entries
-
-    private func processServerProject(_ entry: ServerProjectEntry) {
-        // Decrypt project ID (uses fixed IV for deterministic matching)
-        guard let projectId = crypto.decryptOrNil(
-            encryptedBase64: entry.encryptedProjectId,
-            ivBase64: entry.projectIdIv
-        ) else {
-            logger.warning("Failed to decrypt project ID")
-            return
-        }
-
-        // Always use last path component as project name.
-        // The server stores encrypted_project_id as the name placeholder,
-        // so decrypting it gives the full workspace path (not a human-friendly name).
-        let name = (projectId as NSString).lastPathComponent
-
-        // Decrypt project config if present
-        var commandsJson: String? = nil
-        if let encryptedConfig = entry.encryptedConfig,
-           let configIv = entry.configIv,
-           let configJson = crypto.decryptOrNil(encryptedBase64: encryptedConfig, ivBase64: configIv),
-           let configData = configJson.data(using: .utf8),
-           let config = try? JSONDecoder().decode(ProjectConfig.self, from: configData) {
-            if let encoded = try? JSONEncoder().encode(config.commands),
-               let jsonStr = String(data: encoded, encoding: .utf8) {
-                commandsJson = jsonStr
-            }
-        }
-
-        let project = Project(
-            id: projectId,
-            name: name,
-            sessionCount: entry.sessionCount ?? 0,
-            lastUpdatedAt: entry.lastActivityAt,
-            commandsJson: commandsJson,
-            gitRemoteHash: entry.gitRemoteHash
-        )
-
-        do {
-            try database.upsertProject(project)
-            // Server's sessionCount includes archived sessions; recompute locally
-            // so the displayed count matches what SessionListView actually shows.
-            try database.refreshSessionCount(forProject: projectId)
-        } catch {
-            logger.error("Failed to upsert project: \(error.localizedDescription)")
-        }
-    }
-
-    private func processServerSession(_ entry: ServerSessionEntry) {
-        _ = processServerSessionWithResult(entry)
-    }
-
-    /// Process a server session entry, returning true on success, false on decrypt failure.
-    @discardableResult
-    private func processServerSessionWithResult(_ entry: ServerSessionEntry) -> Bool {
-        // Decrypt project ID to find the parent project
-        guard let projectId = crypto.decryptOrNil(
-            encryptedBase64: entry.encryptedProjectId,
-            ivBase64: entry.projectIdIv
-        ) else {
-            logger.warning("Failed to decrypt project ID for session \(entry.sessionId)")
-            return false
-        }
-
-        // Ensure the project exists (don't overwrite if it already has data from processServerProject)
-        if (try? database.writer.read({ db in try Project.fetchOne(db, id: projectId) })) == nil {
-            let projectName = (projectId as NSString).lastPathComponent
-            let project = Project(id: projectId, name: projectName, lastUpdatedAt: entry.updatedAt)
-            try? database.upsertProject(project)
-        }
-
-        // Decrypt session title
-        let titleDecrypted = crypto.decryptOrNil(
-            encryptedBase64: entry.encryptedTitle,
-            ivBase64: entry.titleIv
-        )
-
-        // Preserve local isExecuting/lastReadAt when the server entry doesn't include them
-        let existing = try? database.session(byId: entry.sessionId)
-
-        // Decrypt client metadata (context usage, etc.)
-        var clientMeta: ClientMetadata?
-        if let encryptedMeta = entry.encryptedClientMetadata,
-           let metaIv = entry.clientMetadataIv,
-           let metaJson = crypto.decryptOrNil(encryptedBase64: encryptedMeta, ivBase64: metaIv),
-           let metaData = metaJson.data(using: .utf8) {
-            clientMeta = try? JSONDecoder().decode(ClientMetadata.self, from: metaData)
-        }
-
-        // Encode tags array to JSON string for storage
-        var tagsJson: String? = nil
-        if let tags = clientMeta?.tags, !tags.isEmpty,
-           let data = try? JSONEncoder().encode(tags) {
-            tagsJson = String(data: data, encoding: .utf8)
-        }
-
-        let session = Session(
-            id: entry.sessionId,
-            projectId: projectId,
-            titleEncrypted: entry.encryptedTitle,
-            titleIv: entry.titleIv,
-            titleDecrypted: titleDecrypted,
-            // See processServerSessionBackground for why these fall back to
-            // the existing values rather than overwriting with nil.
-            provider: entry.provider ?? existing?.provider,
-            model: entry.model ?? existing?.model,
-            mode: entry.mode ?? existing?.mode,
-            sessionType: entry.sessionType ?? existing?.sessionType,
-            parentSessionId: entry.parentSessionId ?? existing?.parentSessionId,
-            agentRole: entry.agentRole ?? existing?.agentRole,
-            createdBySessionId: entry.createdBySessionId ?? existing?.createdBySessionId,
-            phase: clientMeta?.phase ?? existing?.phase,
-            tagsJson: tagsJson ?? existing?.tagsJson,
-            worktreeId: entry.worktreeId ?? existing?.worktreeId,
-            hostDeviceId: entry.hostDeviceId ?? existing?.hostDeviceId,
-            isArchived: entry.isArchived ?? existing?.isArchived ?? false,
-            isPinned: entry.isPinned ?? existing?.isPinned ?? false,
-            branchedFromSessionId: entry.branchedFromSessionId ?? existing?.branchedFromSessionId,
-            branchPointMessageId: entry.branchPointMessageId ?? existing?.branchPointMessageId,
-            branchedAt: entry.branchedAt ?? existing?.branchedAt,
-            isExecuting: entry.isExecuting ?? existing?.isExecuting ?? false,
-            hasQueuedPrompts: clientMeta?.hasPendingPrompt ?? entry.hasPendingPrompt ?? existing?.hasQueuedPrompts ?? false,
-            contextTokens: clientMeta?.currentContext?.tokens ?? existing?.contextTokens,
-            contextWindow: clientMeta?.currentContext?.contextWindow ?? existing?.contextWindow,
-            createdAt: entry.createdAt,
-            updatedAt: entry.updatedAt,
-            lastSyncedSeq: entry.messageCount ?? existing?.lastSyncedSeq ?? 0,
-            lastReadAt: entry.lastReadAt ?? existing?.lastReadAt,
-            lastMessageAt: entry.lastMessageAt ?? existing?.lastMessageAt,
-            // "" from remote means "cleared" -> nil locally; nil means "not sent" -> keep existing
-            draftInput: clientMeta?.draftInput != nil ? (clientMeta!.draftInput!.isEmpty ? nil : clientMeta!.draftInput!) : existing?.draftInput,
-            draftUpdatedAt: clientMeta?.draftUpdatedAt ?? existing?.draftUpdatedAt
-        )
-
-        do {
-            try database.upsertSession(session)
-            // Update the project's lastUpdatedAt if this session is more recent
-            try database.updateProjectLastActivity(projectId: projectId, activityAt: entry.updatedAt)
-
-            // Decrypt and store queued prompts from remote for display
-            if let encryptedPrompts = entry.encryptedQueuedPrompts, !encryptedPrompts.isEmpty {
-                decryptAndStoreQueuedPrompts(sessionId: entry.sessionId, encryptedPrompts: encryptedPrompts)
-            } else if entry.queuedPromptCount == 0 || entry.encryptedQueuedPrompts?.isEmpty == true {
-                // Queue was cleared on remote -- remove synced prompts
-                try? database.deleteRemoteQueuedPrompts(forSession: entry.sessionId)
-            }
-
-            return true
-        } catch {
-            logger.error("Failed to upsert session: \(error.localizedDescription)")
-            return false
-        }
-    }
-
-    /// Decrypt queued prompts from the server and store for local display.
-    private func decryptAndStoreQueuedPrompts(sessionId: String, encryptedPrompts: [EncryptedQueuedPrompt]) {
-        var decrypted: [QueuedPrompt] = []
-        for ep in encryptedPrompts {
-            guard let plaintext = crypto.decryptOrNil(encryptedBase64: ep.encryptedPrompt, ivBase64: ep.iv) else {
-                continue
-            }
-            let qp = QueuedPrompt(
-                id: ep.id,
-                sessionId: sessionId,
-                promptTextEncrypted: ep.encryptedPrompt,
-                iv: ep.iv,
-                createdAt: ep.timestamp,
-                sentAt: nil,
-                promptTextDecrypted: plaintext,
-                source: ep.source ?? "desktop"
-            )
-            decrypted.append(qp)
-        }
-        try? database.replaceQueuedPrompts(forSession: sessionId, with: decrypted)
     }
 
     // MARK: - Real-time Broadcasts
-
-    private func handleIndexBroadcast(_ data: Data) {
-        guard let broadcast = try? decoder.decode(IndexBroadcast.self, from: data) else {
-            logger.error("Failed to decode index_broadcast")
-            return
-        }
-        processServerSession(broadcast.session)
-    }
-
-    private func handleIndexDeleteBroadcast(_ data: Data) {
-        guard let broadcast = try? decoder.decode(IndexDeleteBroadcast.self, from: data) else {
-            logger.error("Failed to decode index_delete_broadcast")
-            return
-        }
-        logger.info("Session deleted: \(broadcast.sessionId)")
-
-        do {
-            // Look up project before deleting so we can refresh count
-            let projectId = try database.session(byId: broadcast.sessionId)?.projectId
-            try database.deleteSession(broadcast.sessionId)
-            if let projectId {
-                try database.refreshSessionCount(forProject: projectId)
-            }
-        } catch {
-            logger.error("Failed to delete session: \(error.localizedDescription)")
-        }
-    }
-
-    private func handleProjectBroadcast(_ data: Data) {
-        guard let broadcast = try? decoder.decode(ProjectBroadcast.self, from: data) else {
-            logger.error("Failed to decode project_broadcast")
-            return
-        }
-        processServerProject(broadcast.project)
-    }
 
     private func handleCreateSessionResponse(_ data: Data) {
         guard let broadcast = try? decoder.decode(CreateSessionResponseBroadcast.self, from: data) else {
             logger.error("Failed to decode create_session_response_broadcast")
             return
         }
+        _ = sessionCreation.receive(broadcast.response)
+        let draft = pendingCreationDrafts.removeValue(forKey: broadcast.response.requestId)
         if broadcast.response.success {
             let sessionId = broadcast.response.sessionId ?? "unknown"
             logger.info("Session created: \(sessionId)")
             if let sessionId = broadcast.response.sessionId {
-                onSessionCreated?(broadcast.response.requestId, sessionId)
+                if let draft {
+                    pendingSessionDrafts[sessionId] = draft
+                    applyPendingCreationDrafts()
+                }
             }
         } else {
             logger.error("Session creation failed: \(broadcast.response.error ?? "unknown error")")
+        }
+        sessionCreations.receive(broadcast.response)
+    }
+
+    /// The worktree session itself arrives via the index, but the answer is the
+    /// only thing that says the desktop got as far as trying. Without it the
+    /// request had no tracker and no timeout: a failure looked like a slow one.
+    private func handleCreateWorktreeResponse(_ data: Data) {
+        guard let broadcast = try? decoder.decode(CreateWorktreeResponseBroadcast.self, from: data) else {
+            logger.error("Failed to decode createWorktreeResponseBroadcast")
+            return
+        }
+        let response = broadcast.response
+        requests.resolve(
+            requestId: response.requestId,
+            detail: response.success ? nil : (response.error ?? "The desktop could not create the worktree.")
+        )
+    }
+
+    private func applyPendingCreationDrafts() {
+        for (sessionId, draft) in pendingSessionDrafts {
+            guard (try? database.session(byId: sessionId)) != nil else { continue }
+            updateDraftInput(sessionId: sessionId, draftInput: draft)
+            pendingSessionDrafts.removeValue(forKey: sessionId)
         }
     }
 
     // MARK: - Voice Tool Proxy (mobile -> desktop)
 
     /// Result of a proxied voice tool call.
-    public struct VoiceToolCallResult {
-        public let success: Bool
-        public let result: String?
-        public let error: String?
+    public typealias VoiceToolCallResult = VoiceToolProxy.Result
+
+    private lazy var voiceTools = VoiceToolProxy(crypto: crypto) { [weak self] requestId, json in
+        self?.requests.request(kind: .voiceTool, requestId: requestId, channel: .index, json: json)
     }
-
-    /// Continuations awaiting a desktop voice-tool response, keyed by requestId.
-    private var pendingVoiceToolCalls: [String: CheckedContinuation<VoiceToolCallResult, Never>] = [:]
-
-    /// Voice-tool request timeout. The memory engine lives on the desktop; if no
-    /// desktop is connected the request never gets answered, so we resolve
-    /// gracefully after this window.
-    private static let voiceToolTimeoutNs: UInt64 = 30_000_000_000 // 30s
 
     /// Run a desktop-hosted voice tool (e.g. project-memory lookup) by proxying
     /// it over the sync channel. Returns the tool result, or a graceful failure
     /// if the desktop is unavailable / doesn't respond in time.
     public func callVoiceTool(toolName: String, argsJson: String, projectId: String) async -> VoiceToolCallResult {
-        let encryptedProjectId: String
-        let toolNameEnc: (encrypted: String, iv: String)
-        let argsEnc: (encrypted: String, iv: String)
-        do {
-            encryptedProjectId = try crypto.encryptProjectId(projectId)
-            toolNameEnc = try crypto.encrypt(plaintext: toolName)
-            argsEnc = try crypto.encrypt(plaintext: argsJson)
-        } catch {
-            return VoiceToolCallResult(success: false, result: nil, error: "Failed to encrypt voice tool request")
+        await voiceTools.call(toolName: toolName, argsJson: argsJson, projectId: projectId)
+    }
+
+    func callLiveVoiceTool(toolName: String, argsJson: String, scope: VoiceRelayScope) async -> VoiceToolCallResult {
+        guard await awaitVoiceHost(scope.hostDeviceId) else {
+            return .init(success: false, result: nil, error: "The selected computer is unavailable.")
         }
-
-        let requestId = UUID().uuidString
-        let message = VoiceToolRequestMessage(
-            request: EncryptedVoiceToolRequest(
-                requestId: requestId,
-                encryptedProjectId: encryptedProjectId,
-                projectIdIv: CryptoManager.projectIdIvBase64,
-                encryptedToolName: toolNameEnc.encrypted,
-                toolNameIv: toolNameEnc.iv,
-                encryptedArgs: argsEnc.encrypted,
-                argsIv: argsEnc.iv,
-                timestamp: Int(Date().timeIntervalSince1970 * 1000)
-            )
-        )
-
-        guard let data = try? JSONEncoder().encode(message),
+        guard let data = try? JSONEncoder().encode(VoiceRelayRequest(scope: scope, tool: toolName, arguments: argsJson)),
               let json = String(data: data, encoding: .utf8) else {
-            return VoiceToolCallResult(success: false, result: nil, error: "Failed to encode voice tool request")
+            return .init(success: false, result: nil, error: "Could not encode voice request.")
         }
-
-        return await withCheckedContinuation { continuation in
-            pendingVoiceToolCalls[requestId] = continuation
-            indexClient.sendRaw(json)
-
-            // Timeout fallback (desktop offline / slow).
-            Task { [weak self] in
-                try? await Task.sleep(nanoseconds: SyncManager.voiceToolTimeoutNs)
-                guard let self else { return }
-                if let pending = self.pendingVoiceToolCalls.removeValue(forKey: requestId) {
-                    pending.resume(returning: VoiceToolCallResult(
-                        success: false,
-                        result: nil,
-                        error: "Project memory is unavailable because your desktop isn't connected."
-                    ))
-                }
-            }
-        }
+        return await voiceTools.call(toolName: "nimbalyst_live_v1", argsJson: json, projectId: scope.projectId, scope: scope)
     }
 
-    private func handleVoiceToolResponse(_ data: Data) {
-        guard let broadcast = try? decoder.decode(VoiceToolResponseBroadcast.self, from: data) else {
-            logger.error("Failed to decode voiceToolResponseBroadcast")
-            return
-        }
-        let resp = broadcast.response
-        guard let continuation = pendingVoiceToolCalls.removeValue(forKey: resp.requestId) else {
-            return // already resolved by timeout, or not ours
-        }
-        var resultText: String?
-        if let enc = resp.encryptedResult, let iv = resp.resultIv {
-            resultText = crypto.decryptOrNil(encryptedBase64: enc, ivBase64: iv)
-        }
-        var errorText: String?
-        if let enc = resp.encryptedError, let iv = resp.errorIv {
-            errorText = crypto.decryptOrNil(encryptedBase64: enc, ivBase64: iv)
-        }
-        continuation.resume(returning: VoiceToolCallResult(
-            success: resp.success,
-            result: resultText,
-            error: errorText
-        ))
-    }
-
-    // MARK: - Device Presence
-
-    private func handleDevicesList(_ data: Data) {
-        struct DevicesListMessage: Codable {
-            let devices: [DeviceInfo]
-        }
-        guard let msg = try? decoder.decode(DevicesListMessage.self, from: data) else { return }
-        connectedDevices = msg.devices
-    }
-
-    private func handleDeviceJoined(_ data: Data) {
-        struct DeviceJoinedMessage: Codable {
-            let device: DeviceInfo
-        }
-        guard let msg = try? decoder.decode(DeviceJoinedMessage.self, from: data) else { return }
-        if !connectedDevices.contains(where: { $0.deviceId == msg.device.deviceId }) {
-            connectedDevices.append(msg.device)
-        }
-    }
-
-    private func handleDeviceLeft(_ data: Data) {
-        struct DeviceLeftMessage: Codable {
-            let deviceId: String
-        }
-        guard let msg = try? decoder.decode(DeviceLeftMessage.self, from: data) else { return }
-        connectedDevices.removeAll { $0.deviceId == msg.deviceId }
-    }
+    /// Mid-turn context usage relayed, never stored, by the server.
+    private lazy var liveContext = LiveSessionContextApplier(crypto: crypto, database: database)
 
     // MARK: - Settings Sync
 
-    private func handleSettingsSyncBroadcast(_ data: Data) {
-        guard let broadcast = try? decoder.decode(SettingsSyncBroadcast.self, from: data) else {
-            logger.error("Failed to decode settingsSyncBroadcast")
-            return
-        }
-
-        let payload = broadcast.settings
-        logger.info("Received settings sync from device: \(payload.deviceId), version: \(payload.version)")
-
-        // Decrypt the settings JSON using the shared encryption key
-        guard let settingsJson = crypto.decryptOrNil(
-            encryptedBase64: payload.encryptedSettings,
-            ivBase64: payload.settingsIv
-        ) else {
-            logger.error("Failed to decrypt synced settings")
-            return
-        }
-
-        guard let settingsData = settingsJson.data(using: .utf8),
-              let settings = try? JSONDecoder().decode(SyncedSettings.self, from: settingsData) else {
-            logger.error("Failed to parse decrypted settings JSON")
-            return
-        }
-
-        logger.info("Decrypted settings: version=\(settings.version), hasOpenAIKey=\(settings.openaiApiKey != nil)")
-
-        // Store the OpenAI API key in the Keychain
-        if let apiKey = settings.openaiApiKey, !apiKey.isEmpty {
-            try? KeychainManager.storeOpenAIApiKey(apiKey)
-            logger.info("Stored OpenAI API key from desktop sync")
-            NotificationCenter.default.post(name: .init("OpenAIApiKeySynced"), object: nil)
-        }
-
-        #if os(iOS)
-        // Store voice mode settings if present. preferredAgentLanguage is a
-        // top-level field, so persist it even when voiceMode itself is absent --
-        // it pins the voice agent's spoken language to the desktop default.
-        if settings.voiceMode != nil || settings.preferredAgentLanguage != nil {
-            var currentSettings = VoiceModeSettings.load()
-            if let voiceMode = settings.voiceMode {
-                if let voice = voiceMode.voice {
-                    currentSettings.voice = voice
-                }
-                if let delay = voiceMode.submitDelayMs {
-                    currentSettings.promptConfirmationDelay = TimeInterval(delay) / 1000.0
-                }
+    func handleSettingsSyncBroadcast(_ data: Data) {
+        switch SettingsSyncApplier.decode(data, crypto: crypto) {
+        case .failure(let failure):
+            logger.error("Settings sync rejected: \(failure.label)")
+            if failure == .undecryptable {
+                report(SyncError(kind: .decrypt,
+                    message: "Settings from your desktop could not be read with this device's key."))
             }
-            currentSettings.language = settings.preferredAgentLanguage
-            currentSettings.save()
+        case .success(let accepted):
+            let payload = accepted.payload
+            // #NIM-5921: the desktop's counter restarts at zero on every desktop
+            // launch, so a rejoin used to replay an old payload -- including the
+            // OpenAI credential -- over newer state.
+            guard SettingsSyncApplier.isFresh(
+                version: payload.version,
+                timestamp: payload.timestamp,
+                lastApplied: settingsVersions.lastApplied(deviceId: payload.deviceId)
+            ) else {
+                logger.info("Settings sync rejected: \(SettingsSyncApplier.Failure.stale.label) (v\(payload.version) @\(payload.timestamp))")
+                return
+            }
+            settingsVersions.record(deviceId: payload.deviceId, version: payload.version, timestamp: payload.timestamp)
+            logger.info("Applying settings v\(payload.version) from device \(payload.deviceId)")
+            SettingsSyncApplier.apply(accepted.settings)
+            if let models = accepted.settings.availableModels {
+                availableModels = models
+            }
+            if let defaultModel = accepted.settings.defaultModel {
+                desktopDefaultModel = defaultModel
+            }
+            onSettingsSynced?(accepted.settings)
         }
-        #endif
-
-        // Store available models from desktop for the model picker and persist
-        if let models = settings.availableModels {
-            availableModels = models
-            ModelPreferences.saveAvailableModels(models, defaultModel: settings.defaultModel)
-            logger.info("Synced \(models.count) available models from desktop")
-        }
-        if let defaultModel = settings.defaultModel {
-            desktopDefaultModel = defaultModel
-            logger.info("Desktop default model: \(defaultModel)")
-        }
-
-        // Persist the meta-agent alpha gate from desktop and notify gated UI.
-        let metaAgentEnabled = settings.metaAgentEnabled ?? false
-        FeaturePreferences.setMetaAgentEnabled(metaAgentEnabled)
-        NotificationCenter.default.post(name: .init("MetaAgentEnabledSynced"), object: nil)
-        logger.info("Meta Agent alpha gate from desktop: \(metaAgentEnabled)")
-
-        onSettingsSynced?(settings)
     }
 
     // MARK: - Error Handling
@@ -1027,18 +886,18 @@ public final class SyncManager: ObservableObject {
 
     private func setupSessionClient() {
         sessionClient.onConnectionStateChanged = { [weak self] connected in
-            Task { @MainActor in
-                guard let self = self else { return }
-                self.logger.info("sessionClient connection state: \(connected) (activeSessionId=\(self.activeSessionId ?? "nil"))")
-                if connected {
-                    self.requestSessionSync()
-                }
+            guard let self = self else { return }
+            self.logger.info("sessionClient connection state: \(connected) (activeSessionId=\(self.activeSessionId ?? "nil"))")
+            if connected {
+                self.requestSessionSync()
             }
         }
 
         sessionClient.onMessage = { [weak self] data in
+            // Read the room synchronously, on the queue the frame arrived on.
+            guard let sessionId = self?.sessionRoom.sessionId else { return }
             Task { @MainActor in
-                self?.handleSessionMessage(data)
+                self?.handleSessionMessage(data, sessionId: sessionId)
             }
         }
     }
@@ -1070,7 +929,7 @@ public final class SyncManager: ObservableObject {
             sinceSeq = nil
         }
 
-        let request = SessionSyncRequest(sinceSeq: sinceSeq)
+        let request = SessionSyncRequest(sinceRevision: forceFullSync ? 0 : transcriptRevisionCursor((try? database.syncState(forRoom: sessionId))?.lastCursor), sinceSeq: sinceSeq)
         guard let data = try? JSONEncoder().encode(request),
               let json = String(data: data, encoding: .utf8) else {
             logger.error("requestSessionSync failed to encode request for session \(sessionId)")
@@ -1104,7 +963,7 @@ public final class SyncManager: ObservableObject {
         }
     }
 
-    private func handleSessionMessage(_ data: Data) {
+    func handleSessionMessage(_ data: Data, sessionId: String) {
         guard let envelope = try? decoder.decode(ServerMessage.self, from: data) else {
             let rawPreview = String(data: data.prefix(200), encoding: .utf8) ?? "<binary>"
             logger.warning("Could not decode session message type — raw: \(rawPreview)")
@@ -1113,11 +972,13 @@ public final class SyncManager: ObservableObject {
 
         switch envelope.type {
         case "syncResponse":
-            handleSessionSyncResponse(data)
+            handleSessionSyncResponse(data, sessionId: sessionId)
+        case "messagePayloadPart":
+            acceptPayloadPart(data, sessionId: sessionId)
         case "messageBroadcast":
-            handleMessageBroadcast(data)
+            handleMessageBroadcast(data, sessionId: sessionId)
         case "metadataBroadcast":
-            handleMetadataBroadcast(data)
+            handleMetadataBroadcast(data, sessionId: sessionId)
         case "error":
             handleServerError(data)
         default:
@@ -1127,7 +988,7 @@ public final class SyncManager: ObservableObject {
 
     // MARK: - Session Sync Response
 
-    private func handleSessionSyncResponse(_ data: Data) {
+    private func handleSessionSyncResponse(_ data: Data, sessionId: String) {
         let response: SessionSyncResponse
         do {
             response = try decoder.decode(SessionSyncResponse.self, from: data)
@@ -1135,36 +996,33 @@ public final class SyncManager: ObservableObject {
         } catch {
             let rawPreview = String(data: data.prefix(500), encoding: .utf8) ?? "<binary>"
             logger.error("Failed to decode session syncResponse: \(error.localizedDescription) — raw: \(rawPreview)")
-            if let sessionId = activeSessionId {
-                emitSessionSyncDiagnostic(sessionId, SessionSyncDiagnostic(
-                    totalServerMessages: 0, decryptedCount: 0, storedCount: 0,
-                    failedMessageIds: [], failedSequences: [],
-                    error: "Sync response decode failed: \(error.localizedDescription)"
-                ))
-            }
+            emitSessionSyncDiagnostic(sessionId, SessionSyncDiagnostic(
+                totalServerMessages: 0, decryptedCount: 0, storedCount: 0,
+                failedMessageIds: [], failedSequences: [],
+                error: "Sync response decode failed: \(error.localizedDescription)"
+            ))
+            report(SyncError(kind: .transport, message: "Part of this transcript could not be loaded."))
             return
         }
 
         // Buffer messages for batch insert
         sessionSyncBuffer.append(contentsOf: response.messages)
 
-        if response.hasMore, let cursor = response.cursor {
+        if response.hasMore, let cursor = response.revisionCursor.map(String.init) ?? response.cursor {
             // Request next page
             let sinceSeq = Int(cursor)
-            let request = SessionSyncRequest(sinceSeq: sinceSeq)
+            let request = SessionSyncRequest(sinceRevision: response.revisionCursor, sinceSeq: response.revisionCursor == nil ? sinceSeq : nil)
             if let data = try? JSONEncoder().encode(request),
                let json = String(data: data, encoding: .utf8) {
-                sessionClient.sendRaw(json)
+                requests.send(kind: .sessionSyncPage, channel: .session, json: json)
             }
         } else {
             // All pages received - decrypt and store
-            commitSessionMessages()
+            commitSessionMessages(sessionId: sessionId)
         }
     }
 
-    private func commitSessionMessages() {
-        guard let sessionId = activeSessionId else { return }
-
+    private func commitSessionMessages(sessionId: String) {
         let totalCount = sessionSyncBuffer.count
         var failedIds: [String] = []
         var failedSeqs: [Int] = []
@@ -1178,23 +1036,31 @@ public final class SyncManager: ObservableObject {
             return msg
         }
 
+        let maxRevision = sessionSyncBuffer.compactMap(\.revision).max()
+        let receivedEntries = sessionSyncBuffer
+        // An inline row that fails to decrypt is from a prior key epoch and never
+        // becomes readable; only an incomplete chunked row may heal on a refetch.
+        let holdsCursor = receivedEntries.contains { $0.payload != nil && failedIds.contains($0.id) }
         sessionSyncBuffer = []
 
         // Log decryption results
         if !failedIds.isEmpty {
             logger.error("Decryption failed for \(failedIds.count)/\(totalCount) messages in session \(sessionId). Failed sequences: \(failedSeqs.prefix(10))")
+            recordUnreadableHistory(failed: failedIds.count, of: totalCount)
         }
 
         do {
             try database.appendMessages(messages)
+            for entry in receivedEntries where !failedIds.contains(entry.id) { sessionPayloads.release(entry, sessionId: sessionId) }
 
+            let previous = try database.syncState(forRoom: sessionId)
             // Update sync watermark to max sequence
             if let maxSeq = messages.map(\.sequence).max() {
                 let now = Int(Date().timeIntervalSince1970 * 1000)
                 let syncState = SyncState(
                     roomId: sessionId,
-                    lastCursor: nil,
-                    lastSequence: maxSeq,
+                    lastCursor: !holdsCursor ? maxRevision.map { "r:\(max($0, transcriptRevisionCursor(previous?.lastCursor)))" } ?? previous?.lastCursor : previous?.lastCursor,
+                    lastSequence: max(maxSeq, previous?.lastSequence ?? 0),
                     lastSyncedAt: now
                 )
                 try database.updateSyncState(syncState)
@@ -1244,9 +1110,8 @@ public final class SyncManager: ObservableObject {
 
     // MARK: - Real-time Session Messages
 
-    private func handleMessageBroadcast(_ data: Data) {
-        guard let broadcast = try? decoder.decode(MessageBroadcast.self, from: data),
-              let sessionId = activeSessionId else {
+    private func handleMessageBroadcast(_ data: Data, sessionId: String) {
+        guard let broadcast = try? decoder.decode(MessageBroadcast.self, from: data) else {
             let rawPreview = String(data: data.prefix(200), encoding: .utf8) ?? "<binary>"
             logger.error("Failed to decode messageBroadcast — raw: \(rawPreview)")
             return
@@ -1254,30 +1119,49 @@ public final class SyncManager: ObservableObject {
 
         guard let message = decryptServerMessage(broadcast.message, sessionId: sessionId) else {
             // decryptServerMessage already logs the specific error
+            report(SyncError(kind: .decrypt, message: "A message in this transcript could not be read with this device's key."))
             return
         }
 
         do {
             try database.appendMessage(message)
+            if !sessionSyncBuffer.contains(where: { $0.payload?.transferId == broadcast.message.payload?.transferId }) {
+                sessionPayloads.release(broadcast.message, sessionId: sessionId)
+            }
 
-            // Update sync watermark
-            let now = Int(Date().timeIntervalSince1970 * 1000)
-            let syncState = SyncState(
+            // #NIM-5924: the watermark only moves forward. A broadcast that
+            // arrives late, or out of order after a reconnect, used to rewind
+            // it, and the next delta request then re-fetched from the lower
+            // sequence -- or skipped everything above it on the next advance.
+            let lastSequence = (try? database.syncState(forRoom: sessionId))?.lastSequence ?? 0
+            guard message.sequence > lastSequence else { return }
+            try database.updateSyncState(SyncState(
                 roomId: sessionId,
-                lastCursor: nil,
+                lastCursor: (try database.syncState(forRoom: sessionId))?.lastCursor,
                 lastSequence: message.sequence,
-                lastSyncedAt: now
-            )
-            try database.updateSyncState(syncState)
+                lastSyncedAt: Int(Date().timeIntervalSince1970 * 1000)
+            ))
         } catch {
             logger.error("Failed to store broadcast message: \(error.localizedDescription)")
+            report(SyncError(kind: .storage, message: "Could not save an incoming message on this device."))
         }
     }
 
-    private func handleMetadataBroadcast(_ data: Data) {
-        guard let broadcast = try? decoder.decode(MetadataBroadcast.self, from: data),
-              let sessionId = activeSessionId else {
+    private func handleMetadataBroadcast(_ data: Data, sessionId: String) {
+        guard let broadcast = try? decoder.decode(MetadataBroadcast.self, from: data) else {
             return
+        }
+
+        // #NIM-5924: `updatedAt` is the only ordering signal this payload
+        // carries. Without comparing it, a replayed executing:true followed by
+        // the already-applied executing:false fired onSessionCompleted twice --
+        // two completion notifications for one turn.
+        if let updatedAt = broadcast.metadata.updatedAt {
+            guard updatedAt > (lastMetadataUpdatedAt[sessionId] ?? Int.min) else {
+                logger.info("Ignoring metadata broadcast for \(sessionId) at \(updatedAt): not newer than what is applied")
+                return
+            }
+            lastMetadataUpdatedAt[sessionId] = updatedAt
         }
 
         // Update session metadata in the database
@@ -1352,28 +1236,8 @@ public final class SyncManager: ObservableObject {
 
     // MARK: - Message Decryption
 
-    private func decryptServerMessage(_ entry: ServerMessageEntry, sessionId: String) -> Message? {
-        let decrypted: String?
-        do {
-            decrypted = try crypto.decrypt(encryptedBase64: entry.encryptedContent, ivBase64: entry.iv)
-        } catch {
-            logger.error("Failed to decrypt message \(entry.id) seq=\(entry.sequence) in session \(sessionId): \(error.localizedDescription). encryptedContent length=\(entry.encryptedContent.count), iv length=\(entry.iv.count)")
-            return nil
-        }
-
-        return Message(
-            id: entry.id,
-            sessionId: sessionId,
-            sequence: entry.sequence,
-            source: entry.source,
-            direction: entry.direction,
-            encryptedContent: entry.encryptedContent,
-            iv: entry.iv,
-            contentDecrypted: decrypted,
-            metadataJson: nil,
-            createdAt: entry.createdAt
-        )
-    }
+    /// See SyncManager+SessionPayloads.swift.
+    let sessionPayloads = SessionPayloadStore()
 
     // MARK: - Draft Input Sync
 
@@ -1391,70 +1255,62 @@ public final class SyncManager: ObservableObject {
         }
 
         do {
-            let clientMeta = ClientMetadata(
-                currentContext: nil,
-                hasPendingPrompt: nil,
-                phase: session.phase,
-                tags: session.tags.isEmpty ? nil : session.tags,
-                draftInput: draftInput,  // Send "" explicitly when clearing so remote caches update
-                draftUpdatedAt: now
+            let json = try draftIndexUpdate(session: session, draft: draftInput, draftUpdatedAt: now)
+            logger.info("[Draft] Sending indexUpdate via WebSocket, json length=\(json.count)")
+            // The local row is already committed, so a failed send is a
+            // divergence, not a lost edit: park it and re-publish whatever the
+            // row says after the socket comes back.
+            requests.send(
+                kind: .draftPush,
+                channel: .index,
+                json: json,
+                coalesceKey: "draft:\(sessionId)",
+                rebuild: { [weak self] in self?.rebuildDraftIndexUpdate(sessionId: sessionId) }
             )
-            let metaJson = try JSONEncoder().encode(clientMeta)
-            guard let metaString = String(data: metaJson, encoding: .utf8) else { return }
-            let encrypted = try crypto.encrypt(plaintext: metaString)
-
-            let encryptedProjectId = try crypto.encryptProjectId(session.projectId)
-            var indexEntry = IndexUpdateEntry(
-                sessionId: sessionId,
-                encryptedProjectId: encryptedProjectId,
-                projectIdIv: CryptoManager.projectIdIvBase64,
-                encryptedTitle: session.titleEncrypted,
-                titleIv: session.titleIv,
-                provider: session.provider ?? "claude-code",
-                model: session.model,
-                mode: session.mode,
-                messageCount: (try? database.messages(forSession: sessionId).count) ?? 0,
-                lastMessageAt: session.lastMessageAt ?? session.updatedAt,
-                createdAt: session.createdAt,
-                updatedAt: Int(Date().timeIntervalSince1970 * 1000),
-                isExecuting: session.isExecuting,
-                queuedPromptCount: nil,
-                encryptedQueuedPrompts: nil
-            )
-            indexEntry.encryptedClientMetadata = encrypted.encrypted
-            indexEntry.clientMetadataIv = encrypted.iv
-
-            let indexMessage = IndexUpdateMessage(session: indexEntry)
-            if let data = try? JSONEncoder().encode(indexMessage),
-               let json = String(data: data, encoding: .utf8) {
-                logger.info("[Draft] Sending indexUpdate via WebSocket, json length=\(json.count), hasClientMeta=\(indexEntry.encryptedClientMetadata != nil)")
-                indexClient.sendRaw(json)
-            } else {
-                logger.error("[Draft] Failed to encode IndexUpdateMessage to JSON")
-            }
         } catch {
             logger.error("[Draft] Failed to push draft input to sync: \(error.localizedDescription)")
+            report(SyncError(kind: .transport, message: SyncRequestKind.draftPush.failureDescription))
         }
+    }
+
+    private func draftIndexUpdate(session: Session, draft: String, draftUpdatedAt: Int) throws -> String {
+        try SessionIndexUpdates.draft(
+            session: session,
+            draft: draft,
+            draftUpdatedAt: draftUpdatedAt,
+            messageCount: try? database.messages(forSession: session.id).count,
+            crypto: crypto
+        )
+    }
+
+    /// Rebuilds the draft push from the committed row, so a replay publishes
+    /// what the composer holds now rather than the edit that failed to send.
+    private func rebuildDraftIndexUpdate(sessionId: String) -> String? {
+        guard let session = try? database.session(byId: sessionId) else { return nil }
+        return try? draftIndexUpdate(
+            session: session,
+            draft: session.draftInput ?? "",
+            draftUpdatedAt: session.draftUpdatedAt ?? Int(Date().timeIntervalSince1970 * 1000)
+        )
     }
 
     // MARK: - Send Prompt
 
     /// Send a prompt to the current session via the queued prompts system.
     /// Desktop picks up prompts from index_update broadcasts (not session room messages).
-    public func sendPrompt(sessionId: String, text: String, attachments: [PendingAttachment] = []) async throws {
+    @discardableResult
+    public func sendPrompt(sessionId: String, text: String, attachments: [PendingAttachment] = [], promptId: String = UUID().uuidString) async throws -> String {
         logger.info("[SendPrompt] Starting: sessionId=\(sessionId), textLength=\(text.count), attachments=\(attachments.count), wsConnected=\(self.indexClient.isConnected), roomOrgId=\(self.orgId ?? "nil")")
         guard indexClient.isConnected else {
             logger.error("[SendPrompt] WebSocket not connected - cannot send prompt")
-            throw SyncError.webSocketSendFailed("Not connected to sync server")
+            throw PromptSendError.webSocketSendFailed("Not connected to sync server")
         }
         guard let session = try database.session(byId: sessionId) else {
             logger.error("[SendPrompt] Session not found: \(sessionId)")
-            throw SyncError.sessionNotFound
+            throw PromptSendError.sessionNotFound
         }
 
         let now = Int(Date().timeIntervalSince1970 * 1000)
-        let promptId = UUID().uuidString
-
         // Encrypt the prompt text
         let encryptedPrompt = try crypto.encrypt(plaintext: text)
 
@@ -1488,33 +1344,12 @@ public final class SyncManager: ObservableObject {
         )
         queuedPrompt.encryptedAttachments = encryptedAttachments
 
-        // Build the encrypted project ID for the index entry
-        let encryptedProjectId = try crypto.encryptProjectId(session.projectId)
-
         // Send index_update with queued prompt via the index room
-        let indexEntry = IndexUpdateEntry(
-            sessionId: sessionId,
-            encryptedProjectId: encryptedProjectId,
-            projectIdIv: CryptoManager.projectIdIvBase64,
-            encryptedTitle: session.titleEncrypted,
-            titleIv: session.titleIv,
-            provider: session.provider ?? "claude-code",
-            model: session.model,
-            mode: session.mode,
+        let json = try SessionIndexUpdates.prompt(
+            session: session, prompt: queuedPrompt,
             messageCount: (try? database.messages(forSession: sessionId).count) ?? 0,
-            lastMessageAt: now,
-            createdAt: session.createdAt,
-            updatedAt: now,
-            isExecuting: session.isExecuting,
-            queuedPromptCount: 1,
-            encryptedQueuedPrompts: [queuedPrompt]
+            crypto: crypto
         )
-
-        let indexMessage = IndexUpdateMessage(session: indexEntry)
-        let data = try JSONEncoder().encode(indexMessage)
-        guard let json = String(data: data, encoding: .utf8) else {
-            throw SyncError.encodingFailed
-        }
 
         // Send via WebSocket with completion handler to detect failures
         let sendResult = await withCheckedContinuation { continuation in
@@ -1523,7 +1358,7 @@ public final class SyncManager: ObservableObject {
             }
         }
         if let sendError = sendResult {
-            throw SyncError.webSocketSendFailed(sendError.localizedDescription)
+            throw PromptSendError.webSocketSendFailed(sendError.localizedDescription)
         }
 
         // Store the prompt locally for immediate display in transcript
@@ -1540,6 +1375,7 @@ public final class SyncManager: ObservableObject {
             createdAt: now
         )
         try database.appendMessage(localMessage)
+        return promptId
     }
 
     // MARK: - Interactive Prompt Responses
@@ -1549,7 +1385,16 @@ public final class SyncManager: ObservableObject {
     /// Routes to the desktop that owns the session. Without a target the server
     /// broadcasts and every connected desktop acts on the control -- two
     /// desktops both cancelling, or both answering the same prompt.
-    public func sendSessionControlMessage(sessionId: String, messageType: String, payload: [String: Any]? = nil) {
+    ///
+    /// `republish` is opt-in and belongs only to controls that mirror a local
+    /// row (archive). An interactive prompt response must never be replayed on
+    /// reconnect: by then the desktop has moved on and the answer is wrong.
+    public func sendSessionControlMessage(
+        sessionId: String,
+        messageType: String,
+        payload: [String: Any]? = nil,
+        republish: (@MainActor () -> String?)? = nil
+    ) {
         var hostDeviceId: String?
         if let session = try? database.session(byId: sessionId) {
             hostDeviceId = session.hostDeviceId
@@ -1567,11 +1412,20 @@ public final class SyncManager: ObservableObject {
         )
 
         let message = SessionControlMessage(message: controlPayload)
-        if let data = try? JSONEncoder().encode(message),
-           let json = String(data: data, encoding: .utf8) {
-            indexClient.sendRaw(json)
-            logger.info("Sent session_control: \(messageType) for session \(sessionId)")
+        guard let data = try? JSONEncoder().encode(message),
+              let json = String(data: data, encoding: .utf8) else {
+            logger.error("Failed to encode session_control: \(messageType) for session \(sessionId)")
+            report(SyncError(kind: .transport, message: SyncRequestKind.sessionControl.failureDescription))
+            return
         }
+        requests.send(
+            kind: .sessionControl,
+            channel: .index,
+            json: json,
+            coalesceKey: republish == nil ? nil : "control:\(messageType):\(sessionId)",
+            rebuild: republish
+        )
+        logger.info("Sent session_control: \(messageType) for session \(sessionId)")
     }
 
     /// Append a tool result to the session room for transcript storage.
@@ -1597,12 +1451,15 @@ public final class SyncManager: ObservableObject {
         let request = AppendMessageRequest(message: entry)
         if let data = try? JSONEncoder().encode(request),
            let json = String(data: data, encoding: .utf8) {
-            sessionClient.sendRaw(json)
+            requests.send(kind: .toolResult, channel: .session, json: json)
             logger.info("Appended tool result \(toolResultId) to session room")
         }
     }
 
-    enum SyncError: LocalizedError {
+    /// Thrown by the send paths a caller awaits directly. Distinct from the
+    /// top-level `SyncError`, which is the reportable surface for failures
+    /// nobody is awaiting.
+    enum PromptSendError: LocalizedError {
         case sessionNotFound
         case encodingFailed
         case webSocketSendFailed(String)
@@ -1629,111 +1486,6 @@ public final class SyncManager: ObservableObject {
         public let error: String?
     }
 
-    // MARK: - Session Actions
-
-    // MARK: - Push Token Registration
-
-    private func setupPushTokenForwarding() {
-        NotificationManager.shared.onTokenReceived = { [weak self] token in
-            Task { @MainActor in
-                self?.registerPushToken(token)
-            }
-        }
-        NotificationManager.shared.onPushDisabled = { [weak self] in
-            Task { @MainActor in
-                self?.unregisterPushToken()
-            }
-        }
-        // If a token was already received before SyncManager was created, use it now.
-        // This handles the case where NotificationManager.shared was accessed early
-        // (e.g., from SettingsView) and got a token before the callback was set.
-        if let existingToken = NotificationManager.shared.deviceToken {
-            if NotificationManager.shared.shouldRegisterForPush {
-                registerPushToken(existingToken)
-            } else {
-                unregisterPushToken()
-            }
-        }
-    }
-
-    /// Send the APNs push token to the sync server.
-    public func registerPushToken(_ token: String) {
-        guard NotificationManager.shared.shouldRegisterForPush else {
-            logger.info("Skipping push token registration because push notifications are disabled in app or OS")
-            return
-        }
-
-        let message = NotificationManager.makeRegisterTokenMessage(
-            token: token,
-            deviceId: WebSocketClient.deviceId
-        )
-        if let data = try? JSONEncoder().encode(message),
-           let json = String(data: data, encoding: .utf8) {
-            indexClient.sendRaw(json)
-            logger.info("Registered push token with server")
-        }
-    }
-
-    public func unregisterPushToken() {
-        let message = NotificationManager.makeUnregisterTokenMessage(
-            deviceId: WebSocketClient.deviceId
-        )
-        if let data = try? JSONEncoder().encode(message),
-           let json = String(data: data, encoding: .utf8) {
-            indexClient.sendRaw(json)
-            logger.info("Unregistered push token with server")
-        }
-    }
-
-    // MARK: - Live Activity Token Registration
-
-    private func setupLiveActivityForwarding() {
-        FleetActivityController.shared.onTokenReceived = { [weak self] token, kind in
-            Task { @MainActor in
-                self?.registerLiveActivityToken(token, kind: kind)
-            }
-        }
-        FleetActivityController.shared.onTokenInvalidated = { [weak self] kind in
-            Task { @MainActor in
-                self?.unregisterLiveActivityToken(kind: kind)
-            }
-        }
-        FleetActivityController.shared.start()
-    }
-
-    /// Send an ActivityKit token to the sync server.
-    ///
-    /// Kept apart from the APNs device token all the way down: the server stores
-    /// the two kinds under different prefixes because a token in the wrong lane
-    /// fails with an error indistinguishable from a bad token.
-    public func registerLiveActivityToken(_ token: String, kind: LiveActivityTokenKind) {
-        guard FleetActivityController.shared.shouldRegister else { return }
-        let message = RegisterLiveActivityTokenMessage(
-            token: token,
-            kind: kind.rawValue,
-            deviceId: WebSocketClient.deviceId,
-            platform: "ios",
-            environment: "production"
-        )
-        if let data = try? JSONEncoder().encode(message),
-           let json = String(data: data, encoding: .utf8) {
-            indexClient.sendRaw(json)
-            logger.info("Registered Live Activity \(kind.rawValue) token with server")
-        }
-    }
-
-    public func unregisterLiveActivityToken(kind: LiveActivityTokenKind?) {
-        let message = UnregisterLiveActivityTokenMessage(
-            deviceId: WebSocketClient.deviceId,
-            kind: kind?.rawValue
-        )
-        if let data = try? JSONEncoder().encode(message),
-           let json = String(data: data, encoding: .utf8) {
-            indexClient.sendRaw(json)
-            logger.info("Unregistered Live Activity token(s) with server")
-        }
-    }
-
     /// Mark a session as read locally and push lastReadAt through the sync server.
     public func markSessionRead(sessionId: String) {
         let now = Int(Date().timeIntervalSince1970 * 1000)
@@ -1743,46 +1495,30 @@ public final class SyncManager: ObservableObject {
             try database.markSessionRead(sessionId)
         } catch {
             logger.error("Failed to mark session read locally: \(error.localizedDescription)")
+            report(SyncError(kind: .storage, message: "Could not save the read marker on this device."))
         }
 
         // Push lastReadAt through index update to server
         guard let session = try? database.session(byId: sessionId) else { return }
         do {
-            let encryptedProjectId = try crypto.encryptProjectId(session.projectId)
-
-            // Build a minimal index update with lastReadAt
-            var entry: [String: Any] = [
-                "sessionId": session.id,
-                "encryptedProjectId": encryptedProjectId,
-                "projectIdIv": CryptoManager.projectIdIvBase64,
-                "provider": session.provider ?? "unknown",
-                "messageCount": 0,
-                "lastMessageAt": session.lastMessageAt ?? session.updatedAt,
-                "createdAt": session.createdAt,
-                "updatedAt": session.updatedAt,
-                "isExecuting": session.isExecuting,
-                "lastReadAt": now,
-            ]
-
-            // Encrypt title if available
-            if let title = session.titleDecrypted {
-                let result = try crypto.encrypt(plaintext: title)
-                entry["encryptedTitle"] = result.encrypted
-                entry["titleIv"] = result.iv
-            }
-
-            let message: [String: Any] = [
-                "type": "indexUpdate",
-                "session": entry,
-            ]
-
-            if let data = try? JSONSerialization.data(withJSONObject: message),
-               let json = String(data: data, encoding: .utf8) {
-                indexClient.sendRaw(json)
-            }
+            let json = try SessionIndexUpdates.readReceipt(session: session, lastReadAt: now, crypto: crypto)
+            requests.send(
+                kind: .readReceipt,
+                channel: .index,
+                json: json,
+                coalesceKey: "read:\(sessionId)",
+                rebuild: { [weak self] in self?.rebuildReadReceipt(sessionId: sessionId) }
+            )
         } catch {
             logger.error("Failed to push lastReadAt to server: \(error.localizedDescription)")
+            report(SyncError(kind: .transport, message: SyncRequestKind.readReceipt.failureDescription))
         }
+    }
+
+    private func rebuildReadReceipt(sessionId: String) -> String? {
+        guard let session = try? database.session(byId: sessionId),
+              let lastReadAt = session.lastReadAt else { return nil }
+        return try? SessionIndexUpdates.readReceipt(session: session, lastReadAt: lastReadAt, crypto: crypto)
     }
 
     /// Request the desktop to create a new session in a project.
@@ -1797,72 +1533,85 @@ public final class SyncManager: ObservableObject {
         parentSessionId: String? = nil,
         provider: String? = nil,
         model: String? = nil,
-        agentRole: String? = nil
+        agentRole: String? = nil,
+        targetDeviceId: String? = nil,
+        initialDraft: String? = nil
     ) throws -> String {
-        let encryptedProjectId = try crypto.encryptProjectId(projectId)
-
-        var encryptedPrompt: String?
-        var promptIv: String?
-        if let prompt = initialPrompt {
-            let result = try crypto.encrypt(plaintext: prompt)
-            encryptedPrompt = result.encrypted
-            promptIv = result.iv
-        }
-
-        let requestId = UUID().uuidString
-        let request = CreateSessionRequestMessage(
-            request: EncryptedCreateSessionRequest(
-                requestId: requestId,
-                encryptedProjectId: encryptedProjectId,
-                projectIdIv: CryptoManager.projectIdIvBase64,
-                encryptedInitialPrompt: encryptedPrompt,
-                initialPromptIv: promptIv,
-                sessionType: sessionType,
-                parentSessionId: parentSessionId,
-                provider: provider,
-                model: model,
-                agentRole: agentRole,
-                timestamp: Int(Date().timeIntervalSince1970 * 1000)
-            )
+        let requestId = try sessionCreation.create(
+            SessionCreationOptions(projectId: projectId, initialPrompt: initialPrompt,
+                sessionType: sessionType, parentSessionId: parentSessionId,
+                provider: provider, model: model, agentRole: agentRole, targetDeviceId: targetDeviceId),
+            crypto: crypto, devices: connectedDevices, isConnected: isConnected,
+            onRegistered: { [self] requestId in
+                sessionCreations.register(requestId)
+                if let initialDraft { pendingCreationDrafts[requestId] = initialDraft }
+            },
+            send: { [self] json, completion in
+                if let sender { sender(.index, json, completion) }
+                else { indexClient.sendRaw(json, completion: completion) }
+            }
         )
-
-        if let data = try? JSONEncoder().encode(request),
-           let json = String(data: data, encoding: .utf8) {
-            indexClient.sendRaw(json)
-        }
         return requestId
     }
 
     /// Request the desktop to create a new git worktree.
-    /// The desktop will create the worktree and the result will arrive via index broadcast.
-    public func createWorktree(projectId: String) throws {
+    /// The worktree session arrives via index broadcast; the tracked request is
+    /// what makes a desktop that never answers distinguishable from a slow one.
+    /// Returns the requestId so a caller can correlate the outcome.
+    @discardableResult
+    public func createWorktree(projectId: String) throws -> String {
         let encryptedProjectId = try crypto.encryptProjectId(projectId)
 
+        let requestId = UUID().uuidString
         let request = CreateWorktreeRequestMessage(
             request: CreateWorktreeRequest(
-                requestId: UUID().uuidString,
+                requestId: requestId,
                 encryptedProjectId: encryptedProjectId,
                 projectIdIv: CryptoManager.projectIdIvBase64,
                 timestamp: Int(Date().timeIntervalSince1970 * 1000)
             )
         )
 
-        if let data = try? JSONEncoder().encode(request),
-           let json = String(data: data, encoding: .utf8) {
-            indexClient.sendRaw(json)
+        guard let data = try? JSONEncoder().encode(request),
+              let json = String(data: data, encoding: .utf8) else {
+            throw PromptSendError.encodingFailed
         }
+        requests.request(kind: .createWorktree, requestId: requestId, channel: .index, json: json)
+        return requestId
     }
 
     /// Update a session's parent (for reparenting into a workstream).
-    /// Updates the local database immediately for instant UI feedback.
-    /// The change will propagate to desktop on the next index sync cycle.
-    public func updateSessionParent(sessionId: String, parentSessionId: String) throws {
+    ///
+    /// Local first for instant UI feedback, then published. #NIM-5922: this
+    /// used to write locally and send nothing, so the desktop reasserted the
+    /// old parent on the next index page and the move silently undid itself.
+    public func updateSessionParent(sessionId: String, parentSessionId: String?) throws {
         try database.writer.write { db in
             try db.execute(
                 sql: "UPDATE sessions SET parentSessionId = ? WHERE id = ?",
                 arguments: [parentSessionId, sessionId]
             )
         }
+
+        guard let session = try? database.session(byId: sessionId) else { return }
+        do {
+            let json = try SessionIndexUpdates.parent(session: session, parentSessionId: parentSessionId, crypto: crypto)
+            requests.send(
+                kind: .reparent,
+                channel: .index,
+                json: json,
+                coalesceKey: "parent:\(sessionId)",
+                rebuild: { [weak self] in self?.rebuildParentIndexUpdate(sessionId: sessionId) }
+            )
+        } catch {
+            logger.error("Failed to publish reparent for \(sessionId): \(error.localizedDescription)")
+            report(SyncError(kind: .transport, message: SyncRequestKind.reparent.failureDescription))
+        }
+    }
+
+    private func rebuildParentIndexUpdate(sessionId: String) -> String? {
+        guard let session = try? database.session(byId: sessionId) else { return nil }
+        return try? SessionIndexUpdates.parent(session: session, parentSessionId: session.parentSessionId, crypto: crypto)
     }
 
     /// Archive or unarchive a session.
@@ -1879,7 +1628,25 @@ public final class SyncManager: ObservableObject {
         sendSessionControlMessage(
             sessionId: sessionId,
             messageType: "archive",
-            payload: ["isArchived": isArchived]
+            payload: ["isArchived": isArchived],
+            // The row is already flipped locally; a replay re-asserts whatever
+            // it says now rather than the value that failed to send.
+            republish: { [weak self] in self?.rebuildArchiveControl(sessionId: sessionId) }
         )
+    }
+
+    private func rebuildArchiveControl(sessionId: String) -> String? {
+        guard let session = try? database.session(byId: sessionId) else { return nil }
+        let controlPayload = SessionControlPayload(
+            sessionId: sessionId,
+            messageType: "archive",
+            payload: ["isArchived": AnyCodable(session.isArchived)],
+            timestamp: Int(Date().timeIntervalSince1970 * 1000),
+            sentBy: "mobile",
+            sentByDeviceId: WebSocketClient.deviceId,
+            targetDeviceId: session.hostDeviceId
+        )
+        guard let data = try? JSONEncoder().encode(SessionControlMessage(message: controlPayload)) else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 }

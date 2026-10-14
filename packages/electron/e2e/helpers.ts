@@ -253,6 +253,8 @@ async function closeSpawnedElectron(
 }
 
 export async function launchElectronApp(options?: {
+  /** Independently built main entry for isolated feature tests. */
+  mainPath?: string;
   workspace?: string;
   env?: Record<string, string>;
   /** Permission mode. Defaults to 'allow-all' to skip trust toast. Use 'none' to show the toast. */
@@ -262,7 +264,8 @@ export async function launchElectronApp(options?: {
   /** Video recording config. Defaults to e2e_test_output/videos. Pass false to disable. */
   recordVideo?: { dir: string } | false;
 }): Promise<ElectronApplication> {
-  const electronMain = path.resolve(__dirname, '../out/main/index.js');
+  // NIMBALYST_E2E_MAIN_PATH runs a spec against a main bundle built elsewhere, leaving `out/` to the dev app.
+  const electronMain = options?.mainPath ?? process.env.NIMBALYST_E2E_MAIN_PATH ?? path.resolve(__dirname, '../out/main/index.js');
   const electronCwd = path.resolve(__dirname, '../../../');
 
   // Default video recording to e2e_test_output/videos (opt-out with recordVideo: false)

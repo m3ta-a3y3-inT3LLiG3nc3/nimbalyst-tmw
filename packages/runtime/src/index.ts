@@ -133,9 +133,8 @@ export type {
   StalePlanStatus,
 } from './plugins/TrackerPlugin/models/planStatusIntegrity';
 // Generic Frontmatter Plugin
-// Import triggers registration with DocumentHeaderRegistry (priority 50, below tracker's 100)
 export {
-  GenericFrontmatterHeader,
+  FrontmatterProperties,
   shouldRenderGenericFrontmatter,
   extractFrontmatter,
   parseFields,
@@ -179,7 +178,7 @@ export { STYTCH_CONFIG, getStytchConfig } from './config/stytch';
 export * from './extensions';
 // Services
 export { screenshotService } from './services/ScreenshotService';
-export type { ScreenshotCapability } from './services/ScreenshotService';
+export type { ScreenshotCapability, ScreenshotCaptureProvider } from './services/ScreenshotService';
 // Editor context
 export { DocumentPathProvider, useDocumentPath } from './DocumentPathContext';
 // Workspace file link routing (NIM-1487)

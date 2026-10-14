@@ -26,6 +26,8 @@ import { canvasWorkingSetRegistry } from '@nimbalyst/runtime/canvas/canvasPresen
 import { store } from '@nimbalyst/runtime/store';
 import {
   sessionProcessingAtom,
+  pruneClosedSessionDataAtom,
+  sessionDataReleaseListenersAtom,
   reloadSessionDataAtom,
   sessionListWorkspaceAtom,
   updateSessionStoreAtom,
@@ -38,6 +40,8 @@ import {
   sessionRegistryAtom,
   sessionChildrenAtom,
   sessionStoreAtom,
+  isSessionLoadInFlight,
+  isSessionDataResident,
   sessionDraftInputAtom,
   sessionLastSubmitAtAtom,
   sessionDraftLocalModifiedAtAtom,
@@ -55,6 +59,7 @@ import {
 } from './atoms/sessionActivity';
 import type { TranscriptEvent } from '@nimbalyst/runtime/ai/server/transcript/types';
 import { TranscriptStreamAccumulator } from './transcriptStreamAccumulator';
+import { sessionViewRetention } from './sessionViewRetention';
 import { resolveOwnedWorkspacePath } from '../../shared/sessionWorkspaceRouting';
 import type { SessionNotificationNavigationTarget } from '../../shared/sessionNotificationNavigation';
 import { navigateToNotificationSession } from './actions/sessionNotificationNavigation';
@@ -71,7 +76,7 @@ import { navigateToNotificationSession } from './actions/sessionNotificationNavi
 const transcriptAccumulator = new TranscriptStreamAccumulator({
   emit: ({ sessionId, messages }) => {
     const currentSession = store.get(sessionStoreAtom(sessionId));
-    if (!currentSession) return;
+    if (!currentSession || !isSessionDataResident(currentSession)) return;
     store.set(sessionStoreAtom(sessionId), {
       ...currentSession,
       messages,
@@ -81,6 +86,9 @@ const transcriptAccumulator = new TranscriptStreamAccumulator({
     const currentSession = store.get(sessionStoreAtom(sessionId));
     return currentSession?.messages ?? [];
   },
+  // Keep events while a load is in flight: its snapshot may predate them.
+  isSessionTracked: (sessionId) =>
+    isSessionDataResident(store.get(sessionStoreAtom(sessionId))) || isSessionLoadInFlight(sessionId),
   // requestAnimationFrame caps flushes at the display refresh rate (~60 Hz)
   // and gives the JS thread a chance to do other work between frames.
   // Falls back to setTimeout in non-DOM environments (Vitest, headless).
@@ -197,6 +205,9 @@ export function initSessionStateListeners(): () => void {
     return () => {};
   }
 
+  const releaseTranscript = (sessionId: string) => transcriptAccumulator.unload(sessionId);
+  store.set(sessionDataReleaseListenersAtom, listeners => new Set([...listeners, releaseTranscript]));
+
   // Debounced trigger for the processing-state reconcile (assigned once the
   // reconcile function is defined below). Fired on terminal session events so a
   // stuck spinner clears within ~1s instead of waiting for the slow interval.
@@ -222,14 +233,14 @@ export function initSessionStateListeners(): () => void {
     workspacePath: string,
     timestamp: number,
   ) => {
-    const meta = store.get(sessionRegistryAtom).get(sessionId);
-    const parentId = meta?.parentSessionId;
-    if (!parentId) return;
-    store.set(markSessionTurnActivityAtom, {
-      sessionId: parentId,
-      workspacePath,
-      timestamp,
-    });
+    const registry = store.get(sessionRegistryAtom);
+    const seen = new Set([sessionId]);
+    let parentId = registry.get(sessionId)?.parentSessionId;
+    while (parentId && !seen.has(parentId)) {
+      seen.add(parentId);
+      store.set(markSessionTurnActivityAtom, { sessionId: parentId, workspacePath, timestamp });
+      parentId = registry.get(parentId)?.parentSessionId;
+    }
   };
 
   /**
@@ -310,6 +321,8 @@ export function initSessionStateListeners(): () => void {
       // child finishes this clears the parent's spinner within ~1s rather than
       // leaving it stuck until the user clicks the child.
       scheduleProcessingReconcile?.();
+      store.set(pruneClosedSessionDataAtom);
+      sessionViewRetention.sweep();
     }
 
     if (!ownedWorkspacePath) {
@@ -753,13 +766,21 @@ export function initSessionStateListeners(): () => void {
   const handleAskUserQuestionResolved = (data: { sessionId: string; questionId?: string }) => {
     const { sessionId } = data;
     if (!sessionId) return;
-    store.set(sessionHasPendingInteractivePromptAtom(sessionId), false);
-    // Remove the resolved prompt from the array
+    // Remove the resolved prompt, then derive the aggregate flag from what is
+    // left. Hard-clearing it here took the "waiting for your response"
+    // indicator down whenever ANY prompt settled -- answering or cancelling Q1
+    // stopped the sidebar advertising Q2, or a tool permission the user had not
+    // answered yet. The array holds every interactive prompt kind, so it is the
+    // right thing to count. Refs #1549.
     if (data.questionId) {
       const current = store.get(sessionPendingPromptsAtom(sessionId));
-      store.set(sessionPendingPromptsAtom(sessionId), current.filter(p => p.promptId !== data.questionId));
+      const remaining = current.filter(p => p.promptId !== data.questionId);
+      store.set(sessionPendingPromptsAtom(sessionId), remaining);
+      store.set(sessionHasPendingInteractivePromptAtom(sessionId), remaining.length > 0);
     } else {
+      // No id: a session-wide cancel, which settles everything at once.
       store.set(sessionPendingPromptsAtom(sessionId), []);
+      store.set(sessionHasPendingInteractivePromptAtom(sessionId), false);
     }
   };
 
@@ -849,9 +870,10 @@ export function initSessionStateListeners(): () => void {
     commitMessage?: string;
     filesToStage?: Array<string | { path: string; status?: string }>;
     workspacePath?: string;
+    autoApproved?: boolean;
   }) => {
     const { sessionId, proposalId } = data;
-    if (!sessionId) return;
+    if (!sessionId || data.autoApproved) return;
     store.set(sessionHasPendingInteractivePromptAtom(sessionId), true);
     const prompt: PendingPrompt = {
       id: proposalId,
@@ -1089,6 +1111,7 @@ export function initSessionStateListeners(): () => void {
 
   let cleanupAskUserQuestion: (() => void) | undefined;
   let cleanupAskUserQuestionAnswered: (() => void) | undefined;
+  let cleanupAskUserQuestionCancelled: (() => void) | undefined;
   let cleanupSessionCancelled: (() => void) | undefined;
   let cleanupExitPlanModeConfirm: (() => void) | undefined;
   let cleanupExitPlanModeResolved: (() => void) | undefined;
@@ -1113,6 +1136,10 @@ export function initSessionStateListeners(): () => void {
     cleanupTitleUpdated = window.electronAPI.on('session:title-updated', handleTitleUpdated);
     cleanupAskUserQuestion = window.electronAPI.on('ai:askUserQuestion', handleAskUserQuestion);
     cleanupAskUserQuestionAnswered = window.electronAPI.on('ai:askUserQuestionAnswered', handleAskUserQuestionResolved);
+    // A question that is aborted or cancelled clears the same pending flag an
+    // answer does -- without it the session keeps advertising a widget that is
+    // already terminalized in the transcript. See #1549.
+    cleanupAskUserQuestionCancelled = window.electronAPI.on('ai:askUserQuestionCancelled', handleAskUserQuestionResolved);
     cleanupSessionCancelled = window.electronAPI.on('ai:sessionCancelled', handleAskUserQuestionResolved);
     cleanupExitPlanModeConfirm = window.electronAPI.on('ai:exitPlanModeConfirm', handleExitPlanModeConfirm);
     cleanupExitPlanModeResolved = window.electronAPI.on('ai:exitPlanModeResolved', handleExitPlanModeResolved);
@@ -1171,6 +1198,7 @@ export function initSessionStateListeners(): () => void {
     cleanupTitleUpdated?.();
     cleanupAskUserQuestion?.();
     cleanupAskUserQuestionAnswered?.();
+    cleanupAskUserQuestionCancelled?.();
     cleanupSessionCancelled?.();
     cleanupExitPlanModeConfirm?.();
     cleanupExitPlanModeResolved?.();
@@ -1186,6 +1214,11 @@ export function initSessionStateListeners(): () => void {
     cleanupSyncDraftInput?.();
     cleanupTranscriptEvent?.();
     cleanupTranscriptSessionReparsed?.();
+    store.set(sessionDataReleaseListenersAtom, listeners => {
+      const remaining = new Set(listeners);
+      remaining.delete(releaseTranscript);
+      return remaining;
+    });
     transcriptAccumulator.clear();
   };
 }

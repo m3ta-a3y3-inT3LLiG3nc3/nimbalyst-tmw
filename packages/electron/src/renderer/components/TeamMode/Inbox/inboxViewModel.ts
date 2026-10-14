@@ -1,3 +1,4 @@
+import type { DocumentFeedbackInboxDelivery } from '../../../store/atoms/documentFeedbackInbox';
 /**
  * Pure view-model logic for the messaging Inbox.
  *
@@ -12,7 +13,7 @@ import { getFileIconName } from '@nimbalyst/runtime/ui/icons/fileIcons';
 import {
   defaultTrackerTypeColor,
   defaultTrackerTypeIcon,
-} from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerTypeIdentity';
+} from '@nimbalyst/tracker-schema';
 import type {
   TeamInboxMaterializedDelivery,
   TeamInboxSnapshot,
@@ -73,6 +74,7 @@ const SOURCE_TYPES: Record<InboxSourceKind, InboxTypeIdentity> = {
   // Both document kinds are *documents*. A speech bubble here was the exact
   // failure this redesign exists to fix: it described the delivery's shape
   // (someone commented) instead of the thing you are about to open.
+  documentDecision: { icon: 'ballot', accent: 'var(--nim-purple)', label: 'Question' },
   documentDiscussion: { icon: 'description', accent: 'var(--nim-success)', label: 'Doc' },
   documentInlineComment: { icon: 'description', accent: 'var(--nim-success)', label: 'Doc' },
   // Shares the direct-message hue deliberately: both are addressed to you
@@ -104,6 +106,7 @@ const REDACTED_TYPE: InboxTypeIdentity = {
 export const SOURCE_KIND_LABELS: Record<InboxSourceKind, string> = {
   roomMessage: 'Rooms',
   documentDiscussion: 'Document discussions',
+  documentDecision: 'Document questions',
   dmMessage: 'Direct messages',
   trackerComment: 'Tracker comments',
   documentInlineComment: 'Inline comments',
@@ -111,15 +114,15 @@ export const SOURCE_KIND_LABELS: Record<InboxSourceKind, string> = {
 };
 
 /**
- * The one source kind that asks for something back.
+ * Typed requests whose authorized state still asks this viewer for an answer.
  *
  * A comment or a mention is a statement the reader may act on; a feedback
  * request is a question with typed answers waiting on them, and the row has to
  * say so before it is opened. Derived from the source kind alone — response
  * state lives on the request resource, which a delivery does not carry.
  */
-export function awaitsResponse(sourceKind: InboxSourceKind | undefined): boolean {
-  return sourceKind === 'feedbackRequest';
+export function awaitsResponse(sourceKind: InboxSourceKind | undefined, reason?: string, documentDecisionNeedsResponse?: boolean): boolean {
+  return sourceKind === 'feedbackRequest' || (sourceKind === 'documentDecision' && reason === 'assignment' && documentDecisionNeedsResponse === true);
 }
 
 /**
@@ -185,6 +188,7 @@ export function openActionLabel(row: Pick<InboxRowView, 'sourceKind' | 'itemType
   switch (row.sourceKind) {
     case 'trackerComment':
       return row.itemType ? `Open ${row.itemType}` : 'Open tracker item';
+    case 'documentDecision':
     case 'documentDiscussion':
     case 'documentInlineComment':
       return 'Open document';
@@ -301,12 +305,13 @@ export function toRowView(delivery: HydratedInboxDelivery, options: { now: numbe
     sourceId: revoked ? undefined : delivery.source.sourceId,
     commentId: revoked ? undefined : delivery.source.commentId,
     threadId: revoked ? undefined : delivery.source.threadId,
+    blockId: revoked ? undefined : delivery.source.blockId,
     sourceKind,
     itemType,
     type: typeIdentity(sourceKind, { itemType, sourceTitle }),
     // Redacted with the source kind: a revoked row must not disclose that
     // someone was waiting on an answer from this reader.
-    awaitsResponse: awaitsResponse(sourceKind),
+    awaitsResponse: awaitsResponse(sourceKind, delivery.reason, delivery.documentDecisionNeedsResponse),
     archived: !!delivery.dismissedAt,
     sourceTitle,
     actor,
@@ -388,11 +393,12 @@ function deliveryFilterSubject(
   delivery: TeamInboxMaterializedDelivery,
 ): InboxFilterSubject {
   const source = delivery.unavailable ? undefined : delivery.source;
-  const sourceKind = source && 'sourceKind' in source ? source.sourceKind : undefined;
+  const sourceKind = source && 'sourceKind' in source ? source.sourceKind
+    : source && 'resourceKind' in source && source.resourceKind === 'document' && source.eventClass.startsWith('documentDecision') ? 'documentDecision' : undefined;
   return {
     reason: delivery.reason,
     subscription: delivery.subscription,
-    awaitsResponse: awaitsResponse(sourceKind),
+    awaitsResponse: awaitsResponse(sourceKind, delivery.reason, (delivery as DocumentFeedbackInboxDelivery).documentDecisionNeedsResponse),
     archived: !!delivery.dismissedAt,
   };
 }

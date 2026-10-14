@@ -5,6 +5,8 @@ import { basename, join, dirname, extname } from 'path';
 import { windowStates, savingWindows, recentlyDeletedFiles, findWindowByFilePath, createWindow, getWindowId, windows, documentServices } from '../window/WindowManager';
 import { loadFileIntoWindow, saveFile } from '../file/FileOperations';
 import { shouldBlockEmptyOverwrite, wouldDiscardUnseenContent, writeRecoverySnapshot } from '../file/safeFileWrite';
+import { registerOpenFileHandlers } from './OpenFileHandlers';
+import { verifyFileSave } from '../file/verifyFileSave';
 import { openFileWithDialog, openFile } from '../file/FileOpener';
 import { startFileWatcher, stopFileWatcher } from '../file/FileWatcher';
 import { AUTOSAVE_DELAY } from '../utils/constants';
@@ -43,20 +45,12 @@ function getFileType(filePath: string): string {
     return typeMap[ext] || 'other';
 }
 
-// Helper function to get word count category
-function getWordCountCategory(content: string): 'small' | 'medium' | 'large' {
-    const wordCount = content.split(/\s+/).filter(word => word.length > 0).length;
-    if (wordCount < 500) return 'small';
-    if (wordCount < 2000) return 'medium';
-    return 'large';
-}
-
-// Helper function to check if content has frontmatter
-function hasFrontmatter(content: string): boolean {
-    return content.trimStart().startsWith('---');
-}
+// getWordCountCategory / hasFrontmatter lived here to build the `file_saved`
+// payload. Both went with that event -- they had no other caller, and the word
+// count in particular walked the whole document on every autosave.
 
 export function registerFileHandlers() {
+    registerOpenFileHandlers();
     const analytics = AnalyticsService.getInstance();
     const saveFailureTelemetry = new FileSaveFailureTelemetryDeduper();
 
@@ -178,25 +172,8 @@ export function registerFileHandlers() {
                 return { success: false, deleted: true, filePath };
             }
 
-            // Check for conflicts with external changes before saving
-            if (lastKnownContent !== undefined && existsSync(filePath)) {
-                try {
-                    const currentDiskContent = readFileSync(filePath, 'utf-8');
-                    if (currentDiskContent !== lastKnownContent) {
-                        console.log('[SAVE] ⚠ Conflict detected - file changed on disk since last load');
-
-                        return {
-                            success: false,
-                            conflict: true,
-                            filePath,
-                            diskContent: currentDiskContent
-                        };
-                    }
-                } catch (readError) {
-                    console.error('[SAVE] Failed to check for conflicts:', readError);
-                    // Continue with save if we can't read the file
-                }
-            }
+            const verificationFailure = verifyFileSave(filePath, lastKnownContent);
+            if (verificationFailure) return verificationFailure;
 
             // Don't recreate a file that was deleted from disk
             if (!existsSync(filePath)) {
@@ -244,7 +221,7 @@ export function registerFileHandlers() {
 
             // Mark that we're saving to prevent file watcher from reacting
             savingWindows.add(windowId);
-            SessionFileWatcher.markEditorSave(filePath);
+            SessionFileWatcher.markEditorSave(filePath, content);
 
             saveFile(filePath, content);
 
@@ -285,13 +262,11 @@ export function registerFileHandlers() {
                 savingWindows.delete(windowId);
             }, AUTOSAVE_DELAY);
 
-            // Track successful file save
-            analytics.sendEvent('file_saved', {
-                saveType: saveSourceAnalytics.saveType,
-                fileType: getFileType(filePath),
-                hasFrontmatter: hasFrontmatter(content),
-                wordCount: getWordCountCategory(content)
-            });
+            // `file_saved` was removed here. It fired on every save including
+            // debounced autosave -- 650,472 events in 30 days, the second-largest
+            // event in the product -- and nothing consumed the count. Throttling
+            // it would only have produced an "active editing" proxy that also had
+            // no consumer. `file_save_failed` below is the signal worth keeping.
             saveFailureTelemetry.markSuccess(filePath);
 
             // Push file index update for .md files in sync-enabled projects
@@ -356,7 +331,7 @@ export function registerFileHandlers() {
 
                 // Mark that we're saving to prevent file watcher from reacting
                 savingWindows.add(windowId);
-                SessionFileWatcher.markEditorSave(filePath);
+                SessionFileWatcher.markEditorSave(filePath, content);
 
                 if (state) {
                     state.filePath = filePath;

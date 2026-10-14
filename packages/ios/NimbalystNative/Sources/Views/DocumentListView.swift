@@ -1,39 +1,38 @@
 import SwiftUI
 import GRDB
+import Combine
 
 /// Displays synced documents for a project as a collapsible file tree
 /// with path flattening (single-child directory chains collapsed into one row).
 struct DocumentListView: View {
     @EnvironmentObject var appState: AppState
     let project: Project
-
-    /// When non-nil, the List uses selection binding for NavigationSplitView sidebar mode.
-    /// When nil, NavigationLink push navigation is used (iPhone NavigationStack mode).
-    private var selectedDocument: Binding<SyncedDocument?>?
-
-    private var isIPadSidebar: Bool { selectedDocument != nil }
+    @Binding private var selection: WorkspaceSelection?
 
     @State private var documents: [SyncedDocument] = []
     @State private var cancellable: AnyDatabaseCancellable?
-    @State private var searchText = ""
+    /// Owned by the sidebar, whose header search button drives both tabs.
+    @Binding private var searchText: String
     @State private var isLoading = true
     @State private var expandedPaths: Set<String> = []
+    @State private var syncState: DocumentSyncState = .connecting
+    @State private var observationError: String?
 
-    /// iPhone init: push navigation via NavigationLink.
-    init(project: Project) {
+    init(project: Project, selection: Binding<WorkspaceSelection?>, searchText: Binding<String>) {
         self.project = project
-        self.selectedDocument = nil
+        _selection = selection
+        _searchText = searchText
     }
 
-    /// iPad init: selection binding drives NavigationSplitView detail column.
-    init(project: Project, selectedDocument: Binding<SyncedDocument?>) {
-        self.project = project
-        self.selectedDocument = selectedDocument
+    /// Wiki tables, the marker, sidecars and trash belong to the Wiki tab; the
+    /// editor here would only mangle them.
+    private var listedDocuments: [SyncedDocument] {
+        documents.filter { !WikiDocuments.isWikiDataFile($0.relativePath, folder: project.localWikiFolder) }
     }
 
     private var filteredDocuments: [SyncedDocument] {
-        if searchText.isEmpty { return documents }
-        return documents.filter { doc in
+        if searchText.isEmpty { return listedDocuments }
+        return listedDocuments.filter { doc in
             doc.title.localizedCaseInsensitiveContains(searchText)
             || doc.relativePath.localizedCaseInsensitiveContains(searchText)
         }
@@ -45,15 +44,28 @@ struct DocumentListView: View {
 
     var body: some View {
         Group {
-            if isLoading {
-                ProgressView()
-            } else if documents.isEmpty {
-                emptyState
+            if let observationError {
+                syncError(observationError)
+            } else if isLoading {
+                ProgressView("Loading files…")
+            } else if listedDocuments.isEmpty {
+                switch syncState {
+                case .ready: emptyState
+                case .failed(let message): syncError(message)
+                case .connecting, .syncing: ProgressView("Syncing files…")
+                }
             } else {
-                documentTree
+                VStack(spacing: 0) {
+                    switch syncState {
+                    case .failed(let message): syncError(message)
+                    case .connecting: ProgressView("Connecting file sync…").padding(8)
+                    case .syncing(let received): ProgressView("Syncing files… \(received) received").padding(8)
+                    case .ready: Text("\(listedDocuments.count) files").font(.caption).foregroundStyle(.secondary).padding(8)
+                    }
+                    documentTree
+                }
             }
         }
-        .searchable(text: $searchText, prompt: "Search files")
         .onAppear {
             loadExpandedPaths()
             startObserving()
@@ -62,6 +74,9 @@ struct DocumentListView: View {
         .onDisappear {
             cancellable?.cancel()
         }
+        .onReceive(appState.documentSyncManager?.$loadStates.eraseToAnyPublisher() ?? Just([:]).eraseToAnyPublisher()) { states in
+            syncState = states[project.id] ?? .connecting
+        }
         .onChange(of: expandedPaths) {
             saveExpandedPaths()
         }
@@ -69,23 +84,10 @@ struct DocumentListView: View {
 
     private var documentTree: some View {
         Group {
-            if let binding = selectedDocument {
-                List(selection: binding) {
-                    documentTreeRows
-                }
-                .listStyle(.sidebar)
-            } else {
-                List {
-                    documentTreeRows
-                }
-                .listStyle(.plain)
-                #if canImport(UIKit)
-                .navigationDestination(for: SyncedDocument.self) { doc in
-                    DocumentEditorView(document: doc)
-                        .environmentObject(appState)
-                }
-                #endif
+            List(selection: $selection) {
+                documentTreeRows
             }
+            .listStyle(.plain)
         }
     }
 
@@ -95,7 +97,6 @@ struct DocumentListView: View {
             FileTreeRow(
                 node: node,
                 isExpanded: expandedPaths.contains(node.path),
-                useSelectionTag: isIPadSidebar,
                 onToggle: { toggleExpansion(node.path) }
             )
             .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 16))
@@ -128,8 +129,24 @@ struct DocumentListView: View {
         }
     }
 
+    private func syncError(_ message: String) -> some View {
+        VStack(spacing: 8) {
+            Text(message).font(.caption).multilineTextAlignment(.center)
+            Button("Retry") {
+                observationError = nil
+                startObserving()
+                appState.documentSyncManager?.retryProject(project.id)
+            }
+        }
+        .padding()
+    }
+
     private func startObserving() {
-        guard let db = appState.databaseManager else { return }
+        cancellable?.cancel()
+        guard let db = appState.databaseManager else {
+            observationError = "Files are unavailable until this account connects."
+            return
+        }
 
         let projectId = project.id
         let observation = ValueObservation.tracking { db in
@@ -141,7 +158,10 @@ struct DocumentListView: View {
 
         cancellable = observation.start(
             in: db.writer,
-            onError: { _ in },
+            onError: { error in
+                observationError = "Could not load files. Please retry."
+                isLoading = false
+            },
             onChange: { newDocs in
                 withAnimation {
                     documents = newDocs
@@ -152,7 +172,11 @@ struct DocumentListView: View {
     }
 
     private func connectDocSync() {
-        appState.documentSyncManager?.connectProject(project.id)
+        guard let manager = appState.documentSyncManager else {
+            observationError = "File sync is unavailable until this account connects."
+            return
+        }
+        manager.connectProject(project.id)
     }
 
     private var expandedPathsKey: String {
@@ -333,18 +357,12 @@ private func emitNodes(
 struct FileTreeRow: View {
     let node: FileTreeNode
     let isExpanded: Bool
-    var useSelectionTag: Bool = false
     let onToggle: () -> Void
 
     var body: some View {
         if let doc = node.document {
-            if useSelectionTag {
-                rowContent.tag(doc)
-            } else {
-                NavigationLink(value: doc) {
-                    rowContent
-                }
-            }
+            rowContent
+                .tag(WorkspaceSelection.document(doc.id))
         } else {
             Button(action: onToggle) {
                 rowContent

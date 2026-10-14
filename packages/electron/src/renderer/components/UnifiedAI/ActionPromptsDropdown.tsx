@@ -3,19 +3,23 @@ import { useAtomValue, useSetAtom } from 'jotai';
 import { usePostHog } from 'posthog-js/react';
 import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
 import { FloatingPortal, useFloatingMenu } from '../../hooks/useFloatingMenu';
+import { useMenuTypeahead } from '../../hooks/useMenuTypeahead';
 import {
   actionPromptsAtomFamily,
   type ActionPrompt,
+  type ActionPickerSettings,
 } from '../../store/atoms/actionPrompts';
 
 interface ActionPromptsDropdownProps {
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
   workspacePath: string;
   /**
    * Called with the action body when the user picks an action whose config is
    * `launch: same-session` (or has no config at all). The composer should
    * replace its draft with this string and push an undo snapshot.
    */
-  onInsert: (body: string) => void;
+  onInsert: (body: string, picker?: ActionPickerSettings) => void;
   /**
    * Called when the user picks an action whose config is `launch: new-session`.
    * If omitted, the dropdown falls back to the same-session insert path so
@@ -31,7 +35,7 @@ function firstLinePreview(body: string, maxLen = 80): string {
   return trimmed.slice(0, maxLen - 1) + '…';
 }
 
-export function ActionPromptsDropdown({ workspacePath, onInsert, onLaunchNewSession }: ActionPromptsDropdownProps) {
+export function ActionPromptsDropdown({ open, onOpenChange, workspacePath, onInsert, onLaunchNewSession }: ActionPromptsDropdownProps) {
   const state = useAtomValue(actionPromptsAtomFamily(workspacePath));
   const setState = useSetAtom(actionPromptsAtomFamily(workspacePath));
   const posthog = usePostHog();
@@ -40,14 +44,16 @@ export function ActionPromptsDropdown({ workspacePath, onInsert, onLaunchNewSess
   const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   const menu = useFloatingMenu({
+    open,
+    onOpenChange,
     placement: 'top-end',
     offsetPx: 6,
     constrainHeight: false,
   });
+  const { getTypeaheadMatch, resetTypeahead } = useMenuTypeahead(menu.isOpen);
 
-  // First-load fetch when the workspace changes. We always (re)load on mount
-  // for the current workspace so the dropdown reflects fresh state without
-  // relying on a broadcast that only fires on subsequent changes.
+  // Reopening is a recovery boundary for missed native events (#1524).
+  // Keep the initial fetch too, so the button count is populated before opening.
   useEffect(() => {
     if (!workspacePath) return;
     let cancelled = false;
@@ -69,7 +75,7 @@ export function ActionPromptsDropdown({ workspacePath, onInsert, onLaunchNewSess
     return () => {
       cancelled = true;
     };
-  }, [workspacePath, setState]);
+  }, [workspacePath, setState, menu.isOpen]);
 
   const actions = state.actions;
   const hasActions = actions.length > 0;
@@ -103,7 +109,7 @@ export function ActionPromptsDropdown({ workspacePath, onInsert, onLaunchNewSess
         return;
       }
 
-      onInsert(action.body);
+      onInsert(action.body, { model: action.config?.model, effort: action.config?.effort });
       menu.setIsOpen(false);
       try {
         posthog?.capture('action_prompt_inserted', {
@@ -154,20 +160,25 @@ export function ActionPromptsDropdown({ workspacePath, onInsert, onLaunchNewSess
       if (!hasActions) return;
       if (e.key === 'ArrowDown') {
         e.preventDefault();
+        resetTypeahead();
         setHighlightedIndex((i) => (i + 1) % actions.length);
       } else if (e.key === 'ArrowUp') {
         e.preventDefault();
+        resetTypeahead();
         setHighlightedIndex((i) => (i - 1 + actions.length) % actions.length);
       } else if (e.key === 'Enter') {
         e.preventDefault();
         const action = actions[highlightedIndex];
         if (action) handleSelect(action);
+      } else {
+        const match = getTypeaheadMatch(e, actions);
+        if (match >= 0) setHighlightedIndex(match);
       }
     },
-    [hasActions, actions, highlightedIndex, handleSelect]
+    [hasActions, actions, highlightedIndex, handleSelect, getTypeaheadMatch, resetTypeahead]
   );
 
-  // Scroll the highlighted item into view as the user navigates with arrows.
+  // Scroll the highlighted item into view as the user navigates with arrows or typeahead.
   useEffect(() => {
     if (!menu.isOpen) return;
     const el = itemRefs.current[highlightedIndex];
@@ -175,6 +186,11 @@ export function ActionPromptsDropdown({ workspacePath, onInsert, onLaunchNewSess
       el.scrollIntoView({ block: 'nearest' });
     }
   }, [highlightedIndex, menu.isOpen]);
+
+  const setMenuRef = useCallback((node: HTMLDivElement | null) => {
+    menu.refs.setFloating(node);
+    node?.focus();
+  }, [menu.refs.setFloating]);
 
   const buttonLabel = useMemo(() => 'Actions', []);
 
@@ -201,7 +217,7 @@ export function ActionPromptsDropdown({ workspacePath, onInsert, onLaunchNewSess
       {menu.isOpen && (
         <FloatingPortal>
           <div
-            ref={menu.refs.setFloating as React.RefCallback<HTMLDivElement>}
+            ref={setMenuRef}
             style={menu.floatingStyles}
             {...menu.getFloatingProps()}
             onKeyDown={handleKeyDown}

@@ -201,3 +201,103 @@ export type {
   TrackerContextMenuPoint,
   TrackerContextMenuProps,
 } from './detail/TrackerContextMenu';
+
+export { getSupportedTrackerOrderingColumns } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerOrdering';
+export { getTrackerTypeLabel, TRACKER_GROUPING_OPTIONS } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerGrouping';
+
+// Resolver and context only. The view components are exported from the collab
+// bundle's `./editor` entry, which already carries them for the node renderer;
+// re-exporting them here would put them in the tracker surfaces' eager graph too.
+export {
+  createTrackerReferenceResolver,
+  TrackerReferenceResolverContext,
+  TrackerReferenceResolverProvider,
+  useTrackerBacklinks,
+  useTrackerReference,
+  useTrackerReferenceResolver,
+  useTrackerStatements,
+  // The state word and its menu, for a host's own state line on the page item.
+  TrackerStateMenu,
+  stateTone,
+} from './references';
+export type {
+  CreateTrackerReferenceResolverOptions,
+  StateTone,
+  TrackerBacklink,
+  TrackerReferenceActor,
+  TrackerReferenceStatusOption,
+  TrackerStateChange,
+  TrackerStateMenuProps,
+  TrackerReferenceResolution,
+  TrackerReferenceResolver,
+  TrackerReferenceSchema,
+  TrackerReferenceStatusInfo,
+  TrackerReferenceTypeInfo,
+  TrackerStatement,
+  TrackerStatementGroup,
+} from './references';
+
+// The document-header field bar, for hosts that show a tracker item's fields
+// above its body. Exported from here so a browser host shares this build's
+// `globalRegistry` instead of compiling a second copy from runtime source.
+export { StatusBar } from '@nimbalyst/runtime/plugins/TrackerPlugin/components/StatusBar';
+export type { StatusBarProps } from '@nimbalyst/runtime/plugins/TrackerPlugin/components/StatusBar';
+
+// Ontology inspector types, and the label reading shared by the web console
+// Tracker setup screen, the wiki and its Types pages.
+export type { OntologyViewModel, OntologyInput, TypeSummary, RelationshipGraph as OntologyRelationshipGraph, RelationshipEdge as OntologyRelationshipEdge, PredicatesSummary, KnowledgeSection } from './ontology/ontologyAnalysis';
+export type { HealthItem, FactValue } from './ontology/ontologyKnowledge';
+// Content health loads on demand with the Types pages: `loadOntologyTypesApi().computeContentHealth`.
+export type { ContentHealthOptions } from './ontology/ontologyContentHealth';
+export type { OntologyRecordLike } from './ontology/ontologyRecords';
+export { OntologyInspector } from './ontology/LazyOntologyInspector';
+export type { OntologyInspectorProps, OntologyInspectorWriter, OntologyInspectorView } from './ontology/OntologyInspector';
+export type { DomainModel, DomainCategory, DomainGap, DomainLine } from './ontology/ontologyDomain';
+// Labels: the wiki's Types section, fact boxes and roles read the registry
+// through these, with the kind stand-in while a room has no `labels.yaml`.
+export {
+  buildLabelIndex,
+  effectiveLabelRegistry,
+  hasRole,
+  isFallbackRegistry,
+  isHomePage,
+  labelById,
+  labelName,
+  LABELED_TYPE,
+  narrowerLabels,
+  propertyRange,
+  recordEffectiveLabels,
+  recordOwnLabels,
+  recordRole,
+} from './ontology/ontologyLabels';
+export type { KindOption, LabelIndex } from './ontology/ontologyLabels';
+export type { RelationshipStatus, TypeMapExpectation, TypeMapModel, TypeMapOptions, TypeMapProperty, TypeMapRelationship, TypeMapStatement, TypeMapType, TypeMapZone } from './ontology/ontologyLabelMap';
+export type { TypeCell, TypePageModel, TypePageOptions, TypeProperty, TypeRelationship, TypeRow } from './ontology/ontologyTypePage';
+// The type map, type pages and label health load on demand (see `ontologyTypesApi.ts`).
+export type OntologyTypesApi = typeof import('./ontology/ontologyTypesApi');
+export const loadOntologyTypesApi = (): Promise<OntologyTypesApi> => import('./ontology/ontologyTypesApi');
+export { OntologyLabelReview, OntologyTypeMap } from './ontology/LazyOntologyTypes';
+export type { OntologyLabelReviewProps } from './ontology/OntologyLabelReview';
+export type { OntologyTypeMapProps } from './ontology/OntologyTypeMap';
+export {
+  CLAIM_FACT_STALE_DAYS,
+  claimAsOf,
+  claimAsOfPrecision,
+  claimDisplayValue,
+  compareClaimCurrency,
+  effectiveProperties,
+  isClaimAsserted,
+  isClaimFactStale,
+  isQualifiedFieldProperty,
+  readClaimRecord,
+} from '@nimbalyst/tracker-schema';
+export type {
+  AsOfPrecision,
+  ClaimRecord,
+  CurrentClaimValue,
+  EffectiveProperty,
+  FieldPropertyDefinition,
+  LabelDefinition,
+  LabelRegistry,
+  LabelRole,
+} from '@nimbalyst/tracker-schema';

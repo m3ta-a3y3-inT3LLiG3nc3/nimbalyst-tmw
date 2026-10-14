@@ -49,7 +49,7 @@ vi.mock('../../utils/store', () => ({
   isAnalyticsEnabled: () => true,
 }));
 
-vi.mock('@nimbalyst/runtime/plugins/TrackerPlugin/models/TrackerDataModel', () => ({
+vi.mock('../../../../../tracker-schema/src/TrackerDataModel', () => ({
   globalRegistry: {
     get: mockGlobalRegistryGet,
     // The policy resolver reads by explicit workspace (NIM-3702). These tests
@@ -170,6 +170,14 @@ describe('captureFrontmatterTrackerTransition', () => {
     const writtenData = JSON.parse(insertCall[1][2]);
     expect(writtenData.activity[0]).toMatchObject({ action: 'created' });
     expect(events[0].added).toHaveLength(1);
+  });
+
+  it('ignores tracker frontmatter in a throwaway file under temptests/ (no DB hit)', async () => {
+    await (service as any).captureFrontmatterTrackerTransition(
+      'temptests/r3-wiki/plan.md',
+      { planStatus: { title: 'Fixture', status: 'draft' } },
+    );
+    expect(mockQuery).not.toHaveBeenCalled();
   });
 
   it('ignores documents without tracker frontmatter (no DB hit)', async () => {

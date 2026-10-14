@@ -15,8 +15,8 @@
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { MaterialSymbol } from '../../../ui';
-import type { FieldDefinition, TrackerRelationshipValue } from '../models/TrackerDataModel';
+import { MaterialSymbol } from '../../../ui/icons/MaterialSymbol';
+import type { FieldDefinition, TrackerRelationshipValue } from '@nimbalyst/tracker-schema';
 import {
   addRelationshipValue,
   normalizeRelationshipValue,

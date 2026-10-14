@@ -68,6 +68,61 @@ describe('DocumentModel', () => {
     vi.useRealTimers();
   });
 
+  it('retains the verified baseline after repeated rejected saves (#1499)', async () => {
+    await model.loadContent();
+    const handle = model.attach();
+    handle.setDirty(true);
+    vi.mocked(mockStore.save).mockRejectedValue(new Error('verification failed'));
+    await expect(handle.saveContent('unsaved edit')).rejects.toThrow('verification failed');
+    await expect(handle.saveContent('unsaved edit')).rejects.toThrow('verification failed');
+    expect(vi.mocked(mockStore.save).mock.calls.map(call => call[1])).toEqual(['hello world', 'hello world']);
+    expect(model.getLastPersistedContent()).toBe('hello world');
+    expect(model.isDirty()).toBe(true);
+  });
+
+  it('retains the baseline when an editor explicitly rejects an unverified reload', async () => {
+    await model.loadContent();
+    model.attach().onFileChanged(() => false);
+    mockStore.triggerExternalChange('unapplied disk bytes');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(model.getLastPersistedContent()).toBe('hello world');
+  });
+
+  it.each(['delete', 'rename'])('does not apply a history lookup started before %s', async (action) => {
+    model.dispose();
+    let finish!: (tags: []) => void;
+    model = new DocumentModel('/test/file.md', mockStore, {
+      autosaveInterval: 0,
+      getPendingTags: () => new Promise<[]>(resolve => { finish = resolve; }),
+    });
+    model.setLastPersistedContent('hello world');
+    const changed = vi.fn();
+    model.attach().onFileChanged(changed);
+    mockStore.triggerExternalChange('read before deletion');
+    if (action === 'delete') model.markDeleted();
+    else model.migrateToNewPath('/test/renamed.md', createMockStore('renamed bytes').store);
+    finish([]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(changed).not.toHaveBeenCalled();
+    expect(model.isDeleted()).toBe(action === 'delete');
+    expect(model.getLastPersistedContent()).toBe(action === 'delete' ? null : 'hello world');
+  });
+
+  it('reports an external conflict immediately without discarding a dirty buffer (#1499)', async () => {
+    await model.loadContent();
+    const handle = model.attach();
+    const changed = vi.fn();
+    handle.onFileChanged(changed);
+    handle.setDirty(true);
+    const conflict = vi.fn();
+    model.on('external-conflict', conflict);
+    mockStore.triggerExternalChange('external edit');
+    await vi.advanceTimersByTimeAsync(100);
+    expect(changed).not.toHaveBeenCalled();
+    expect(conflict).toHaveBeenCalledWith(expect.objectContaining({ diskContent: 'external edit' }));
+    expect(model.getLastPersistedContent()).toBe('hello world');
+  });
+
   describe('loadContent', () => {
     it('loads from backing store and caches as lastPersistedContent', async () => {
       const content = await model.loadContent();
@@ -1261,6 +1316,33 @@ describe('DocumentModel diff lifecycle (NIM-5359)', () => {
       expect(harness.loadCalls()).toBeGreaterThan(0);
       expect(harness.tagUpdates).toEqual([]);
       expect(contentsOf(a.diffCb).at(-1)).toBe('C2');
+    });
+
+    /**
+     * A synchronous inline diff can block the renderer for longer than the
+     * watchdog bound (#1606). The overdue timer then runs the moment the thread
+     * frees up, ahead of the presenter's acknowledgement queued behind it, and
+     * recovering there throws away the diff that just rendered and replays it.
+     */
+    it('waits for the acknowledgement when the watchdog fires late after a blocked thread', async () => {
+      harness = createLifecycleHarness({ watchdogMs: 1000 });
+      const a = harness.attachPresenter();
+
+      harness.emit('C1');
+      await settle();
+      const generation = lastGeneration(a.diffCb);
+      const loadsBefore = harness.loadCalls();
+
+      // The presenter blocks the thread for 20s building the diff: wall-clock
+      // time passes and no timer runs. Then the overdue watchdog runs first...
+      vi.setSystemTime(Date.now() + 20_000);
+      await vi.advanceTimersByTimeAsync(1000);
+      // ...and the presenter's report lands right behind it.
+      a.handle.completeDiffApply({ generation, outcome: 'applied' });
+      await vi.advanceTimersByTimeAsync(5000);
+
+      expect(harness.loadCalls()).toBe(loadsBefore);
+      expect(contentsOf(a.diffCb)).toEqual(['C1']);
     });
 
     /**

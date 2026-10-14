@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * `npm run test:last` -- print the last vitest run, and say whether it is still
+ * `pnpm run test:last` -- print the last vitest run, and say whether it is still
  * true.
  *
  * This used to be `cat .vitest/last-run.log`, which answers "what failed?" but
@@ -19,7 +19,7 @@ const logPath = path.join(LOG_DIR, 'last-run.log');
 const statePath = path.join(LOG_DIR, 'last-run.json');
 
 if (!fs.existsSync(logPath)) {
-  console.log('No recorded test run. Run: npm run test:prepush');
+  console.log('No recorded test run. Run: pnpm run test:prepush');
   process.exit(0);
 }
 
@@ -34,6 +34,11 @@ const { verdict, changed } = compareTreeFingerprint(state?.fingerprint ?? null);
 const failing = state?.failingFiles ?? [];
 
 const banner = [];
+let fullState;
+try { fullState = JSON.parse(fs.readFileSync(path.join(LOG_DIR, 'last-full-run.json'), 'utf8')); } catch {}
+banner.push(`Last invocation: ${state?.invocation ?? 'unknown'} (${state?.complete ? 'complete' : 'incomplete/legacy'})`);
+if (fullState) banner.push(`Last full suite: ${fullState.result}, ${fullState.complete ? 'complete' : 'incomplete'}, ${fullState.finishedAt ?? fullState.startedAt}`);
+else banner.push('No separate full-suite record.');
 if (verdict === 'current') {
   banner.push('CURRENT -- the working tree is unchanged since this run.');
   banner.push('These results still hold. Re-running the suite cannot tell you anything new.');
@@ -47,7 +52,7 @@ if (verdict === 'current') {
   banner.push('');
   banner.push(
     failing.length > 0
-      ? `Rerun only the affected files, not the suite: npx vitest --run ${failing.join(' ')}`
+      ? `Rerun only the affected files, not the suite: pnpm exec vitest --run ${failing.join(' ')}`
       : 'Rerun only the files your edits affect, not the whole suite.',
   );
 } else {

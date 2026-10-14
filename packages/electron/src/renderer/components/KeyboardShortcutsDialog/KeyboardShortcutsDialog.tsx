@@ -7,6 +7,7 @@ import {
   type RegisteredKeybinding,
 } from '../../extensions/commands/ExtensionCommandRegistry';
 import { getExtensionLoader } from '@nimbalyst/runtime';
+import { CANVAS_SHORTCUT_TABLE } from '@nimbalyst/runtime/canvas/canvasKeymap';
 import { developerModeAtom } from '../../store/atoms/appSettings';
 
 interface KeyboardShortcutsDialogProps {
@@ -25,6 +26,25 @@ interface ShortcutGroup {
 type TabId = 'general' | 'editor' | 'extensions';
 
 const IS_MAC = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+
+const canvasKeyTokens: Record<string, string> = {
+  Mod: 'Cmd',
+  ArrowLeft: '←',
+  ArrowRight: '→',
+  ArrowUp: '↑',
+  ArrowDown: '↓',
+  '+': 'Plus',
+  '-': 'Minus',
+};
+
+// Shared across renders: never mutate this group or its shortcuts in place.
+const canvasShortcuts: ShortcutGroup = {
+  title: 'Project Canvas',
+  shortcuts: CANVAS_SHORTCUT_TABLE.map(({ label, keys }) => ({
+    label,
+    shortcut: keys.map(key => canvasKeyTokens[key] ?? key).join('+'),
+  })),
+};
 
 /**
  * Convert a manifest key string like "ctrl+shift+g" to the display format
@@ -113,7 +133,7 @@ export function KeyboardShortcutsDialog({ isOpen, onClose }: KeyboardShortcutsDi
 
   if (!isOpen) return null;
 
-  // All general shortcuts are defined in: packages/electron/src/shared/KeyboardShortcuts.ts
+  // Application shortcuts come from shared/KeyboardShortcuts.ts; canvas shortcuts come from the runtime keymap.
   const generalShortcuts: ShortcutGroup[] = [
     {
       title: 'File',
@@ -147,7 +167,9 @@ export function KeyboardShortcutsDialog({ isOpen, onClose }: KeyboardShortcutsDi
         { label: 'Approve Current Action', shortcut: KeyboardShortcuts.edit.approve }, // shared/KeyboardShortcuts.ts:35 - Cmd+Enter
         { label: 'Reject Current Action', shortcut: KeyboardShortcuts.edit.reject }, // shared/KeyboardShortcuts.ts:36 - Cmd+Shift+Backspace
         { label: 'Toggle Plan Mode (Claude Code)', shortcut: 'Shift+Tab' }, // AIInput.tsx - toggle between Plan/Agent mode
+        { label: 'Fill in suggested next prompt (empty input)', shortcut: 'Tab' }, // AIInput.tsx - promptSuggestionKeys.ts
         { label: 'Choose AI Model (AI input focused)', shortcut: 'Cmd+Shift+M' }, // AIInput.tsx
+        { label: 'Next / Previous AI menu (model, effort, actions)', shortcut: 'Tab / Shift+Tab' }, // AIInputControls.tsx
       ],
     },
     {
@@ -161,7 +183,7 @@ export function KeyboardShortcutsDialog({ isOpen, onClose }: KeyboardShortcutsDi
         { label: 'Toggle Terminal Panel', shortcut: KeyboardShortcuts.view.toggleTerminalPanel }, // shared/KeyboardShortcuts.ts:48 - Ctrl+`
         { label: 'Toggle Claude CLI Terminal Drawer', shortcut: KeyboardShortcuts.view.toggleCliTerminalDrawer }, // Ctrl+Shift+` — active claude-code-cli session only
         { label: 'Tracker Mode', shortcut: KeyboardShortcuts.view.trackerMode }, // shared/KeyboardShortcuts.ts:49 - Cmd+T
-        { label: 'Shared Documents', shortcut: KeyboardShortcuts.view.collabMode }, // shared/KeyboardShortcuts.ts:50 - Cmd+D
+        { label: 'Wiki', shortcut: KeyboardShortcuts.view.collabMode }, // shared/KeyboardShortcuts.ts:50 - Cmd+D
         { label: 'Organization', shortcut: KeyboardShortcuts.view.orgMode }, // Cmd+Alt+M — only when the project belongs to an organization
         { label: 'Toggle Sidebar', shortcut: KeyboardShortcuts.view.toggleSidebar }, // shared/KeyboardShortcuts.ts:51 - Cmd+B
         { label: 'Toggle Expanded Tab', shortcut: KeyboardShortcuts.view.toggleExpandedTab }, // Shift+Escape — same as double-clicking a tab
@@ -178,6 +200,7 @@ export function KeyboardShortcutsDialog({ isOpen, onClose }: KeyboardShortcutsDi
     {
       title: 'Window',
       shortcuts: [
+        { label: 'Project menu (focused rail icon)', shortcut: 'Shift+F10' },
         { label: 'Project Manager', shortcut: KeyboardShortcuts.window.workspaceManager }, // shared/KeyboardShortcuts.ts:75 - Cmd+P
         { label: 'Switch Project', shortcut: KeyboardShortcuts.window.projectQuickOpen }, // shared/KeyboardShortcuts.ts - Cmd+Shift+P
         { label: 'Session Quick Open', shortcut: KeyboardShortcuts.window.sessionQuickOpen }, // shared/KeyboardShortcuts.ts:77 - Cmd+L
@@ -206,6 +229,15 @@ export function KeyboardShortcutsDialog({ isOpen, onClose }: KeyboardShortcutsDi
       ],
     },
     {
+      // Pages navigates like a wiki: a click shows the page in the current tab.
+      title: 'Wiki',
+      shortcuts: [
+        { label: 'Back in the current tab', shortcut: KeyboardShortcuts.view.navigateBack }, // App.tsx -> pagesTabNavigation.ts - Cmd+[
+        { label: 'Forward in the current tab', shortcut: KeyboardShortcuts.view.navigateForward }, // App.tsx -> pagesTabNavigation.ts - Cmd+]
+        { label: 'Open a page in a new tab', shortcut: IS_MAC ? '⌘+Click' : 'Ctrl+Click' }, // usePagesTabNavigation.tsx
+      ],
+    },
+    {
       title: 'Tracker Grid',
       shortcuts: [
         { label: 'Move between cells', shortcut: 'Arrow keys / Tab' },
@@ -217,6 +249,7 @@ export function KeyboardShortcutsDialog({ isOpen, onClose }: KeyboardShortcutsDi
         { label: 'Redo grid edit', shortcut: IS_MAC ? '⌘+Shift+Z' : 'Ctrl+Shift+Z' },
       ],
     },
+    canvasShortcuts,
   ];
 
   // Editor shortcuts are defined in: packages/runtime/src/editor/plugins/ShortcutsPlugin/shortcuts.ts

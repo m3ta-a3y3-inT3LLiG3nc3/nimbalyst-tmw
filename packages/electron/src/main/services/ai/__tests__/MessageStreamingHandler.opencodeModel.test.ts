@@ -4,6 +4,7 @@ import { EventEmitter } from "events";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
+  pushChange: vi.fn(),
   providerFactory: {
     getProvider: vi.fn(),
     createProvider: vi.fn(),
@@ -13,12 +14,15 @@ const mocks = vi.hoisted(() => ({
     updateActivity: vi.fn(),
     endSession: vi.fn(),
     isSessionActive: vi.fn(() => false),
+    // No follow-up adopted the turn's query: the not-executing publish proceeds.
+    getSessionState: vi.fn(() => undefined),
   },
 }));
 
 // MessageStreamingHandler pulls in most of the main process. Everything below
 // exists only to let it import; nothing here is under test.
-vi.mock("electron", () => ({
+vi.mock("electron", async () => ({
+  app: (await import('../../../../../test-stubs/privateUserData')).testApp,
   BrowserWindow: {
     fromWebContents: vi.fn(() => null),
     getAllWindows: vi.fn(() => []),
@@ -115,7 +119,7 @@ vi.mock("../../CodexEditWindowRegistry", () => ({
 }));
 
 vi.mock("../../ToolCallMatcher", () => ({
-  toolCallMatcher: { matchSession: vi.fn() },
+  toolCallMatcher: { matchSession: vi.fn(async () => 0) },
   unwrapShellCommand: vi.fn(),
 }));
 
@@ -141,7 +145,7 @@ vi.mock("../../../file/WorkspaceEventBus", () => ({
 }));
 
 vi.mock("../../SyncManager", () => ({
-  getSyncProvider: vi.fn(() => null),
+  getSyncProvider: vi.fn(() => ({ pushChange: mocks.pushChange })),
   isDesktopTrulyAway: vi.fn(() => false),
 }));
 
@@ -149,9 +153,16 @@ vi.mock("../mobilePushRequest", () => ({
   requestMobilePush: vi.fn(),
 }));
 
+vi.mock("../supersedeOpenQuestions", () => ({
+  supersedeOpenQuestions: vi.fn(async () => ({ superseded: [], skipped: [] })),
+}));
 vi.mock("../pendingPromptPersistence", () => ({
   setSessionPendingPrompt: vi.fn(),
 }));
+vi.mock('../sessionInboxService', () => ({
+  sessionInbox: { current: vi.fn(), begin: vi.fn(), end: vi.fn(async () => {}) },
+}));
+vi.mock('../../../mcp/httpServer', () => ({ updateDocumentState: vi.fn(), registerWorkspaceWindow: vi.fn() }));
 
 vi.mock("../../AgentWorkflowService", () => ({
   getAgentWorkflowService: vi.fn(),
@@ -169,6 +180,8 @@ vi.mock("../../../mcp/devAgentTools", () => ({
 vi.mock("../../MetaAgentService", () => ({
   MetaAgentService: { getInstance: vi.fn() },
 }));
+
+vi.mock("../wikiSkillAvailability", () => ({ isWikiSkillAvailable: () => false }));
 
 vi.mock("../../../utils/store", () => ({
   getDefaultEffortLevel: vi.fn(() => undefined),
@@ -193,6 +206,9 @@ vi.mock("../../tutorial/tutorialAnalytics", () => ({
 }));
 
 import { MessageStreamingHandler } from "../MessageStreamingHandler";
+import { logger } from '../../../utils/logger';
+import { resolveClaudeCodeParentContextWindow } from '@nimbalyst/runtime/ai/modelConstants';
+import { resetPushOutcomeWarnings } from '@nimbalyst/runtime/sync/pushOutcome';
 
 /**
  * OpenCode replaces its whole config on every `initialize`, which is how the
@@ -323,6 +339,28 @@ describe("MessageStreamingHandler OpenCode turn config", () => {
   });
 });
 
+describe("MessageStreamingHandler provisional title", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.providerFactory.getProvider.mockReturnValue(null);
+  });
+
+  it("titles a fresh session from its first prompt but keeps a title its caller assigned", async () => {
+    const updateSessionTitle = vi.fn();
+    for (const [id, hasBeenNamed] of [["fresh-session", false], ["caller-named-session", true]] as const) {
+      await runTurn({
+        session: openCodeSession({ id, messages: [], hasBeenNamed }),
+        provider: new RecordingProvider(),
+        sessionManager: { updateSessionTitle },
+      });
+    }
+
+    expect(updateSessionTitle.mock.calls).toEqual([
+      ["fresh-session", "Prompt", { force: true, markAsNamed: false }],
+    ]);
+  });
+});
+
 describe("MessageStreamingHandler OpenCode context usage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -348,6 +386,8 @@ describe("MessageStreamingHandler OpenCode context usage", () => {
       inputTokens: 1_000,
       outputTokens: 200,
       totalTokens: 1_200,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
       contextWindow: 200_000,
       currentContext: { tokens: 12_500, contextWindow: 200_000 },
     });
@@ -389,5 +429,77 @@ describe("MessageStreamingHandler OpenCode context usage", () => {
     expect(persisted.contextWindow).toBeUndefined();
     // Compaction reset the context, not what the session has spent.
     expect(persisted.totalTokens).toBe(132);
+  });
+});
+
+describe('stream publication warnings', () => {
+  class MetadataProvider extends RecordingProvider {
+    async *sendMessage() {
+      this.emit('session:metadata-updated', { sessionId: 'sync-session', metadata: { phase: 'implementing' } });
+      yield* super.sendMessage();
+    }
+  }
+  class RejectingProvider extends MetadataProvider {
+    async *sendMessage(): AsyncGenerator<Record<string, unknown>> {
+      yield* super.sendMessage();
+      throw new Error('stream rejected');
+    }
+  }
+  const chunks = [
+    { type: 'context_usage', contextFillTokens: 100, contextWindow: 200000 },
+    { type: 'complete', isComplete: true, usage: { input_tokens: 100, output_tokens: 10 },
+      modelUsage: { sonnet: { contextWindow: 200000 } }, contextFillTokens: 110, contextWindow: 200000 },
+  ];
+  function turn(provider: RecordingProvider, providerType = 'opencode') {
+    return runTurn({
+      session: openCodeSession({ id: 'sync-session', provider: providerType,
+        tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, contextWindow: 200000 } }),
+      provider, sessionManager: { updateSessionTokenUsage: vi.fn() },
+    });
+  }
+  function expectWarnings(count: number) {
+    expect(mocks.pushChange).toHaveBeenCalledTimes(count);
+    expect(logger.main.warn).toHaveBeenCalledTimes(count);
+    for (let i = 1; i <= count; i++) {
+      expect(logger.main.warn).toHaveBeenCalledWith(expect.stringContaining(`session sync-session: disconnected-${i}`));
+    }
+  }
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetPushOutcomeWarnings();
+    mocks.providerFactory.getProvider.mockReturnValue(null);
+    vi.mocked(resolveClaudeCodeParentContextWindow).mockReturnValue(200000);
+    let publication = 0;
+    mocks.pushChange.mockImplementation(async () => ({ published: false, reason: `disconnected-${++publication}` }));
+  });
+  it('reports all five publications during an OpenCode turn', async () => {
+    await turn(new MetadataProvider(chunks));
+    expectWarnings(5);
+  });
+  it('reports all five publications during a Claude turn', async () => {
+    await turn(new MetadataProvider(chunks), 'claude-code');
+    expectWarnings(5);
+  });
+  it('reports three publications when the provider emits an error', async () => {
+    await turn(new MetadataProvider([{ type: 'error', error: 'turn failed' }]));
+    expectWarnings(3);
+  });
+  it('reports three publications and preserves the stream rejection', async () => {
+    await expect(turn(new RejectingProvider())).rejects.toThrow('stream rejected');
+    expectWarnings(3);
+  });
+  it('does not block provider execution or chunks behind execution-state and live-context publishes', async () => {
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    mocks.pushChange.mockImplementation(async (_id, change) => {
+      if (change.metadata.isExecuting === true || change.metadata.currentContext) await pending;
+      return { published: true };
+    });
+    let finished = false;
+    const running = turn(new RecordingProvider([chunks[0]])).then(() => { finished = true; });
+    await vi.waitFor(() => expect(finished).toBe(true));
+    expect(mocks.pushChange).toHaveBeenCalledTimes(3);
+    release();
+    await running;
   });
 });

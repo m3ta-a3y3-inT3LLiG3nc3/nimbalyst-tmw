@@ -37,6 +37,7 @@ import { CommentsExtension } from './builtin/CommentsExtension';
 import { DiffExtension } from './builtin/DiffExtension';
 import { DragDropPasteExtension } from './builtin/DragDropPasteExtension';
 import { EmbedExtension } from './builtin/EmbedExtension';
+import { DecisionExtension } from './builtin/DecisionExtension';
 import { EmojiMarkdownExtension } from './builtin/EmojiExtension';
 import { HeadingAnchorExtension } from './builtin/HeadingAnchorExtension';
 import { ImagesExtension } from './builtin/ImagesExtension';
@@ -45,7 +46,18 @@ import { LayoutExtension } from './builtin/LayoutExtension';
 import { MarkdownCopyExtension } from './builtin/MarkdownCopyExtension';
 import { MarkdownPasteExtension } from './builtin/MarkdownPasteExtension';
 import { MermaidExtension } from './builtin/MermaidExtension';
+import { QuadrantExtension } from './builtin/QuadrantExtension';
+import { ChartExtension } from './builtin/ChartExtension';
+import { CodeExcerptExtension } from './builtin/CodeExcerptExtension';
+import { CalloutExtension } from './builtin/CalloutExtension';
+import { TocExtension } from './builtin/TocExtension';
+import { TransclusionExtension } from './builtin/TransclusionExtension';
+import { MentionExtension } from './builtin/MentionExtension';
+import { TabsExtension } from './builtin/TabsExtension';
+import { ActionButtonExtension } from './builtin/ActionButtonExtension';
 import { PageBreakExtension } from './builtin/PageBreakExtension';
+import { PageMarkExtension } from './builtin/PageMarkExtension';
+import { CitationExtension } from './builtin/CitationExtension';
 import { TabFocusExtension } from './builtin/TabFocusExtension';
 import { TableMarkdownExtension } from './builtin/TableMarkdownExtension';
 import type { UploadedEditorAsset } from '../EditorConfig';
@@ -158,10 +170,22 @@ export function buildNimbalystRootExtension(
     LayoutExtension,
     KanbanBoardExtension,
     MermaidExtension,
+    QuadrantExtension,
+    ChartExtension,
+    CodeExcerptExtension,
+    CalloutExtension,
+    TocExtension,
+    TransclusionExtension,
+    MentionExtension,
+    TabsExtension,
+    ActionButtonExtension,
+    DecisionExtension,
     EmbedExtension,
     DiffExtension,
     TableMarkdownExtension,
     EmojiMarkdownExtension,
+    PageMarkExtension,
+    CitationExtension,
   ];
 
   if (!options.collaboration) {

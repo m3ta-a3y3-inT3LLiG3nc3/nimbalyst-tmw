@@ -34,13 +34,13 @@
 
 import { EventEmitter } from 'events';
 import * as path from 'path';
-import * as fs from 'fs/promises';
 import { mkdirSync } from 'fs';
 import { createHash } from 'crypto';
 import { app, utilityProcess, UtilityProcess } from 'electron';
 import { Worker } from 'worker_threads';
 import type {
   BackendModuleContribution,
+  BackendToolCallContext,
   ExtensionPermissionId,
 } from '@nimbalyst/extension-sdk';
 import { effectiveModulePermissions } from '@nimbalyst/extension-sdk';
@@ -69,19 +69,14 @@ import type {
   BackendRuntimeContext,
   BackendToHostMessage,
   BrokerMethodName,
-  BrokerPayloads,
-  BrokerResults,
   HostToBackendMessage,
   PendingRpc,
   PendingStream,
   SerializedError,
 } from './extensionBackendRpc';
 import { serializeError } from './extensionBackendRpc';
-import { AgentMessagesRepository } from '@nimbalyst/runtime/storage/repositories/AgentMessagesRepository';
-import { getProviderApiKeyFromSettings } from '../utils/store';
-import { dispatchMetaAgentTool } from '../mcp/metaAgentServer';
-import { dispatchDevAgentTool } from '../mcp/devAgentTools';
-import { registerBackendTools } from '../mcp/backendToolRegistry';
+import { dispatchBrokerMethod } from './extensionBrokerDispatch';
+import { installExtensionHostWiring } from './extensionHostWiring';
 
 /**
  * Authoritative map from broker method name to its required catalog permission.
@@ -97,7 +92,7 @@ import { registerBackendTools } from '../mcp/backendToolRegistry';
  * provider-private and never route through this gate.
  */
 const BROKER_METHOD_PERMISSIONS: {
-  readonly [K in BrokerMethodName]: ExtensionPermissionId;
+  readonly [K in BrokerMethodName]: ExtensionPermissionId | null;
 } = {
   logRaw: 'nimbalyst-database-write',
   getApiKey: 'secrets-read',
@@ -115,6 +110,12 @@ const BROKER_METHOD_PERMISSIONS: {
   // anti-forge gate honest: the host derives this permission from the method
   // name, never from the backend-supplied tool name.
   devToolExecutor: 'workspace-files',
+  // ctx.services.sessions. Every op is scoped to the calling module's own
+  // extension id and bound workspace inside extensionSessionsService.
+  sessions: 'ai-sessions',
+  // Ungated: only the badge on a panel the caller's own manifest declares
+  // (see backendPanelBadges.ts), which its panel can already set.
+  panels: null,
 } as const;
 
 /** Public state of a single module the host is tracking. */
@@ -195,6 +196,25 @@ function createReadyGate(): ReadyGate {
 /** Max time to wait for a spawned module to send init-ack before giving up. */
 const MODULE_READY_TIMEOUT_MS = 15_000;
 
+/**
+ * Max time a single `request` may wait for its `rpc-result`/`rpc-error`.
+ *
+ * Without this, a pending call was parked in `managed.pending` with no timer at
+ * all: the only thing that could ever settle it was a reply, a module crash, or
+ * a stop (`rejectAllPending`). A module that stayed *alive* but never answered —
+ * wedged in a sync loop, deadlocked on its own SQLite handle, awaiting a promise
+ * that never resolves — left the caller hanging forever with no error and no log
+ * line. When the caller was an MCP tool handler, no JSON-RPC response was ever
+ * written and the agent sat on the call until its own client timeout, which on
+ * `/mcp/core` is a week. Agents surface that as "the service is slow"; there is
+ * nothing in any log to contradict them.
+ *
+ * Generous on purpose. Backend tools do real work — notebook cells, circuit
+ * simulation, a full memory re-index — and this is a stuck-detector, not a
+ * latency budget. Callers that legitimately run longer pass `timeoutMs`.
+ */
+const RPC_REQUEST_TIMEOUT_MS = 600_000;
+
 interface ManagedModule {
   args: StartModuleArgs;
   state: ModuleState;
@@ -216,10 +236,16 @@ const HOST_EVENT_STATE_CHANGED = 'state-changed';
 
 export class PrivilegedExtensionHost extends EventEmitter {
   private modules = new Map<ModuleKey, ManagedModule>();
+  private initializingRuntimes = 0;
+  private runtimeStartQueue: Array<() => void> = [];
 
   constructor() {
     super();
     this.setMaxListeners(50);
+    installExtensionHostWiring({
+      listModules: () => this.modules.values(),
+      onStateChanged: (listener) => this.onStateChanged(listener),
+    });
   }
 
   /**
@@ -510,7 +536,11 @@ export class PrivilegedExtensionHost extends EventEmitter {
   ): Promise<void> {
     const key = moduleKey(extensionId, moduleId, workspacePath);
     const managed = this.modules.get(key);
-    if (!managed || !managed.runtime) {
+    if (!managed) {
+      return;
+    }
+    if (!managed.runtime) {
+      this.setState(managed, { status: 'stopped', stoppedAt: Date.now() });
       return;
     }
     const reason = opts.failPendingWith ?? 'Module is shutting down';
@@ -625,6 +655,10 @@ export class PrivilegedExtensionHost extends EventEmitter {
    * caller (renderer IPC handler, AI tool adapter) is responsible for
    * declaring which permission a given method consumes. Methods that need
    * no permission at all can pass `null`.
+   *
+   * Rejects after `timeoutMs` (default `RPC_REQUEST_TIMEOUT_MS`) if the module
+   * never answers, so a wedged-but-alive module fails loudly instead of parking
+   * the caller forever.
    */
   async request<T = unknown>(args: {
     extensionId: string;
@@ -633,6 +667,9 @@ export class PrivilegedExtensionHost extends EventEmitter {
     method: string;
     params?: unknown;
     requiredPermission: ExtensionPermissionId | null;
+    timeoutMs?: number;
+    /** Set for MCP tool dispatch; reaches the method as `ctx.call`. */
+    callContext?: BackendToolCallContext;
   }): Promise<T> {
     const key = moduleKey(args.extensionId, args.moduleId, args.workspacePath);
     const managed = this.modules.get(key);
@@ -669,10 +706,43 @@ export class PrivilegedExtensionHost extends EventEmitter {
     }
 
     const id = String(managed.nextRpcId++);
+    const timeoutMs = args.timeoutMs ?? RPC_REQUEST_TIMEOUT_MS;
     return new Promise<T>((resolve, reject) => {
+      // Cleared by whichever of the three settle paths wins: a reply routed
+      // through `pending` (handleMessage), a send() throw below, or the timer.
+      let timer: NodeJS.Timeout | undefined;
+      const settle = <R>(fn: (value: R) => void) => (value: R) => {
+        if (timer) clearTimeout(timer);
+        timer = undefined;
+        fn(value);
+      };
+      const settledResolve = settle<unknown>((v) => resolve(v as T));
+      const settledReject = settle<Error>(reject);
+
+      if (timeoutMs > 0 && Number.isFinite(timeoutMs)) {
+        timer = setTimeout(() => {
+          timer = undefined;
+          // Drop the callback first: a late reply must not resolve a promise we
+          // have already rejected, and must not leak in `pending` forever.
+          if (!managed.pending.delete(id)) return;
+          logger.main.warn(
+            `[PrivilegedExtensionHost] rpc timeout after ${timeoutMs}ms: ` +
+              `${args.extensionId}/${args.moduleId} ${args.method}`
+          );
+          reject(
+            new Error(
+              `[PrivilegedExtensionHost] ${args.extensionId}/${args.moduleId} ` +
+                `did not answer ${args.method} within ${timeoutMs}ms`
+            )
+          );
+        }, timeoutMs);
+        // A pending backend call must not by itself keep the process alive.
+        timer.unref?.();
+      }
+
       managed.pending.set(id, {
-        resolve: (v) => resolve(v as T),
-        reject,
+        resolve: settledResolve,
+        reject: settledReject,
         streaming: false,
       });
       try {
@@ -681,10 +751,11 @@ export class PrivilegedExtensionHost extends EventEmitter {
           id,
           method: args.method,
           params: args.params,
+          ...(args.callContext ? { callContext: args.callContext } : {}),
         });
       } catch (err) {
         managed.pending.delete(id);
-        reject(err instanceof Error ? err : new Error(String(err)));
+        settledReject(err instanceof Error ? err : new Error(String(err)));
       }
     });
   }
@@ -915,6 +986,26 @@ export class PrivilegedExtensionHost extends EventEmitter {
   }
 
   private async spawnRuntime(managed: ManagedModule): Promise<void> {
+    // Restoring many projects must not spawn dozens of backends at once and
+    // exhaust their initialization deadlines. Consent is resolved before this
+    // queue, so an unanswered permission prompt never occupies a startup slot.
+    if (this.initializingRuntimes >= 4) {
+      await new Promise<void>(resolve => this.runtimeStartQueue.push(resolve));
+    } else {
+      this.initializingRuntimes++;
+    }
+    try {
+      if (managed.state.status === 'stopped') return;
+      await this.initializeRuntime(managed);
+      await this.waitForRunning(managed).catch(() => {});
+    } finally {
+      const next = this.runtimeStartQueue.shift();
+      if (next) next();
+      else this.initializingRuntimes--;
+    }
+  }
+
+  private async initializeRuntime(managed: ManagedModule): Promise<void> {
     // Arm the readiness gate before sending init; `setState` settles it when
     // init-ack ('running') or a failure arrives.
     managed.ready = createReadyGate();
@@ -992,18 +1083,23 @@ export class PrivilegedExtensionHost extends EventEmitter {
       stdio: 'pipe',
     });
 
+    // kill() can return before exit is delivered. A replaced runtime must not
+    // clear its successor or publish stale initialization/tool messages.
     child.on('spawn', () => {
       logger.main.info(
         `[PrivilegedExtensionHost] utility-process spawned for ${logLabel} pid=${child.pid}`
       );
     });
     child.on('message', (msg: unknown) => {
+      if (managed.runtime !== runtime) return;
       this.handleBackendMessage(managed, msg as BackendToHostMessage, ctx);
     });
     child.on('exit', (code: number) => {
+      if (managed.runtime !== runtime) return;
       this.handleRuntimeExit(managed, code, logLabel);
     });
     child.on('error', (type: string, location: string) => {
+      if (managed.runtime !== runtime) return;
       logger.main.error(
         `[PrivilegedExtensionHost] utility-process fatal for ${logLabel}: ${type} @ ${location}`
       );
@@ -1023,7 +1119,7 @@ export class PrivilegedExtensionHost extends EventEmitter {
       });
     }
 
-    return {
+    const runtime: ManagedRuntime = {
       send: (msg) => {
         child.postMessage(msg);
       },
@@ -1038,6 +1134,7 @@ export class PrivilegedExtensionHost extends EventEmitter {
       },
       isAlive: () => child.pid !== undefined,
     };
+    return runtime;
   }
 
   private spawnWorkerThread(
@@ -1053,9 +1150,11 @@ export class PrivilegedExtensionHost extends EventEmitter {
     });
 
     worker.on('message', (msg: unknown) => {
+      if (managed.runtime !== runtime) return;
       this.handleBackendMessage(managed, msg as BackendToHostMessage, ctx);
     });
     worker.on('error', (err) => {
+      if (managed.runtime !== runtime) return;
       logger.main.error(
         `[PrivilegedExtensionHost] worker error for ${logLabel}:`,
         err
@@ -1069,10 +1168,11 @@ export class PrivilegedExtensionHost extends EventEmitter {
       this.rejectPending(managed, `Backend crashed: ${err.message}`);
     });
     worker.on('exit', (code) => {
+      if (managed.runtime !== runtime) return;
       this.handleRuntimeExit(managed, code, logLabel);
     });
 
-    return {
+    const runtime: ManagedRuntime = {
       send: (msg) => {
         worker.postMessage(msg);
       },
@@ -1081,6 +1181,7 @@ export class PrivilegedExtensionHost extends EventEmitter {
       },
       isAlive: () => worker.threadId !== -1,
     };
+    return runtime;
   }
 
   private handleRuntimeExit(
@@ -1239,27 +1340,31 @@ export class PrivilegedExtensionHost extends EventEmitter {
     const requiredPermission = BROKER_METHOD_PERMISSIONS[method];
     const tracker = getPermissionUsageTracker();
     try {
-      assertPermission({
-        extensionId: managed.args.extensionId,
-        moduleId: managed.args.module.id,
-        permissionId: requiredPermission,
-        workspacePath: managed.args.workspacePath,
-      });
-      tracker.record({
-        extensionId: managed.args.extensionId,
-        moduleId: managed.args.module.id,
-        permissionId: requiredPermission,
-        outcome: 'allowed',
-        method,
-      });
-      const result = await this.dispatchBrokerMethod(method, payload, ctx);
+      // `null` = deliberately ungated. A forged unknown method reads undefined
+      // and still goes through the gate, which denies it.
+      if (requiredPermission !== null) {
+        assertPermission({
+          extensionId: managed.args.extensionId,
+          moduleId: managed.args.module.id,
+          permissionId: requiredPermission,
+          workspacePath: managed.args.workspacePath,
+        });
+        tracker.record({
+          extensionId: managed.args.extensionId,
+          moduleId: managed.args.module.id,
+          permissionId: requiredPermission,
+          outcome: 'allowed',
+          method,
+        });
+      }
+      const result = await dispatchBrokerMethod(method, payload, ctx);
       managed.runtime?.send({
         kind: 'broker-response',
         requestId,
         result,
       });
     } catch (err) {
-      if (err instanceof CapabilityDeniedError) {
+      if (err instanceof CapabilityDeniedError && requiredPermission) {
         tracker.record({
           extensionId: managed.args.extensionId,
           moduleId: managed.args.module.id,
@@ -1278,155 +1383,6 @@ export class PrivilegedExtensionHost extends EventEmitter {
         error: serializeError(err),
       });
     }
-  }
-
-  /**
-   * Per-method broker dispatch. Each branch performs the actual work AFTER the
-   * gate has cleared. Payload typing is method-keyed via BrokerPayloads.
-   *
-   * Workspace boundary enforcement: readWorkspaceFile / writeWorkspaceFile
-   * resolve the requested path against the runtime's workspacePath and reject
-   * anything that escapes it (absolute paths outside the workspace, `..`
-   * traversal).
-   */
-  private async dispatchBrokerMethod(
-    method: BrokerMethodName,
-    rawPayload: unknown,
-    ctx: BackendRuntimeContext
-  ): Promise<BrokerResults[BrokerMethodName]> {
-    switch (method) {
-      case 'logRaw': {
-        const payload = rawPayload as BrokerPayloads['logRaw'];
-        // Per phase-4-sdk-types-proposal §4.3 anti-impersonation guarantee:
-        // the `source` is stamped HOST-SIDE from ctx.extensionId/ctx.moduleId.
-        // The extension cannot supply or override it, so it cannot impersonate
-        // first-party providers (e.g. claude-code) over the broker.
-        const source = `${ctx.extensionId}/${ctx.moduleId}`;
-        const direction = payload.direction === 'inbound' ? 'input' : 'output';
-        await AgentMessagesRepository.create({
-          sessionId: payload.sessionId,
-          source,
-          direction,
-          content: payload.content,
-          metadata: payload.metadata,
-          hidden: false,
-          createdAt: new Date(),
-          searchable: true,
-        });
-        // AgentMessagesRepository.create returns void; the row id is not
-        // exposed by the store contract. Return 0 as a sentinel so the wire
-        // result shape stays { id: number }; callers that need the id should
-        // re-query by (sessionId, providerMessageId) once a real id surface
-        // is added.
-        const result: BrokerResults['logRaw'] = { id: 0 };
-        return result;
-      }
-      case 'getApiKey': {
-        const payload = rawPayload as BrokerPayloads['getApiKey'];
-        // Per CLAUDE.md "Never Use Environment Variables as Implicit API Key
-        // Sources": read ONLY from the explicit Nimbalyst settings — the
-        // `ai-settings` store's `apiKeys` (where provider keys actually live,
-        // NOT `app-settings`) plus per-workspace overrides. Never process.env.
-        const key = getProviderApiKeyFromSettings(payload.providerId, ctx.workspacePath);
-        const result: BrokerResults['getApiKey'] = { key };
-        return result;
-      }
-      case 'readWorkspaceFile': {
-        const payload = rawPayload as BrokerPayloads['readWorkspaceFile'];
-        const abs = this.resolveWorkspacePath(ctx, payload.path);
-        const content = await fs.readFile(abs, 'utf-8');
-        const result: BrokerResults['readWorkspaceFile'] = { content };
-        return result;
-      }
-      case 'writeWorkspaceFile': {
-        const payload = rawPayload as BrokerPayloads['writeWorkspaceFile'];
-        const abs = this.resolveWorkspacePath(ctx, payload.path);
-        await fs.writeFile(abs, payload.content, 'utf-8');
-        const result: BrokerResults['writeWorkspaceFile'] = {
-          bytesWritten: Buffer.byteLength(payload.content, 'utf-8'),
-        };
-        return result;
-      }
-      case 'registerMcpTools': {
-        const payload = rawPayload as BrokerPayloads['registerMcpTools'];
-        // Fan the registered tools into the main-side backend tool registry,
-        // keyed by the workspace this module was started for. The coding-agent
-        // and voice tool surfaces read from that registry; execution routes
-        // back to this module via `handleBackendTool` -> `request`.
-        const registered = registerBackendTools(
-          ctx.workspacePath,
-          ctx.extensionId,
-          ctx.moduleId,
-          payload.tools
-        );
-        logger.main.info(
-          `[PrivilegedExtensionHost] broker.registerMcpTools: ${ctx.extensionId}/${ctx.moduleId} registered ${registered.length} tool(s) for ${ctx.workspacePath}`
-        );
-        const result: BrokerResults['registerMcpTools'] = { registered };
-        return result;
-      }
-      case 'toolExecutor': {
-        const payload = rawPayload as BrokerPayloads['toolExecutor'];
-        // Scope the tool to the AI session that emitted it (so spawn_session
-        // can find the caller) and the workspace it ran in. dispatchMetaAgentTool
-        // normalizes worktree workspace paths to the parent repo internally.
-        // The workspace falls back to the runtime's bound workspacePath when the
-        // backend didn't supply one.
-        const text = await dispatchMetaAgentTool(
-          payload.name,
-          payload.sessionId,
-          payload.workspacePath ?? ctx.workspacePath,
-          payload.args
-        );
-        const result: BrokerResults['toolExecutor'] = { result: text };
-        return result;
-      }
-      case 'devToolExecutor': {
-        const payload = rawPayload as BrokerPayloads['devToolExecutor'];
-        // Read-only dev tools (read_file / list_files / search_files). The jail
-        // root is the HOST-bound workspace (ctx.workspacePath), NEVER a
-        // backend-supplied path, so a compromised backend cannot read outside
-        // the workspace. ElectronFileSystemService's SafePathValidator blocks
-        // traversal within the call, and reads are size-capped.
-        const text = await dispatchDevAgentTool(
-          payload.name,
-          ctx.workspacePath,
-          payload.args
-        );
-        const result: BrokerResults['devToolExecutor'] = { result: text };
-        return result;
-      }
-      default: {
-        // Exhaustiveness over BrokerMethodName.
-        const _exhaust: never = method;
-        void _exhaust;
-        throw new Error(`unknown broker method: ${String(method)}`);
-      }
-    }
-  }
-
-  /**
-   * Resolve a workspace-relative path against the runtime's workspacePath and
-   * reject anything that escapes the workspace boundary. The `workspace-files`
-   * grant is scoped to within the workspace; an access outside the workspace
-   * is implicitly denied even when the catalog permission has been granted.
-   */
-  private resolveWorkspacePath(ctx: BackendRuntimeContext, relativePath: string): string {
-    const resolved = path.resolve(ctx.workspacePath, relativePath);
-    const workspaceAbs = path.resolve(ctx.workspacePath);
-    const inside =
-      resolved === workspaceAbs ||
-      resolved.startsWith(workspaceAbs + path.sep);
-    if (!inside) {
-      throw new CapabilityDeniedError({
-        reason: 'permission-not-granted',
-        extensionId: ctx.extensionId,
-        moduleId: ctx.moduleId,
-        permissionId: 'workspace-files',
-        detail: `path escapes workspace: ${relativePath}`,
-      });
-    }
-    return resolved;
   }
 }
 

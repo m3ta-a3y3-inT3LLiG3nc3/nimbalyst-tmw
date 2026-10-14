@@ -5,7 +5,7 @@ import { loadBuiltinTrackers } from '@nimbalyst/runtime/plugins/TrackerPlugin/mo
 import {
   READINESS_FILTER_FIELD,
   STATUS_CATEGORY_FILTER_FIELD,
-} from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerStatusCategory';
+} from '@nimbalyst/tracker-schema';
 import { computeReadiness } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerReadiness';
 import { getRecordStatus } from '@nimbalyst/runtime/plugins/TrackerPlugin/trackerRecordAccessors';
 import type { TrackerIdentity } from '@nimbalyst/runtime/core/DocumentService';
@@ -916,4 +916,8 @@ describe('the built-in Ready view', () => {
     expect(merged.map(view => view.name)).toEqual(['Ready', 'Mine']);
     expect(merged[0].builtIn).toBe(true);
   });
+});
+
+ it('keeps selected timeline fields when normalizing a view', () => {
+  expect(normalizeViewDefinition({ ...createDefaultViewDefinition(), timelineFields: { start: 'launchDate', end: 'dueDate' } }).timelineFields).toEqual({ start: 'launchDate', end: 'dueDate' });
 });

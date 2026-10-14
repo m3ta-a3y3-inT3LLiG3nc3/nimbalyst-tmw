@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { getFolderContents, listFolderFilesRecursive } from '../FileTree';
 import * as fs from 'fs';
@@ -13,6 +14,16 @@ describe('FileTree All Files Mode', () => {
 
     afterEach(() => {
         fs.rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    it('discards a scan cancelled while directory I/O is pending', async () => {
+        fs.mkdirSync(path.join(tempDir, 'nested'));
+        fs.writeFileSync(path.join(tempDir, 'nested', 'document.md'), '# test');
+        const controller = new AbortController();
+        const scan = getFolderContents(tempDir, 0, controller.signal);
+        controller.abort();
+        expect(await scan).toEqual([]);
+        expect((await getFolderContents(tempDir))[0].children).toHaveLength(1);
     });
 
     it('should return all folders including those without known file extensions', async () => {
@@ -53,6 +64,24 @@ describe('FileTree All Files Mode', () => {
 
         // Verify we got 8 items total
         expect(result.length).toBe(8);
+    });
+
+    it('marks a folder past the depth limit as unread rather than empty', async () => {
+        // d1/.../d10: the walk lists d9 inside d8 but does not read it.
+        const chain = Array.from({ length: 10 }, (_, i) => `d${i + 1}`);
+        fs.mkdirSync(path.join(tempDir, ...chain), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, ...chain, 'deep.ts'), '');
+
+        let level = await getFolderContents(tempDir);
+        const seen: Array<{ name: string; truncated: boolean }> = [];
+        while (level.length > 0) {
+            const dir = level[0];
+            seen.push({ name: dir.name, truncated: dir.childrenTruncated === true });
+            level = dir.children ?? [];
+        }
+
+        expect(seen.find((entry) => entry.truncated)?.name).toBe('d9');
+        expect(seen.filter((entry) => entry.truncated)).toHaveLength(1);
     });
 
     it('should return empty folders', async () => {

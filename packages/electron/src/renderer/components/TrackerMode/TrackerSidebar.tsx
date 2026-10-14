@@ -31,12 +31,15 @@ import { toggleListEntry } from './trackerSidebarCollapse';
 import type { TrackerTeam } from './useTrackerTeamMembers';
 import type { OwnershipMember } from '../common/TrackerOwnershipChip';
 import { TrackerOwnershipSection } from './TrackerOwnershipSection';
+import { useTrackerTypeShareMenu } from './TrackerTypeShareMenu';
+import { TeamTypesNotSyncingNotice } from './TeamTypesNotSyncingNotice';
 import {
   ALL_TRACKERS_NAV_MODEL,
   TrackerNavTypeRow,
   TrackerSavedViewsSection,
 } from '@nimbalyst/collab-client/trackers-ui';
 import { trackerSyncConnectionAtom } from '../../store/atoms/trackerSync';
+import { requestConfirmation } from '../../dialogs/requestConfirmation';
 import { trackerSnoozedUntilByItemIdAtom } from '../../store/atoms/trackerPersonalState';
 import { countInboxItems, type InboxSignals } from '@nimbalyst/runtime/plugins/TrackerPlugin/models';
 import {
@@ -278,6 +281,7 @@ export const TrackerSidebar: React.FC<TrackerSidebarProps> = ({
     () => virtualElement(contextPoint.x, contextPoint.y),
     [contextPoint],
   );
+  const typeShareMenu = useTrackerTypeShareMenu(workspacePath, team !== null);
   const folderMenu = useFloatingMenu({
     placement: 'right-start',
     reference: contextReference,
@@ -436,6 +440,7 @@ export const TrackerSidebar: React.FC<TrackerSidebarProps> = ({
         />
       }
       onClick={() => onSelectType(tracker.type)}
+      onContextMenu={typeShareMenu.onContextMenuFor(tracker)}
       onDragStart={(event) => {
         setDraggedEntryId(placement.entryId);
         event.dataTransfer.effectAllowed = 'move';
@@ -606,6 +611,7 @@ export const TrackerSidebar: React.FC<TrackerSidebarProps> = ({
                 onToggleCollapsed={() => toggleSectionCollapsed(section.ownership)}
                 actions={renderCreateFolderButton(section.ownership)}
               >
+                {section.ownership === 'team' && <TeamTypesNotSyncingNotice workspacePath={workspacePath} />}
                 {renderCreateFolderRow(section.ownership)}
                 {renderNavigationTree(section.tree)}
               </TrackerOwnershipSection>
@@ -613,6 +619,7 @@ export const TrackerSidebar: React.FC<TrackerSidebarProps> = ({
         </div>
       </div>
 
+      {typeShareMenu.element}
       {contextFolder && (
         <FloatingPortal>
           <div
@@ -634,10 +641,16 @@ export const TrackerSidebar: React.FC<TrackerSidebarProps> = ({
             </button>
             <button
               className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs text-nim-error hover:bg-nim-tertiary"
-              onClick={() => {
+              onClick={async () => {
                 const folder = contextFolder;
                 setContextFolder(null);
-                if (window.confirm(`Delete folder “${folder.name}”? Its tracker types will move to the root.`)) {
+                const approved = await requestConfirmation({
+                  title: 'Delete folder?',
+                  message: `Delete folder “${folder.name}”? Its tracker types will move to the root.`,
+                  confirmLabel: 'Delete',
+                  destructive: true,
+                });
+                if (approved) {
                   void onDeleteFolder(folder.folderId).catch((error) => {
                     console.error('[TrackerSidebar] Failed to delete tracker folder:', error);
                   });

@@ -1,3 +1,4 @@
+import { warnIfUnpublished } from '@nimbalyst/runtime/sync/pushOutcome';
 /**
  * TrayManager - System tray icon and menu for AI session status
  *
@@ -14,6 +15,8 @@ import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStat
 import type { SessionStateEvent } from '@nimbalyst/runtime/ai/server/types/SessionState';
 import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
 import { findWindowByWorkspace } from '../window/WindowManager';
+import { getProjectWindows } from '../window/windowState';
+import { getRestorableProjectWindow, restoreApplicationWindow } from '../window/ApplicationWindowRecovery';
 import { getPackageRoot } from '../utils/appPaths';
 import {
   isShowTrayIcon,
@@ -34,7 +37,6 @@ import { updateSleepPrevention, resolvePreventSleepMode, getSyncProvider } from 
 import {
   closeTrayPanelWindow,
   isTrayPanelSupported,
-  isTrayPanelWindow,
   pushTrayPanelFeed,
   toggleTrayPanelWindow,
 } from '../window/TrayPanelWindow';
@@ -66,8 +68,8 @@ import { unreadSeedQuery } from './unreadSeedQuery';
 import {
   closeMenuBarIsland,
   isMenuBarIslandSupported,
-  isMenuBarIslandWindow,
   showMenuBarIsland,
+  shutdownMenuBarIsland,
 } from '../window/MenuBarIslandWindow';
 
 export type { TraySessionInfo, PromptKind } from './fleetSnapshot';
@@ -112,23 +114,6 @@ const STRIP_AGE_TICK_MS = 60_000;
 const RECENT_SESSIONS_LIMIT = 5;
 /** Idle repaints every minute; this answer does not change nearly that often. */
 const RECENT_SESSIONS_TTL_MS = 5 * 60_000;
-
-/**
- * Project windows only.
- *
- * The tray panel and the menu bar island are BrowserWindows too, so they appear
- * in `getAllWindows()`. Focusing one in response to "Open Nimbalyst" would be a
- * no-op from the user's point of view, and counting it as a visible foreground
- * window makes the app look focused whenever it is on screen -- which for the
- * island is always.
- */
-function projectWindows(): BrowserWindow[] {
-  return BrowserWindow.getAllWindows().filter(
-    (window) => !window.isDestroyed()
-      && !isTrayPanelWindow(window)
-      && !isMenuBarIslandWindow(window),
-  );
-}
 
 // ─── Row helpers ────────────────────────────────────────────────────────────
 
@@ -516,6 +501,7 @@ export class TrayManager {
     this.lingerTimers.clear();
 
     this.teardownStrip();
+    shutdownMenuBarIsland();
     this.stopFleetActivity();
 
     if (this.tray) {
@@ -713,7 +699,7 @@ export class TrayManager {
           // Check if app is backgrounded -- if so, mark as unread. The tray
           // panel does not count: the user opening it to check on sessions must
           // not suppress the unread flag on everything that finishes meanwhile.
-          const hasVisibleFocusedWindow = projectWindows().some(w => w.isVisible() && w.isFocused());
+          const hasVisibleFocusedWindow = getProjectWindows().some(w => w.isVisible() && w.isFocused());
           if (!hasVisibleFocusedWindow) {
             session.hasUnread = true;
           }
@@ -1618,23 +1604,21 @@ export class TrayManager {
   // ─── Session click handling ────────────────────────────────────────────
 
   handleNewSession(): void {
-    const windows = projectWindows();
-    if (windows.length > 0) {
-      const win = windows[0];
+    const win = getRestorableProjectWindow();
+    if (win) {
+      if (win.isMinimized()) win.restore();
       win.show();
       win.focus();
       // Tell renderer to switch to agent mode and create a new session
       win.webContents.send('tray:new-session');
+    } else {
+      restoreApplicationWindow();
     }
   }
 
   /** Focus any project window. Shared by the native menu item and the panel footer. */
   handleOpenApp(): void {
-    const windows = projectWindows();
-    if (windows.length > 0) {
-      windows[0].show();
-      windows[0].focus();
-    }
+    restoreApplicationWindow();
   }
 
   handleSessionClick(sessionId: string, workspacePath: string): void {
@@ -1644,17 +1628,13 @@ export class TrayManager {
 
     const targetWindow = findWindowByWorkspace(workspacePath);
     if (targetWindow && !targetWindow.isDestroyed()) {
+      if (targetWindow.isMinimized()) targetWindow.restore();
       targetWindow.show();
       targetWindow.focus();
       // Send navigation request to renderer
       targetWindow.webContents.send('tray:navigate-to-session', { sessionId, workspacePath });
     } else {
-      // No window for this workspace -- just show any window
-      const windows = projectWindows();
-      if (windows.length > 0) {
-        windows[0].show();
-        windows[0].focus();
-      }
+      restoreApplicationWindow();
     }
 
     // Clear unread flag when user clicks (in-memory + database)
@@ -1739,10 +1719,11 @@ export class TrayManager {
         },
       });
       if (syncProvider) {
-        syncProvider.pushChange(sessionId, {
+        const outcome = await syncProvider.pushChange(sessionId, {
           type: 'metadata_updated',
           metadata: { lastReadAt },
         });
+        warnIfUnpublished(message => logger.main.warn(message), sessionId, '[TrayManager] Failed to publish read state', outcome);
       }
     } catch (error) {
       logger.main.error('[TrayManager] Failed to persist read state from tray action:', error);

@@ -18,7 +18,8 @@
  */
 
 import { ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
-import { normalizeClaudeCodeVariant } from '@nimbalyst/runtime/ai/modelConstants';
+import { normalizeClaudeCodeVariant, CLAUDE_CODE_PINNED_SDK_MODELS } from '@nimbalyst/runtime/ai/modelConstants';
+import { claudeCustomModelName } from '@nimbalyst/runtime/ai/claudeCustomModels';
 
 /**
  * Resolve a Nimbalyst model id to the alias the genuine `claude` CLI accepts for
@@ -43,28 +44,24 @@ export function resolveClaudeCliModelArg(model: string | undefined): string | un
 
   // Combined "provider:variant" id → take the variant part; bare value → itself.
   const parsed = ModelIdentifier.tryParse(trimmed);
+  // Custom gateway models (`claude-code-cli:custom/Fast`) go to `--model` verbatim.
+  const customModel = parsed?.customClaudeModel ?? claudeCustomModelName(trimmed);
+  if (customModel) return customModel;
   const isExtended = parsed ? parsed.isExtendedContext : /-1m$/i.test(trimmed);
   const variantInput = parsed ? parsed.baseVariant : trimmed.toLowerCase().replace(/-1m$/, '');
 
   const variant = normalizeClaudeCodeVariant(variantInput);
   if (variant) {
-    // The CLI accepts canonical aliases (fable, opus, sonnet, haiku) and full
-    // model ids (claude-fable-5, claude-opus-4-7). For pinned variants the
-    // CLI doesn't accept as short aliases, pass the full model id instead.
-    let alias: string;
-    if (variant.startsWith('opus')) {
-      alias = 'opus';
-    } else if (variant === 'fable-5') {
-      alias = 'claude-fable-5';
-    } else {
-      alias = variant;
-    }
+    // Share the SDK mapping so explicit versions never collapse to "latest".
+    const alias = CLAUDE_CODE_PINNED_SDK_MODELS[variant] ?? variant;
     return isExtended ? `${alias}[1m]` : alias;
   }
 
   // Unknown format: a bare full model name is fine to pass through; a non-claude
-  // combined id (e.g. `openai:gpt-5`) must never reach `claude --model`.
-  return parsed ? undefined : trimmed;
+  // combined id (e.g. `openai:gpt-5`) or an unparseable Claude id still carrying
+  // its provider prefix must never reach `claude --model`.
+  if (parsed || /^claude-code(?:-cli)?:/.test(trimmed)) return undefined;
+  return trimmed;
 }
 
 export interface ClaudeCliSpawnInput {

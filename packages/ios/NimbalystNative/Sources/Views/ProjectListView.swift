@@ -8,17 +8,26 @@ public struct ProjectListView: View {
     @EnvironmentObject var appState: AppState
     @State private var projects: [Project] = []
     @State private var cancellable: AnyDatabaseCancellable?
+    @State private var observationState: IndexLoadState = .loading
     @State private var accountSwitchError: String?
 
-    public init() {}
+    private let onSelectProject: (Project) -> Void
+
+    public init(onSelectProject: @escaping (Project) -> Void) {
+        self.onSelectProject = onSelectProject
+    }
 
     public var body: some View {
         List {
             Section {
                 ForEach(projects) { project in
-                    NavigationLink(value: project) {
+                    Button {
+                        onSelectProject(project)
+                    } label: {
                         ProjectRow(project: project)
+                            .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
                 }
             } header: {
                 brandingHeader
@@ -34,36 +43,21 @@ public struct ProjectListView: View {
         .navigationBarTitleDisplayMode(.inline)
         #endif
         .refreshable {
+            startObserving()
             appState.requestSync()
             // Give a moment for the sync response to arrive and update SQLite
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
-        .navigationDestination(for: Project.self) { project in
-            SessionListView(project: project)
-                .onAppear {
-                    AnalyticsManager.shared.capture("mobile_project_selected")
-                }
-        }
         .overlay {
             if projects.isEmpty {
-                VStack(spacing: 12) {
-                    Image(systemName: "folder")
-                        .font(.system(size: 48))
-                        .foregroundStyle(.secondary)
-                    Text("No Projects")
-                        .font(.title3)
-                    Text("Projects will appear here once synced from the desktop app.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                }
-                .padding()
+                IndexListPlaceholder(
+                    noun: "Projects", symbol: "folder",
+                    emptyDescription: "Projects will appear here once synced from the desktop app.",
+                    observationState: observationState
+                )
             }
         }
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                connectionIndicator
-            }
             ToolbarItem(placement: .primaryAction) {
                 accountSwitcher
             }
@@ -94,16 +88,9 @@ public struct ProjectListView: View {
         } message: {
             Text(accountSwitchError ?? "")
         }
-        .onAppear {
+        .task(id: appState.databaseManager.map(ObjectIdentifier.init)) {
+            projects = []
             startObserving()
-        }
-        .onReceive(appState.$databaseManager) { db in
-            // Always restart observation when databaseManager changes (e.g. after re-pairing)
-            cancellable?.cancel()
-            cancellable = nil
-            if db != nil {
-                startObserving()
-            }
         }
         .onDisappear {
             cancellable?.cancel()
@@ -148,22 +135,6 @@ public struct ProjectListView: View {
     }
     #endif
 
-    private var isDesktopConnected: Bool {
-        if appState.screenshotMode { return true }
-        return appState.syncManager?.connectedDevices.contains(where: { $0.type == "desktop" }) ?? false
-    }
-
-    private var connectionIndicator: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "desktopcomputer")
-                .font(.system(size: 14))
-                .foregroundStyle(appState.isConnected ? .primary : .secondary)
-            Circle()
-                .fill(isDesktopConnected ? Color.green : (appState.isConnected ? Color.orange : Color.gray))
-                .frame(width: 8, height: 8)
-        }
-    }
-
     private var accountSwitcher: some View {
         Menu {
             ForEach(appState.accounts) { account in
@@ -189,6 +160,8 @@ public struct ProjectListView: View {
     }
 
     private func startObserving() {
+        cancellable?.cancel()
+        observationState = .loading
         guard let db = appState.databaseManager else { return }
 
         let observation = ValueObservation.tracking { db in
@@ -200,11 +173,13 @@ public struct ProjectListView: View {
         cancellable = observation.start(
             in: db.writer,
             onError: { error in
+                observationState = .failed
                 print("Project observation error: \(error)")
             },
             onChange: { newProjects in
                 withAnimation {
                     projects = newProjects
+                    observationState = .loaded
                 }
             }
         )

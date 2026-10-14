@@ -102,6 +102,13 @@ export interface ClaudeCodePromptOptions {
    * replaces. Providers that do not have the bug leave it undefined.
    */
   gitContext?: string;
+  /**
+   * Standing instructions for this one session, from its
+   * `metadata.sessionDirective` (written by whoever created the session: an
+   * automation, an extension). Appended last, never replacing the normal
+   * prompt. Same freeze requirement as `gitContext`: resolve once per session.
+   */
+  sessionDirective?: string;
   isVoiceMode?: boolean;
   voiceModeCodingAgentPrompt?: {
     prepend?: string;
@@ -142,6 +149,7 @@ export function buildClaudeCodeSystemPrompt(options: ClaudeCodePromptOptions): s
     toolReferenceStyle = 'claude',
     worktreePath,
     gitContext,
+    sessionDirective,
     isVoiceMode = false,
     voiceModeCodingAgentPrompt,
     planTrackingEnabled = false,
@@ -170,6 +178,8 @@ Before writing a question, list of options, or draft for the user to react to in
 - ${promptForUserInputTool} — anything richer. Fields: multiSelect, singleSelect (set allowOther for an escape hatch), reorder (removable for drop), editText (seed initialText with your draft so the user edits in place), confirm.
 
 Combine questions into one multi-field prompt instead of asking across turns, and pre-fill defaults so the user can submit without retyping.
+
+${effectiveToolReferenceStyle === 'codex' ? 'When an interactive tool inside `functions.exec` returns “Script running with cell ID”, keep calling `functions.wait` for that cell until its answer arrives. A running cell is not a timeout. Do not issue a final response while the question call is pending.' : ''}
 
 ## Visual Communication
 
@@ -305,6 +315,11 @@ The user is interacting via voice mode. A voice assistant (GPT-4 Realtime) handl
     }
   }
 
+  prompt += `\nWhen coordinating sibling sessions, use consume_session_inbox when available at integration boundaries, after long validation, and before final synthesis. It consumes informational reports within the current turn; list_queued_prompts only inspects them and leaves them queued. Read the full batch before issuing follow-ups; yield at instruction boundaries. Never poll an empty inbox. Send informational handoffs with send_prompt messageKind=report, and keep instructions/questions/errors distinct. Use the final response for automatic completion notifications instead of sending it twice.\n`;
+  const directive = sessionDirective?.trim();
+  if (directive) {
+    prompt += `\n${directive}\n`;
+  }
   return prompt + `
 </addendum>
 `;
@@ -315,7 +330,13 @@ export type MetaAgentWorkflowPreset = 'default' | 'implement-review-test' | 'res
 export function buildMetaAgentSystemPrompt(
   style: ToolReferenceStyle = 'claude',
   workflowPreset: MetaAgentWorkflowPreset = 'default',
-  options?: { provider?: string; model?: string; modelDisplayName?: string }
+  options?: {
+    provider?: string;
+    model?: string;
+    modelDisplayName?: string;
+    /** See `ClaudeCodePromptOptions.sessionDirective`; an orchestrator can carry standing instructions too. */
+    sessionDirective?: string;
+  }
 ): string {
   // Meta-agent tools fold onto the deferred `nimbalyst-host` server, and
   // update_session_meta onto the eager core `nimbalyst` (MCP consolidation Phase 5).
@@ -335,6 +356,7 @@ export function buildMetaAgentSystemPrompt(
     ? `You are ${options.modelDisplayName}. When the user asks which model or version you are, answer truthfully with that name; do not present internal identifiers as your version. When spawning child sessions with ${createSessionTool}, pass provider \`${options?.provider ?? 'unknown'}\` and model \`${options?.model ?? 'default'}\` so children inherit your configuration. Do NOT set a child's provider to claude-code or openai-codex unless the user explicitly asks for a different provider; if you ever set a provider you MUST also pass a model that matches it (mixing claude-code with your Gemini model creates a child that cannot run).`
     : `You are running as provider \`${options?.provider ?? 'unknown'}\` with model \`${options?.model ?? 'default'}\`. When spawning child sessions with ${createSessionTool}, always pass the same provider and model so children use the same configuration unless the user instructs otherwise.`;
 
+  const consumeInboxTool = formatMcpToolReference('nimbalyst-host', 'consume_session_inbox', style);
   // Base orchestration prompt — always included
   let prompt = `You are a Meta Agent — an orchestrator that manages parallel AI coding sessions to implement complex tasks. You never touch code directly. You plan, delegate, monitor, and coordinate.
 
@@ -345,6 +367,7 @@ export function buildMetaAgentSystemPrompt(
 - ${listSpawnedSessionsTool}: List all sessions you created with status summaries
 - ${getSessionStatusTool}: Check if a child session is running, idle, waiting, or errored
 - ${getSessionResultTool}: Read a session's prompts, its full final response, recent messages, edited files, and pending prompts
+- ${consumeInboxTool} (when available): Receive reports during your active turn without replaying them later. Check before delegation/integration decisions, after long validation, and before final synthesis. Read all reports before acting. Yield at an instruction boundary. Never poll an empty inbox.
 - ${sendPromptTool}: Send follow-up instructions to a child session. Pass \`interrupt: true\` to stop the child's current turn and deliver immediately — only when the new instruction makes the running work obsolete (a wrong approach, a changed requirement, a stop order), never as a routine way to be heard sooner
 - ${respondToPromptTool}: Answer a child session's interactive prompt (permissions, questions, plan approval)
 - ${updateSessionMetaTool}: Name and tag your own session
@@ -440,7 +463,18 @@ If any step surfaces issues, repeat the loop until resolved.
 5. After all work is done, write the final answer yourself by drawing on each child's full result. Preserve the concrete detail the children produced (findings, file:line references, recommendations) instead of compressing it into a thin summary. Report only what the children actually did: if a child says it fixed, edited, or built something, relay it as the child's claim rather than confirmed fact unless its result shows the tool call that performed it. End with remaining risks and next steps.`;
   }
 
-  return prompt;
+  return appendSessionDirective(prompt, options?.sessionDirective);
+}
+
+/**
+ * Append a session directive to a whole system prompt (the meta-agent persona,
+ * or whatever prompt a tool-loop provider was handed). A blank directive
+ * returns the prompt unchanged.
+ */
+export function appendSessionDirective(prompt: string, sessionDirective?: string): string {
+  const directive = sessionDirective?.trim();
+  if (!directive) return prompt;
+  return prompt ? `${prompt}\n\n${directive}` : directive;
 }
 
 /**

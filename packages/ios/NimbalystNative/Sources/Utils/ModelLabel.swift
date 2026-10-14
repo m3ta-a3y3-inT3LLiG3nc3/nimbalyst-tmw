@@ -36,14 +36,19 @@ public enum ModelLabel {
 
     /// Mirrors `CLAUDE_CODE_VARIANT_VERSIONS` in `modelConstants.ts`.
     private static let claudeCodeVariantVersions: [String: String] = [
-        "fable": "5",
-        "opus": "5",
-        "sonnet": "5",
-        "haiku": "4.5",
+        "fable": "5.1",
+        "fable-5": "5",
+        "opus": "5.5",
+        "opus-5-5": "5.5",
+        "opus-5": "5",
+        "sonnet": "5.5",
+        "sonnet-5": "5",
+        "haiku": "5.5",
         "opus-4-8": "4.8",
         "opus-4-7": "4.7",
         "opus-4-6": "4.6",
         "sonnet-4-6": "4.6",
+        "haiku-4-5": "4.5",
     ]
 
     private static func claudeCodeLabel(_ modelId: String?, providerFallback: String = "Claude Agent") -> String? {
@@ -52,7 +57,8 @@ public enum ModelLabel {
         guard let raw = modelId, !raw.isEmpty else { return providerFallback }
 
         // Strip "claude-code:" / "claude-code-cli:" (or similar) prefix.
-        let bare = raw.split(separator: ":", maxSplits: 1).last.map(String.init) ?? raw
+        let bare = (raw.split(separator: ":", maxSplits: 1).last.map(String.init) ?? raw)
+            .replacingOccurrences(of: "-(?:1m|200k)$", with: "", options: .regularExpression)
 
         // Family from substring — handles both canonical variants ("opus",
         // "sonnet-1m") and raw SDK IDs ("claude-opus-4-7").
@@ -83,12 +89,12 @@ public enum ModelLabel {
     /// use in `claudeCodeVariantVersions`. Keeps pinned variants ("opus-4-6")
     /// intact, but strips context-window suffixes ("-1m").
     private static func canonicalVariantKey(_ variant: String) -> String {
-        if claudeCodeVariantVersions[variant] != nil { return variant }
-        // Drop a leading "claude-" (raw SDK IDs like "claude-fable-5") and
-        // trailing "-1m" / "-200k" / other context suffixes.
-        let parts = variant.split(separator: "-").map(String.init).filter { $0 != "claude" }
-        if let first = parts.first { return first }
-        return variant
+        let key = variant
+            .replacingOccurrences(of: "^claude-", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "-(?:1m|200k|[0-9]{8})$", with: "", options: .regularExpression)
+        // Keep explicit major-only versions (claude-opus-5) pinned too.
+        if claudeCodeVariantVersions[key] != nil { return key }
+        return key.split(separator: "-").first.map(String.init) ?? key
     }
 
     /// Pulls a version token like "4.7" / "4.6" / "4.5" out of an ID shaped
@@ -113,7 +119,9 @@ public enum ModelLabel {
     /// Mirrors `CLAUDE_MODELS[*].shortName` in `modelConstants.ts`.
     private static let claudeApiShortNames: [String: String] = [
         "claude-fable-5": "Fable 5",
+        "claude-sonnet-5-5": "Sonnet 5.5",
         "claude-sonnet-5": "Sonnet 5",
+        "claude-haiku-5-5": "Haiku 5.5",
         "claude-opus-5": "Opus 5",
         "claude-opus-4-8": "Opus 4.8",
         "claude-opus-4-7": "Opus 4.7",
@@ -152,6 +160,9 @@ public enum ModelLabel {
     /// (e.g. "GPT-5.4" rather than just "5.4") so the badge reads cleanly
     /// without relying on a neighboring provider word.
     private static let openAIShortNames: [String: String] = [
+        "gpt-6.1-sol": "GPT-6.1 Sol",
+        "gpt-6-sol": "GPT-6 Sol",
+        "gpt-6-luna": "GPT-6 Luna",
         "gpt-5.6-sol": "GPT-5.6 Sol",
         "gpt-5.6-terra": "GPT-5.6 Terra",
         "gpt-5.6-luna": "GPT-5.6 Luna",

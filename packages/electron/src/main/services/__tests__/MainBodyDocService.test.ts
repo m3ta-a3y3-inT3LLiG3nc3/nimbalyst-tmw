@@ -18,6 +18,7 @@
  * the state where the body exists nowhere but the file about to be overwritten.
  */
 import { EventEmitter } from 'events';
+import * as Y from 'yjs';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const WORKSPACE = '/ws/A';
@@ -46,8 +47,13 @@ let rendererBehavior: 'applied' | 'refused' | 'silent';
 /** Markdown handed to the headless codec round trip, if it ran. */
 let headlessWrites: string[];
 let loggedErrors: string[];
+let liveDoc: Y.Doc;
+let exportedBody = '';
 
-vi.mock('ws', () => ({ default: class {} }));
+/** Configs every headless peer was built with, oldest first. */
+let providerConfigs: Array<Record<string, any>>;
+
+vi.mock('ws', () => ({ default: class { constructor(readonly url: string) {} } }));
 
 vi.mock('electron', () => ({ ipcMain }));
 
@@ -56,6 +62,7 @@ vi.mock('@nimbalyst/runtime/sync', () => ({
     private readonly config: Record<string, any>;
     constructor(config: Record<string, any>) {
       this.config = config;
+      providerConfigs.push(config);
     }
     async connect(): Promise<void> {
       if (providerConnects) this.config.onStatusChange?.('connected');
@@ -63,7 +70,7 @@ vi.mock('@nimbalyst/runtime/sync', () => ({
     isSynced(): boolean { return providerConnects; }
     async flushWithAck(): Promise<boolean> { return providerAcks; }
     hasUndecodedContent(): boolean { return false; }
-    getYDoc(): unknown { return {}; }
+    getYDoc(): unknown { return liveDoc; }
     destroy(): void { /* no-op */ }
   },
 }));
@@ -72,7 +79,7 @@ vi.mock('../CollabConversionClient', () => ({
   convertFromFileIntoDoc: vi.fn(async (_op: string, _type: string, _doc: unknown, source: string) => {
     headlessWrites.push(source);
   }),
-  convertExportToFile: vi.fn(async () => ''),
+  convertExportToFile: vi.fn(async () => exportedBody),
   convertRecoveryPlaintext: vi.fn(async () => ''),
 }));
 
@@ -146,6 +153,8 @@ async function runWrite(itemId = ITEM_ID): Promise<boolean> {
 }
 
 beforeEach(() => {
+  liveDoc = new Y.Doc();
+  exportedBody = '';
   vi.resetModules();
   vi.useFakeTimers();
   ipcMain.removeAllListeners();
@@ -153,6 +162,7 @@ beforeEach(() => {
   windowStates.clear();
   sentToRenderer = [];
   headlessWrites = [];
+  providerConfigs = [];
   loggedErrors = [];
   rendererBehavior = 'applied';
   rendererAcks = true;
@@ -161,7 +171,35 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  liveDoc.destroy();
   vi.useRealTimers();
+});
+
+describe('new tracker body initialization', () => {
+  it('requires acknowledgment and never replaces existing or deliberately cleared content', async () => {
+    const { initializeHeadlessBodyMarkdown } = await loadService();
+    const initialize = async (itemId: string) => {
+      const settled = initializeHeadlessBodyMarkdown(WORKSPACE, itemId, MARKDOWN).then(() => null, (error) => error);
+      await vi.advanceTimersByTimeAsync(1000);
+      const error = await settled;
+      if (error) throw error;
+    };
+    await initialize('fresh');
+    expect(headlessWrites).toEqual([MARKDOWN]);
+    exportedBody = 'newer edits';
+    await expect(initialize('changed')).rejects.toThrow('already has edits');
+    exportedBody = '';
+    liveDoc.getText('history').insert(0, 'deleted');
+    liveDoc.getText('history').delete(0, 7);
+    await expect(initialize('cleared')).rejects.toThrow('already has edits');
+    expect(headlessWrites).toEqual([MARKDOWN]);
+    exportedBody = MARKDOWN;
+    providerAcks = false;
+    await expect(initialize('lost-ack')).rejects.toThrow('not acknowledged');
+    providerAcks = true;
+    await initialize('lost-ack');
+    expect(headlessWrites).toEqual([MARKDOWN]);
+  });
 });
 
 describe('MainBodyDocService renderer-first body writes', () => {
@@ -300,5 +338,38 @@ describe('MainBodyDocService server acknowledgment', () => {
     windowStates.set(1, { workspacePath: WORKSPACE });
 
     expect(await runWrite('bug_renderer_legacy_shape')).toBe(false);
+  });
+});
+
+describe('MainBodyDocService E2E harness identity', () => {
+  it('opens body rooms on the harness worker with its team identity instead of team discovery', async () => {
+    const { setBodyRoomIdentityForTests, ensureHeadlessBodyRoom } = await loadService();
+    const { findTeamForWorkspace } = await import('../TeamService');
+    vi.mocked(findTeamForWorkspace).mockClear();
+    setBodyRoomIdentityForTests({
+      orgId: 'e2e-org',
+      serverUrl: 'ws://127.0.0.1:8797',
+      teamMemberId: 'e2e-user-a' as any,
+      getJwt: async () => 'bridge-jwt' as any,
+      urlExtraQuery: 'test_user_id=e2e-user-a&test_org_id=e2e-org',
+    });
+
+    const opened = ensureHeadlessBodyRoom(WORKSPACE, 'harness_item');
+    await vi.advanceTimersByTimeAsync(1000);
+    await opened;
+
+    expect(findTeamForWorkspace).not.toHaveBeenCalled();
+    const [config] = providerConfigs;
+    expect(config).toMatchObject({
+      orgId: 'e2e-org',
+      serverUrl: 'ws://127.0.0.1:8797',
+      teamMemberId: 'e2e-user-a',
+      documentId: 'tracker-content/harness_item',
+    });
+    expect(await config.getJwt()).toBe('bridge-jwt');
+    const socket = config.createWebSocket('ws://127.0.0.1:8797/sync/room?token=bridge-jwt');
+    expect(new URL(socket.url).searchParams.get('test_user_id')).toBe('e2e-user-a');
+    expect(new URL(socket.url).searchParams.get('test_org_id')).toBe('e2e-org');
+    expect(new URL(socket.url).searchParams.get('token')).toBe('bridge-jwt');
   });
 });

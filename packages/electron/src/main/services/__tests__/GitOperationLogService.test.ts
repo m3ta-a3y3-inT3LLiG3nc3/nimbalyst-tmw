@@ -2,6 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
+import { spawn } from "child_process";
+import { EventEmitter } from "events";
+import { PassThrough } from "stream";
+
+vi.mock("child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("child_process")>();
+  return { ...actual, spawn: vi.fn(actual.spawn) };
+});
 
 vi.mock("electron", () => ({
   app: { getPath: () => os.tmpdir() },
@@ -17,6 +25,7 @@ import {
   GitOperationLogService,
   runGitCommandStreaming,
 } from "../GitOperationLogService";
+import { describeGitConnectionFailure, describeSignalExit } from "../gitCommandFailure";
 
 let tmpRoot: string;
 let workspacePath: string;
@@ -372,5 +381,61 @@ describe("GitOperationLogService", () => {
       events.some((event) => event.startsWith("running:git version "))
     ).toBe(true);
     expect(events.at(-1)).toMatch(/^success:git version /);
+  });
+
+  it("names the signal when git dies before exiting, instead of blaming the hook", () => {
+    // The hook's stderr right up to the kill looks like a normal passing run.
+    const hookStderr = [
+      "[pre-push] typecheck:prepush: 86s (exit 0)",
+      "Error: Not implemented: navigation (except hash changes)",
+      "    at module.exports (jsdom/not-implemented.js:9:17)",
+      "[pre-push] test:prepush: 266s (exit 0)",
+    ].join("\n");
+
+    const message = describeSignalExit(["push", "origin", "main"], "SIGHUP", hookStderr);
+
+    expect(message).toMatch(/^git push was terminated by SIGHUP before it finished\./);
+    expect(message).not.toContain("another process signalled git");
+    // Context survives, stack-trace noise does not.
+    expect(message).toContain("[pre-push] test:prepush: 266s (exit 0)");
+    expect(message).not.toContain("    at module.exports");
+    expect(describeSignalExit(["fetch"], "SIGKILL", "")).not.toContain("Last output");
+
+    const disconnected = describeSignalExit(
+      ["push", "origin", "main"],
+      "SIGPIPE",
+      `${hookStderr}\nConnection to github.com closed by remote host.`,
+    );
+    expect(disconnected).toMatch(/^git push lost its SSH connection: Connection to github.com closed by remote host\./);
+    expect(disconnected).toContain("SIGPIPE");
+    expect(disconnected).not.toContain("Its hooks did not reject it");
+    expect(describeGitConnectionFailure(["push"], hookStderr)).toBeUndefined();
+    expect(describeGitConnectionFailure(["push"], "Connection to github.com closed by remote host.")).toMatch(/^git push lost its SSH connection/);
+  });
+
+  it("records SSH disconnects ahead of hook noise for exit codes and signals, without failing successful commands", async () => {
+    const service = new GitOperationLogService({ rootDir: tmpRoot });
+    for (const code of [255, null, 0]) {
+      vi.mocked(spawn).mockImplementationOnce(() => {
+        const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough() });
+        queueMicrotask(() => {
+          child.stdout.write("[pre-push] test:prepush: 273s (exit 0)\n");
+          child.stderr.write("[pre-push] Vitest run: fingerprint is stale.\nConnection to github.com closed by remote host.\r\n");
+          child.emit("close", code, code === null ? "SIGPIPE" : null);
+        });
+        return child as unknown as ReturnType<typeof spawn>;
+      });
+      const result = await runGitCommandStreaming(service, workspacePath, ["push", "origin", "main"]);
+      const entry = (await service.list(workspacePath)).at(-1)!;
+      expect(result.success).toBe(code === 0);
+      expect(entry.error).toBe(result.error);
+      if (code === 0) {
+        expect(result.error).toBeUndefined();
+      } else {
+        expect(result.error).toMatch(/^git push lost its SSH connection:/);
+        expect(entry.stderr).toContain("fingerprint is stale");
+        if (code === null) expect(result.error).toContain("SIGPIPE");
+      }
+    }
   });
 });

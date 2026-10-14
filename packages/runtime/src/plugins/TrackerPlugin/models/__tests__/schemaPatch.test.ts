@@ -5,13 +5,20 @@ import {
   diffTrackerSchema,
   parseTrackerSchemaPatchYAML,
   serializeTrackerSchemaPatchYAML,
+  resolveTrackerTypeInheritance,
   type TrackerSchemaPatch,
-} from '../schemaPatch';
+} from '@nimbalyst/tracker-schema';
 import {
   decodeTrackerSchemaPayload,
   encodeTrackerSchemaPatchPayload,
+  encodeTrackerSchemaModelPayload,
+  encodeTrackerPredicateRegistryPayload,
+  encodeTrackerLabelRegistryPayload,
+  TRACKER_LABEL_REGISTRY_SCHEMA_TYPE,
+  TRACKER_PREDICATE_REGISTRY_SCHEMA_TYPE,
 } from '../schemaSyncPayload';
-import type { TrackerDataModel } from '../TrackerDataModel';
+import type { LabelRegistry, PredicateDefinition } from '@nimbalyst/tracker-schema';
+import type { TrackerDataModel } from '@nimbalyst/tracker-schema';
 
 function featureSeed(): TrackerDataModel {
   return {
@@ -251,5 +258,137 @@ describe('diffTrackerSchema round-trips through resolve', () => {
     const patch = diffTrackerSchema(seed, featureSeed());
     const resolved = resolveTrackerSchemaPatch(seed, patch);
     expect(resolved).toEqual(seed);
+  });
+});
+
+// A derived type must not freeze at the sender's app version either: the
+// payload carries the declaration so the receiver resolves against its own
+// base. This is the model-payload counterpart of the builtin delta above.
+describe('derived type wire payload', () => {
+  const declared = {
+    type: 'product',
+    extends: 'feature',
+    fields: [{ name: 'license', type: 'string' as const }],
+  };
+
+  it('stays a readable full model for a client that knows nothing about extends', () => {
+    const sender = featureSeed();
+    const resolvedBySender = resolveTrackerTypeInheritance(declared, () => sender).model!;
+    const payload = encodeTrackerSchemaModelPayload(resolvedBySender, declared);
+
+    const asPlainModel = JSON.parse(payload) as TrackerDataModel;
+    expect(asPlainModel.type).toBe('product');
+    expect(asPlainModel.fields.map(f => f.name)).toContain('title');
+    expect(asPlainModel.fields.map(f => f.name)).toContain('license');
+  });
+
+  it('lets the receiver re-resolve against its own base, picking up a field the sender never had', () => {
+    const senderBase = featureSeed();
+    const payload = encodeTrackerSchemaModelPayload(
+      resolveTrackerTypeInheritance(declared, () => senderBase).model!,
+      declared,
+    );
+
+    const decoded = decodeTrackerSchemaPayload('product', payload);
+    expect(decoded?.kind).toBe('model');
+    expect((decoded as { declared?: unknown }).declared).toEqual(declared);
+    // The sidecar never leaks into the resolved model the mirror stores.
+    expect(decoded && 'declaredForm' in (decoded as { model: object }).model).toBe(false);
+
+    const receiverBase: TrackerDataModel = {
+      ...featureSeed(),
+      fields: [...featureSeed().fields, { name: 'reviewState', type: 'select' }],
+    };
+    const reResolved = resolveTrackerTypeInheritance(
+      (decoded as { declared: Parameters<typeof resolveTrackerTypeInheritance>[0] }).declared,
+      () => receiverBase,
+    ).model;
+
+    expect(reResolved?.fields.map(f => f.name)).toContain('reviewState');
+  });
+
+  it('emits byte-identical JSON for a plain model with no declaration', () => {
+    const model = featureSeed();
+    expect(encodeTrackerSchemaModelPayload(model)).toBe(JSON.stringify(model));
+  });
+});
+
+describe('predicate registry payload (knowledge-scopes 4.1)', () => {
+  const predicates: PredicateDefinition[] = [{
+    id: 'integrates-with',
+    label: 'integrates with',
+    subjectKinds: ['product'],
+    valueShape: 'entity',
+    direction: 'directed',
+  }];
+
+  it('round-trips under the reserved schema type', () => {
+    const decoded = decodeTrackerSchemaPayload(
+      TRACKER_PREDICATE_REGISTRY_SCHEMA_TYPE,
+      encodeTrackerPredicateRegistryPayload(predicates),
+    );
+    expect(decoded).toEqual({ kind: 'predicates', predicates });
+  });
+
+  it('refuses a registry arriving as some tracker type, which would lose that type', () => {
+    expect(decodeTrackerSchemaPayload('product', encodeTrackerPredicateRegistryPayload(predicates)))
+      .toBeNull();
+  });
+
+  it('drops an invalid registry rather than handing out a partial one', () => {
+    const malformed = JSON.stringify({
+      payloadKind: 'trackerPredicateRegistry',
+      version: 1,
+      predicates: [{ ...predicates[0], valueShape: 'nonsense' }],
+    });
+    expect(decodeTrackerSchemaPayload(TRACKER_PREDICATE_REGISTRY_SCHEMA_TYPE, malformed)).toBeNull();
+  });
+
+  it('is dropped by the model/patch rules a client predating it applies', () => {
+    const parsed = JSON.parse(encodeTrackerPredicateRegistryPayload(predicates));
+    // The two shapes an older client recognizes: a patch discriminator, or a
+    // top-level `type` plus `fields[]`. This payload is neither, so that client
+    // never acquires a broken tracker type named after the reserved key.
+    expect(parsed.payloadKind).not.toBe('trackerSchemaPatch');
+    expect(parsed.type).toBeUndefined();
+    expect(parsed.fields).toBeUndefined();
+  });
+});
+
+describe('label registry payload', () => {
+  const registry: LabelRegistry = {
+    labels: [
+      { id: 'capability', label: 'Capability', properties: ['owner'] },
+      { id: 'feature', label: 'Feature', broader: ['capability'], properties: ['surface', 'implemented-in'] },
+    ],
+    properties: [
+      { id: 'owner', label: 'Owner', type: 'string' },
+      { id: 'surface', label: 'Surface', type: 'select', options: ['desktop', 'web'] },
+    ],
+    // A predicate that has not arrived on its own row yet must not drop this one.
+    claimProperties: { 'implemented-in': { range: ['feature'] } },
+  };
+
+  it('round-trips under the reserved schema type and nowhere else', () => {
+    const json = encodeTrackerLabelRegistryPayload(registry);
+    expect(decodeTrackerSchemaPayload(TRACKER_LABEL_REGISTRY_SCHEMA_TYPE, json)).toEqual({ kind: 'labels', registry });
+    expect(decodeTrackerSchemaPayload('entity', json)).toBeNull();
+    expect(decodeTrackerSchemaPayload(TRACKER_PREDICATE_REGISTRY_SCHEMA_TYPE, json)).toBeNull();
+  });
+
+  it('keeps a registry with a newer key and drops one with a broader cycle', () => {
+    const newer = { ...registry, labels: [{ ...registry.labels[0], futureKey: 1 }, registry.labels[1]] };
+    expect(decodeTrackerSchemaPayload(TRACKER_LABEL_REGISTRY_SCHEMA_TYPE, encodeTrackerLabelRegistryPayload(newer as LabelRegistry)))
+      .not.toBeNull();
+    const cyclic = { ...registry, labels: [{ ...registry.labels[0], broader: ['feature'] }, registry.labels[1]] };
+    expect(decodeTrackerSchemaPayload(TRACKER_LABEL_REGISTRY_SCHEMA_TYPE, encodeTrackerLabelRegistryPayload(cyclic))).toBeNull();
+  });
+
+  it('is dropped by the model/patch rules a client predating it applies', () => {
+    const parsed = JSON.parse(encodeTrackerLabelRegistryPayload(registry));
+    expect(parsed.payloadKind).not.toBe('trackerSchemaPatch');
+    expect(parsed.payloadKind).not.toBe('trackerPredicateRegistry');
+    expect(parsed.type).toBeUndefined();
+    expect(parsed.fields).toBeUndefined();
   });
 });

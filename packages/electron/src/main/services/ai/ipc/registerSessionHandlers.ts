@@ -1,9 +1,11 @@
+import { warnIfUnpublished } from '@nimbalyst/runtime/sync/pushOutcome';
 import { TrayManager } from '../../../tray/TrayManager';
 import { safeHandle } from '../../../utils/ipcRegistry';
 import { logger } from '../../../utils/logger';
 import { getDefaultEffortLevel, getDefaultThinkingMode } from '../../../utils/store';
 import { FEATURES, FeatureUsageService } from '../../FeatureUsageService.ts';
 import { getSyncProvider } from '../../SyncManager';
+import { getPendingSubmissionStore } from '../../RepositoryManager';
 import { trackCreateAiSession } from '../../analytics/sessionLaunchAnalytics';
 import { captureTutorialMilestone } from '../../tutorial/tutorialAnalytics';
 import { bucketAgeInDays, bucketCount, extractModelForProvider } from '.././aiServiceUtils';
@@ -15,6 +17,8 @@ import { ModelRegistry, ProviderFactory } from '@nimbalyst/runtime/ai/server';
 import { resolveEffortLevel, resolveThinkingMode } from '@nimbalyst/runtime/ai/server/effortLevels';
 import { type AIProviderType, type DocumentContext, type Message, type SessionType } from '@nimbalyst/runtime/ai/server/types';
 import * as fs from 'fs';
+import { remoteSessions } from '../remoteSessions';
+import { registerRemoteSessionHandlers } from './registerRemoteSessionHandlers';
 
 /**
  * Session CRUD and the send-message entry point.
@@ -23,6 +27,7 @@ import * as fs from 'fs';
  * assigns from the streaming handler before the registrars run.
  */
 export function registerSessionHandlers(ctx: AIServiceContext): void {
+  registerRemoteSessionHandlers();
   // Create new session with provider and model selection
   safeHandle('ai:createSession', async (
     event,
@@ -236,8 +241,7 @@ export function registerSessionHandlers(ctx: AIServiceContext): void {
     // Add LMStudio-specific config
     if (provider === 'lmstudio') {
       const lmstudioSettings = ctx.getSettingsStore().get('providerSettings.lmstudio', {}) as any;
-      const storedApiKeys = ctx.getSettingsStore().get('apiKeys', {}) as Record<string, string>;
-      initConfig.baseUrl = lmstudioSettings.baseUrl || storedApiKeys['lmstudio_url'] || 'http://127.0.0.1:8234';
+      initConfig.baseUrl = lmstudioSettings.baseUrl || ctx.getSettingsStore().get('apiKeys.lmstudio_url', '') || 'http://127.0.0.1:8234';
     }
 
     // Pass through allowedTools and effort level settings for Claude Code
@@ -289,7 +293,30 @@ export function registerSessionHandlers(ctx: AIServiceContext): void {
     return session;
   });
 
-  safeHandle('ai:sendMessage', ctx.sendMessageHandler);
+  // Records a composer prompt durably before the renderer clears its draft.
+  // Throws on failure so the renderer keeps the text instead of losing it.
+  safeHandle('ai:recordPendingSubmission', async (_event, sessionId: string, prompt: string) => {
+    if (!sessionId) throw new Error('ai:recordPendingSubmission requires a sessionId');
+    const pending = await getPendingSubmissionStore().record(sessionId, prompt);
+    return { submissionId: pending.id };
+  });
+
+  safeHandle('ai:sendMessage', async (...args: Parameters<NonNullable<typeof ctx.sendMessageHandler>>) => {
+    if (args[3]) await remoteSessions.assertLocalExecution(args[3]);
+    const sessionId = args[3];
+    const submissionId = (args[2] as { submissionId?: unknown } | undefined)?.submissionId;
+    try {
+      return await ctx.sendMessageHandler!(...args);
+    } finally {
+      // The turn is over, delivered or failed. A failure before delivery
+      // reaches the renderer as a rejection, and the renderer restores the text.
+      if (sessionId && typeof submissionId === 'string') {
+        await getPendingSubmissionStore().clear(sessionId, submissionId).catch(error => {
+          logger.main.error(`[AIService] Failed to clear pending submission ${submissionId} for ${sessionId}:`, error);
+        });
+      }
+    }
+  });
 
   // Get session history (full session data with messages - slow)
   safeHandle('ai:getSessions', async (event, workspacePath?: string) => {
@@ -298,7 +325,8 @@ export function registerSessionHandlers(ctx: AIServiceContext): void {
 
   // Get session list (lightweight - just metadata, no messages)
   safeHandle('ai:getSessionList', async (event, workspacePath?: string) => {
-    return await ctx.sessionManager.getSessionList(workspacePath);
+    const local = await ctx.sessionManager.getSessionList(workspacePath);
+    return workspacePath ? remoteSessions.list(workspacePath, local) : local;
   });
 
   // Load a session
@@ -308,6 +336,10 @@ export function registerSessionHandlers(ctx: AIServiceContext): void {
   // to avoid queuing redundant heavy DB queries in PGLite's single-threaded worker
   const loadSessionInFlight = new Map<string, Promise<any>>();
   safeHandle('ai:loadSession', async (event, sessionId: string, workspacePath?: string, trackAsResume?: boolean) => {
+    if (workspacePath && remoteSessions.isRemote(sessionId)) {
+      const remote = await remoteSessions.get(sessionId, workspacePath);
+      if (remote) return remote;
+    }
     const existing = loadSessionInFlight.get(sessionId);
     if (existing && !trackAsResume) {
       return existing;
@@ -315,7 +347,8 @@ export function registerSessionHandlers(ctx: AIServiceContext): void {
 
     const loadPromise = (async () => {
     const loadStart = performance.now();
-    const session = await ctx.sessionManager.loadSession(sessionId, workspacePath);
+    const session = await ctx.sessionManager.loadSession(sessionId, workspacePath)
+      ?? (workspacePath ? await remoteSessions.get(sessionId, workspacePath) : null);
     const loadTime = performance.now() - loadStart;
     if (!session) {
       console.log(`[SESSION] Session not found: ${sessionId} (this is normal if the session was deleted)`);
@@ -421,12 +454,17 @@ export function registerSessionHandlers(ctx: AIServiceContext): void {
     // and should not cause the session to resort to the top of the list on other devices.
     const syncProvider = getSyncProvider();
     if (metadata.metadata?.lastReadAt && syncProvider) {
-      syncProvider.pushChange(sessionId, {
-        type: 'metadata_updated',
-        metadata: {
-          lastReadAt: metadata.metadata.lastReadAt,
-        },
-      });
+      try {
+        const outcome = await syncProvider.pushChange(sessionId, {
+          type: 'metadata_updated',
+          metadata: {
+            lastReadAt: metadata.metadata.lastReadAt,
+          },
+        });
+        warnIfUnpublished(message => logger.main.warn(message), sessionId, '[AIService] Failed to publish sync change', outcome);
+      } catch (error) {
+        logger.main.warn(`[AIService] Failed to publish sync change for session ${sessionId}:`, error);
+      }
     }
 
     return { success: true };

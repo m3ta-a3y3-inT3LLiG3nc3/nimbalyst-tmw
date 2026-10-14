@@ -38,6 +38,29 @@ enum SessionLoadError {
             return "Transcript did not load within 15s. Local messages: \(msgCount), WebView ready: \(wvReady), Transcript ready: \(trReady)"
         }
     }
+
+    /// Properties for `mobile_session_load_error`. Counts and flags only: the
+    /// detail strings can carry session ids and server error text.
+    func analyticsProperties(localMessageCount: Int) -> [String: Any] {
+        var props: [String: Any] = ["localMessageCount": localMessageCount]
+        switch self {
+        case .decryptionFailed(let decrypted, let total):
+            props["errorType"] = "decryptionFailed"
+            props["decryptedCount"] = decrypted
+            props["serverMessageCount"] = total
+        case .syncFailed:
+            props["errorType"] = "syncFailed"
+        case .webViewFailed:
+            props["errorType"] = "webViewFailed"
+        case .noMessages:
+            props["errorType"] = "noMessages"
+        case .timeout(_, let wvReady, let trReady):
+            props["errorType"] = "timeout"
+            props["webViewReady"] = wvReady
+            props["transcriptReady"] = trReady
+        }
+        return props
+    }
 }
 
 /// Session detail view with an embedded web transcript and native compose bar.
@@ -77,28 +100,18 @@ public struct SessionDetailView: View {
     /// Whether the current session room has returned its initial sync response.
     @State private var hasCompletedInitialSessionSync = false
 
-    /// Compose bar state.
-    @State private var composeText = ""
+    @StateObject private var composeState: SessionComposeState
     /// Debounce work item for pushing draft input changes to sync.
     @State private var draftDebounceItem: DispatchWorkItem?
-    /// Whether we are currently applying a synced draft (suppress push-back).
-    @State private var isApplyingRemoteDraft = false
-    /// Epoch ms of last local submit -- used to reject stale remote drafts.
-    @State private var lastSubmitAt: Int = 0
-    /// Epoch ms of last local keystroke -- used to reject stale sync echoes.
-    /// Mirrors desktop's sessionDraftLocalModifiedAtAtom pattern.
-    @State private var lastLocalEditAt: Int = 0
     /// Whether the compose TextField currently has keyboard focus. While true,
-    /// we never overwrite `composeText` from sync -- mutating the binding under
+    /// we never overwrite `composeState.text` from sync -- mutating the binding under
     /// an active TextField reorders characters via IME/autocorrect/dictation
     /// candidate buffers (the "jumbled while typing fast" bug).
     @FocusState private var composeFocused: Bool
     /// Error message shown when prompt send fails.
     @State private var sendError: String?
-    /// Warning shown when prompt was sent but desktop hasn't picked it up.
-    @State private var deliveryWarning: String?
-    /// Timer that fires if desktop doesn't start executing after a prompt send.
-    @State private var deliveryTimeoutItem: DispatchWorkItem?
+    /// Tracks desktop activity after sending, including turns that finish quickly.
+    @StateObject private var delivery = PromptDeliveryTracker()
 
     /// Queued prompts for this session (from GRDB observation).
     @State private var queuedPrompts: [QueuedPrompt] = []
@@ -106,6 +119,7 @@ public struct SessionDetailView: View {
 
     /// Slash commands synced from desktop for this project.
     @State private var projectCommands: [SyncedSlashCommand] = []
+    @State private var projectActions: [SyncedActionPrompt] = []
     @State private var projectCancellable: AnyDatabaseCancellable?
 
     /// Controller for transcript web view actions (scroll, prompts).
@@ -113,11 +127,8 @@ public struct SessionDetailView: View {
     @StateObject private var transcriptController = TranscriptController()
     #endif
 
-    /// Cached prompt list for the jump-to-prompt sheet.
+    /// Cached prompt list shown in the title menu.
     @State private var promptList: [PromptEntry] = []
-
-    /// Whether the jump-to-prompt sheet is presented.
-    @State private var showPromptPicker = false
 
     /// Whether the transcript web view has loaded and rendered its first data.
     @State private var isTranscriptReady = false
@@ -146,15 +157,13 @@ public struct SessionDetailView: View {
         liveSession ?? session
     }
 
-    public init(session: Session) {
+    public init(session: Session, composeState: SessionComposeState? = nil) {
         self.session = session
+        _composeState = StateObject(wrappedValue: composeState ?? SessionComposeState())
     }
 
     public var body: some View {
         VStack(spacing: 0) {
-            // Status bar
-            statusBar
-
             // Web transcript (iOS) or native fallback (macOS)
             #if canImport(UIKit)
             ZStack {
@@ -168,12 +177,13 @@ public struct SessionDetailView: View {
                     onReady: {
                         isWebViewReady = true
                         tryRevealTranscript()
+                        // Messages that landed before the web view was ready
+                        // produced an empty list; fetch it again now.
+                        refreshPromptList()
                     },
                     onError: { errorMessage in
                         if loadError == nil {
-                            withAnimation {
-                                loadError = .webViewFailed(errorMessage)
-                            }
+                            showLoadError(.webViewFailed(errorMessage))
                         }
                     },
                     onOpenFile: { filePath in
@@ -198,6 +208,8 @@ public struct SessionDetailView: View {
                     }
                 }
             }
+            // The web view stops at the landscape safe area; match its background there.
+            .background(NimbalystColors.backgroundSecondary.ignoresSafeArea(edges: .horizontal))
             #else
             nativeMessageList
             #endif
@@ -209,48 +221,62 @@ public struct SessionDetailView: View {
 
             // Compose bar
             //
-            // The text binding stamps `lastLocalEditAt` synchronously inside
-            // its setter rather than waiting for `onChange(of: composeText)`
+            // The text binding stamps `composeState.lastLocalEditAt` synchronously inside
+            // its setter rather than waiting for `onChange(of: composeState.text)`
             // to fire. SwiftUI fires onChange handlers in declaration order
             // within a single render pass, so a GRDB self-echo arriving in
             // the same pass as a keystroke could otherwise see a stale
-            // `lastLocalEditAt`, fail the rejection guard below, and
+            // `composeState.lastLocalEditAt`, fail the rejection guard below, and
             // overwrite the just-typed character.
             ComposeBar(
                 text: Binding(
-                    get: { composeText },
+                    get: { composeState.text },
                     set: { newValue in
-                        composeText = newValue
-                        lastLocalEditAt = Int(Date().timeIntervalSince1970 * 1000)
+                        composeState.text = newValue
+                        composeState.lastLocalEditAt = Int(Date().timeIntervalSince1970 * 1000)
                     }
                 ),
+                pendingAttachments: $composeState.attachments,
                 isExecuting: displaySession.isExecuting,
                 commands: projectCommands,
+                actions: projectActions,
                 onSend: sendPrompt,
                 onCancel: cancelSession,
                 onQueue: { text, attachments in sendPrompt(text, attachments) },
+                onLaunchAction: launchActionInNewSession,
                 focused: $composeFocused
             )
         }
         .navigationTitle(displaySession.titleDecrypted ?? "Session")
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarTitleMenu {
-            Button {
-                transcriptController.scrollToTop()
-            } label: {
-                Label("Scroll to Top", systemImage: "arrow.up")
-            }
-        }
         #endif
         .toolbar {
-            #if os(iOS)
-            if let voice = appState.voiceAgent, voice.state != .disconnected {
-                ToolbarItem(placement: .principal) {
-                    VoiceStatusPill(state: voice.state)
+            // A custom title button: the system title menu has a fixed narrow
+            // width that wraps every prompt onto several lines.
+            ToolbarItem(placement: .principal) {
+                HStack(spacing: 8) {
+                    #if canImport(UIKit)
+                    SessionTitleButton(
+                        title: displaySession.titleDecrypted ?? "Session",
+                        subtitle: SessionStatusIndicator.subtitle(for: displaySession),
+                        prompts: promptList,
+                        onOpen: refreshPromptList,
+                        onScrollToTop: { transcriptController.scrollToTop() },
+                        onSelectPrompt: { transcriptController.scrollToMessage(messageId: $0.id) }
+                    )
+                    #else
+                    Text(displaySession.titleDecrypted ?? "Session").font(.headline)
+                    #endif
+                    #if os(iOS)
+                    if let voice = appState.voiceAgent, voice.state != .disconnected {
+                        VoiceStatusPill(state: voice.state)
+                    }
+                    #endif
                 }
             }
-            #endif
+            // One item only: a second primary-action item overflows in portrait,
+            // and iOS hides both behind its own "more" button.
             ToolbarItem(placement: .primaryAction) {
                 sessionMenu
             }
@@ -267,17 +293,15 @@ public struct SessionDetailView: View {
             subscribeToDiagnostics()
             startObservingQueuedPrompts()
             // Seed compose text from synced draft if local compose is empty
-            if composeText.isEmpty, let draft = session.draftInput, !draft.isEmpty {
-                isApplyingRemoteDraft = true
-                composeText = draft
-                DispatchQueue.main.async { isApplyingRemoteDraft = false }
+            if composeState.text.isEmpty {
+                composeState.applyRemoteDraft(session.draftInput, updatedAt: session.draftUpdatedAt)
             }
             // Mark session as read when viewing it
             appState.syncManager?.markSessionRead(sessionId: session.id)
             AnalyticsManager.shared.capture("mobile_session_viewed")
         }
         .onChange(of: liveSession?.draftInput) { _, _ in
-            // While the user is actively typing, never overwrite composeText from
+            // While the user is actively typing, never overwrite composeState.text from
             // sync. Externally mutating the TextField binding while it is focused
             // reorders characters via IME/autocorrect/dictation candidate buffers
             // (the "jumbled while typing fast" bug). Pending remote drafts will be
@@ -305,19 +329,21 @@ public struct SessionDetailView: View {
             swapSession(fromOldId: oldId)
             previousSessionId = session.id
         }
-        .onChange(of: composeText) { _, newText in
+        .onChange(of: composeState.text) { _, newText in
             // Push draft changes back to sync (debounced).
-            // `lastLocalEditAt` is stamped synchronously by the TextField's
+            // `composeState.lastLocalEditAt` is stamped synchronously by the TextField's
             // binding setter above, not here, to avoid a render-order race
             // where a self-echo could otherwise overwrite a just-typed
             // character.
-            guard !isApplyingRemoteDraft else { return }
+            guard !composeState.isApplyingRemoteDraft else { return }
             draftDebounceItem?.cancel()
-            let item = DispatchWorkItem {
-                appState.syncManager?.updateDraftInput(
-                    sessionId: session.id,
+            let sessionId = session.id
+            let item = DispatchWorkItem { [weak sync = appState.syncManager] in
+                sync?.updateDraftInput(
+                    sessionId: sessionId,
                     draftInput: newText
                 )
+                draftDebounceItem = nil
             }
             draftDebounceItem = item
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: item)
@@ -327,13 +353,18 @@ public struct SessionDetailView: View {
             appState.syncManager?.joinSessionRoom(sessionId: session.id)
         }
         .onDisappear {
+            delivery.cancel()
             sessionCancellable?.cancel()
             messagesCancellable?.cancel()
             projectCancellable?.cancel()
             queuedPromptsCancellable?.cancel()
             timeoutWorkItem?.cancel()
             promptRefreshWorkItem?.cancel()
-            draftDebounceItem?.cancel()
+            // Commit a queued local draft before a column remount cancels its debounce.
+            let pendingDraft = draftDebounceItem
+            pendingDraft?.perform()
+            pendingDraft?.cancel()
+            draftDebounceItem = nil
             // Remove only THIS session's diagnostic handler. The incoming
             // view may have already registered its own; a blanket
             // `onSessionSyncDiagnostic = nil` would drop its registration and
@@ -345,27 +376,6 @@ public struct SessionDetailView: View {
             // socket and leave it stuck forever.
             appState.syncManager?.leaveSessionRoom(expectedSessionId: session.id)
         }
-        #if canImport(UIKit)
-        .sheet(isPresented: $showPromptPicker) {
-            NavigationStack {
-                PromptPickerList(
-                    promptList: promptList,
-                    onSelect: { prompt in
-                        showPromptPicker = false
-                        transcriptController.scrollToMessage(messageId: prompt.id)
-                    }
-                )
-                .navigationTitle("Jump to Prompt")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("Cancel") { showPromptPicker = false }
-                    }
-                }
-            }
-            .presentationDetents([.medium, .large])
-        }
-        #endif
         #if canImport(UIKit)
         .modifier(FileSheetModifier(
             document: $fileSheetDocument,
@@ -382,20 +392,12 @@ public struct SessionDetailView: View {
             Text(sendError ?? "")
         }
         .alert("Delivery Warning", isPresented: Binding(
-            get: { deliveryWarning != nil },
-            set: { if !$0 { deliveryWarning = nil } }
+            get: { delivery.warning != nil },
+            set: { if !$0 { delivery.warning = nil } }
         )) {
-            Button("OK") { deliveryWarning = nil }
+            Button("OK") { delivery.warning = nil }
         } message: {
-            Text(deliveryWarning ?? "")
-        }
-        .onChange(of: liveSession?.isExecuting) { _, isExec in
-            // Desktop picked up the prompt - cancel the delivery timeout
-            if isExec == true {
-                deliveryTimeoutItem?.cancel()
-                deliveryTimeoutItem = nil
-                deliveryWarning = nil
-            }
+            Text(delivery.warning ?? "")
         }
         .onChange(of: messages.count) { _, _ in
             // Re-check reveal: messages may have arrived after onReady fired
@@ -442,34 +444,12 @@ public struct SessionDetailView: View {
             && (!messages.isEmpty || serverConfirmedNoMessages || !hasExpectedTranscriptMessages)
     }
 
-    /// Apply the most recent synced draft to composeText if it represents
+    /// Apply the most recent synced draft to composeState.text if it represents
     /// genuinely newer text than what we have locally. Callers MUST ensure the
     /// TextField is not currently focused before calling this -- mutating the
     /// binding under an active TextField scrambles the user's input.
     private func applyRemoteDraftIfNewer() {
-        let draft = liveSession?.draftInput ?? ""
-        guard draft != composeText else { return }
-        // Defense-in-depth: if the local compose already contains the incoming
-        // draft as a prefix, the user is ahead of the remote (almost always a
-        // self-echo arriving after they kept typing). Don't ever overwrite
-        // their input with a shorter prefix.
-        if !draft.isEmpty && composeText.hasPrefix(draft) && composeText.count > draft.count {
-            return
-        }
-        // Reject stale drafts: if the remote draftUpdatedAt is older than our
-        // last submit, this is an echo of the pre-submit draft -- ignore it.
-        if let remoteTs = liveSession?.draftUpdatedAt, !draft.isEmpty, remoteTs <= lastSubmitAt {
-            return
-        }
-        // Reject sync echoes older than our local typing. Only accept remote
-        // drafts that are genuinely newer (e.g., typed on desktop after we
-        // stopped typing here). Mirrors desktop's sessionDraftLocalModifiedAtAtom.
-        if let remoteTs = liveSession?.draftUpdatedAt, lastLocalEditAt > 0, remoteTs <= lastLocalEditAt {
-            return
-        }
-        isApplyingRemoteDraft = true
-        composeText = draft
-        DispatchQueue.main.async { isApplyingRemoteDraft = false }
+        composeState.applyRemoteDraft(liveSession?.draftInput, updatedAt: liveSession?.draftUpdatedAt)
     }
 
     /// Re-check whether the transcript overlay can be dismissed.
@@ -484,61 +464,10 @@ public struct SessionDetailView: View {
         timeoutWorkItem?.cancel()
     }
 
-    private var hasStatusInfo: Bool {
-        displaySession.isExecuting || displaySession.hasQueuedPrompts || displaySession.contextUsagePercent != nil
-    }
-
-    @ViewBuilder
-    private var statusBar: some View {
-        if hasStatusInfo {
-            HStack(spacing: 12) {
-                if displaySession.hasQueuedPrompts {
-                    HStack(spacing: 6) {
-                        Image(systemName: "clock.fill")
-                            .foregroundStyle(NimbalystColors.warning)
-                            .font(.caption)
-                        Text("Waiting for response")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                } else if displaySession.isExecuting {
-                    HStack(spacing: 6) {
-                        ProgressView()
-                            .controlSize(.small)
-                            .tint(NimbalystColors.primary)
-                        Text("Executing...")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                Spacer()
-
-                if let pct = displaySession.contextUsagePercent {
-                    ContextUsageBar(percent: pct)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(.ultraThinMaterial)
-        }
-    }
-
     // MARK: - Session Menu
 
     private var sessionMenu: some View {
         Menu {
-            #if canImport(UIKit)
-            // Jump to prompt sheet trigger
-            if !promptList.isEmpty {
-                Button {
-                    showPromptPicker = true
-                } label: {
-                    Label("Jump to Prompt", systemImage: "text.line.first.and.arrowtriangle.forward")
-                }
-            }
-            #endif
-
             #if os(iOS)
             if let voice = appState.voiceAgent {
                 Button {
@@ -565,7 +494,12 @@ public struct SessionDetailView: View {
                 }
             }
         } label: {
-            Image(systemName: "ellipsis.circle")
+            HStack(spacing: 8) {
+                if SessionStatusIndicator.isVisible(for: displaySession) {
+                    SessionStatusIndicator(session: displaySession)
+                }
+                Image(systemName: "ellipsis.circle")
+            }
         }
     }
 
@@ -714,8 +648,7 @@ public struct SessionDetailView: View {
         // Cancel any pending per-session debounces/timers.
         draftDebounceItem?.cancel()
         draftDebounceItem = nil
-        deliveryTimeoutItem?.cancel()
-        deliveryTimeoutItem = nil
+        delivery.cancel()
         promptRefreshWorkItem?.cancel()
         promptRefreshWorkItem = nil
 
@@ -725,13 +658,12 @@ public struct SessionDetailView: View {
         messages = []
         queuedPrompts = []
         promptList = []
-        composeText = ""
+        composeState.text = ""
         composeFocused = false
-        isApplyingRemoteDraft = false
-        lastLocalEditAt = 0
-        lastSubmitAt = 0
+        composeState.isApplyingRemoteDraft = false
+        composeState.lastLocalEditAt = 0
+        composeState.lastSubmitAt = 0
         sendError = nil
-        deliveryWarning = nil
         fileSheetDocument = nil
         fileNotAvailableToast = nil
 
@@ -746,9 +678,9 @@ public struct SessionDetailView: View {
 
         // Seed compose from the new session's draft.
         if let draft = session.draftInput, !draft.isEmpty {
-            isApplyingRemoteDraft = true
-            composeText = draft
-            DispatchQueue.main.async { isApplyingRemoteDraft = false }
+            composeState.isApplyingRemoteDraft = true
+            composeState.text = draft
+            DispatchQueue.main.async { composeState.isApplyingRemoteDraft = false }
         }
 
         AnalyticsManager.shared.capture("mobile_session_viewed")
@@ -765,13 +697,11 @@ public struct SessionDetailView: View {
             // which is exactly the failure case we want to surface. If we've
             // been stuck 15s waiting on the sync response, the user needs to
             // see an error and a retry option, not an infinite spinner.
-            withAnimation {
-                loadError = .timeout(
-                    messageCount: messages.count,
-                    webViewReady: isWebViewReady,
-                    isTranscriptReady: isTranscriptReady
-                )
-            }
+            showLoadError(.timeout(
+                messageCount: messages.count,
+                webViewReady: isWebViewReady,
+                isTranscriptReady: isTranscriptReady
+            ))
         }
         timeoutWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: item)
@@ -797,19 +727,26 @@ public struct SessionDetailView: View {
 
             if let error = diagnostic.error {
                 if diagnostic.decryptedCount == 0 && diagnostic.totalServerMessages > 0 {
-                    withAnimation {
-                        loadError = .decryptionFailed(
-                            decryptedCount: diagnostic.decryptedCount,
-                            totalCount: diagnostic.totalServerMessages
-                        )
-                    }
+                    showLoadError(.decryptionFailed(
+                        decryptedCount: diagnostic.decryptedCount,
+                        totalCount: diagnostic.totalServerMessages
+                    ))
                 } else {
-                    withAnimation {
-                        loadError = .syncFailed(error)
-                    }
+                    showLoadError(.syncFailed(error))
                 }
             }
         }
+    }
+
+    private func showLoadError(_ error: SessionLoadError) {
+        withAnimation {
+            loadError = error
+        }
+        DiagnosticsLog.shared.record(area: "sessionDetail", summary: error.title, detail: error.description)
+        AnalyticsManager.shared.capture(
+            "mobile_session_load_error",
+            properties: error.analyticsProperties(localMessageCount: messages.count)
+        )
     }
 
     // MARK: - Retry
@@ -882,6 +819,7 @@ public struct SessionDetailView: View {
             },
             onChange: { updatedSession in
                 liveSession = updatedSession
+                delivery.observeExecution(sessionId: sessionId, isExecuting: updatedSession?.isExecuting == true)
             }
         )
 
@@ -900,10 +838,13 @@ public struct SessionDetailView: View {
             onChange: { newMessages in
                 hasObservedInitialMessages = true
                 messages = newMessages
+                delivery.observeMessages(newMessages)
             }
         )
 
-        // Observe project commands (for slash command typeahead)
+        // Observe project commands (slash command typeahead) and action prompts
+        // (the Actions picker). Both ride the same project config blob, so one
+        // observation feeds both.
         let projectId = session.projectId
         let projectObservation = ValueObservation.tracking { db in
             try Project.fetchOne(db, id: projectId)
@@ -915,6 +856,7 @@ public struct SessionDetailView: View {
             },
             onChange: { project in
                 projectCommands = project?.commands ?? []
+                projectActions = project?.actions ?? []
             }
         )
     }
@@ -953,31 +895,25 @@ public struct SessionDetailView: View {
         // Record submit timestamp so we can reject any remote draft older than this.
         draftDebounceItem?.cancel()
         draftDebounceItem = nil
-        lastSubmitAt = Int(Date().timeIntervalSince1970 * 1000)
+        composeState.lastSubmitAt = Int(Date().timeIntervalSince1970 * 1000)
         syncManager.updateDraftInput(sessionId: session.id, draftInput: "")
 
+        let sessionId = session.id
+        let requestId = delivery.begin(sessionId: sessionId, isExecuting: (liveSession ?? session).isExecuting,
+                                       messages: messages, now: composeState.lastSubmitAt)
         Task {
             do {
-                try await syncManager.sendPrompt(sessionId: session.id, text: text, attachments: attachments)
+                try await syncManager.sendPrompt(sessionId: sessionId, text: text, attachments: attachments)
                 AnalyticsManager.shared.capture("mobile_ai_message_sent", properties: [
                     "hasAttachments": !attachments.isEmpty,
                     "attachmentCount": attachments.count,
                 ])
 
-                // Start a delivery timeout -- if the session doesn't start executing
-                // within 10s, warn the user that the desktop may not have received it.
-                deliveryTimeoutItem?.cancel()
-                let timeout = DispatchWorkItem { [self] in
-                    // Only warn if session still hasn't started executing
-                    if !(liveSession?.isExecuting ?? false) {
-                        deliveryWarning = "Your prompt was sent but the desktop hasn't started processing it. Make sure the desktop app is running and connected."
-                    }
-                }
-                deliveryTimeoutItem = timeout
-                DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: timeout)
+                delivery.sent(requestId)
             } catch {
+                guard delivery.failed(requestId) else { return }
                 // Restore the draft so the user doesn't lose their text
-                composeText = text
+                composeState.text = text
                 sendError = "Failed to send: \(error.localizedDescription)"
             }
         }
@@ -1042,6 +978,34 @@ public struct SessionDetailView: View {
         guard let syncManager = appState.syncManager else { return }
         syncManager.sendSessionControlMessage(sessionId: session.id, messageType: "cancel")
         AnalyticsManager.shared.capture("mobile_session_cancelled")
+    }
+
+    /// Open a new session from a `launch: new-session` action prompt.
+    ///
+    /// Mirrors the desktop, which launches a sibling in the current workstream:
+    /// when this session has a parent, the new one joins it; otherwise it is a
+    /// standalone session in the same project. The action's body becomes the
+    /// initial prompt, and the desktop that receives the request does the actual
+    /// creation.
+    private func launchActionInNewSession(_ action: SyncedActionPrompt) {
+        guard let syncManager = appState.syncManager else { return }
+        do {
+            try syncManager.createSession(
+                projectId: session.projectId,
+                initialPrompt: action.autoSubmit == false ? nil : action.body,
+                parentSessionId: session.parentSessionId,
+                provider: ModelPreferences.providerFromModelId(action.model),
+                model: action.model,
+                targetDeviceId: session.hostDeviceId,
+                initialDraft: action.autoSubmit == false ? action.body : nil
+            )
+            AnalyticsManager.shared.capture("mobile_action_prompt_launched_new_session", properties: [
+                "model": action.model ?? "inherit"
+            ])
+        } catch {
+            sendError = error.localizedDescription
+            logger.error("Failed to launch session from action prompt: \(error.localizedDescription)")
+        }
     }
 
     private func handleInteractiveResponse(_ action: String, _ promptId: String, _ body: [String: Any]) {
@@ -1215,61 +1179,6 @@ struct PromptEntry: Identifiable {
     let text: String
     let createdAt: Int
 }
-
-// MARK: - Prompt Picker List
-
-#if canImport(UIKit)
-private struct PromptPickerList: View {
-    let promptList: [PromptEntry]
-    let onSelect: (PromptEntry) -> Void
-
-    @State private var searchText = ""
-
-    private var filteredPrompts: [PromptEntry] {
-        if searchText.isEmpty {
-            return promptList
-        }
-        return promptList.filter { $0.text.localizedCaseInsensitiveContains(searchText) }
-    }
-
-    var body: some View {
-        List(filteredPrompts) { prompt in
-            Button {
-                onSelect(prompt)
-            } label: {
-                HStack(spacing: 12) {
-                    Text("#\(prompt.number)")
-                        .font(.caption)
-                        .fontWeight(.semibold)
-                        .foregroundStyle(NimbalystColors.primary)
-                        .frame(minWidth: 30, alignment: .trailing)
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(prompt.text)
-                            .font(.body)
-                            .foregroundStyle(.primary)
-                            .lineLimit(2)
-
-                        if prompt.createdAt > 0 {
-                            Text(RelativeTimestamp.format(epochMs: prompt.createdAt))
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-                .padding(.vertical, 2)
-            }
-        }
-        .listStyle(.plain)
-        .searchable(text: $searchText, prompt: "Search prompts")
-        .overlay {
-            if filteredPrompts.isEmpty && !searchText.isEmpty {
-                ContentUnavailableView.search(text: searchText)
-            }
-        }
-    }
-}
-#endif
 
 // MARK: - File Sheet Modifier
 

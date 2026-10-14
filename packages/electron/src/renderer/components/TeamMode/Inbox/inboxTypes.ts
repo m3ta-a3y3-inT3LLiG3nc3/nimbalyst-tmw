@@ -84,6 +84,7 @@ export type InboxAgentDispatchState = 'pending' | 'dispatched';
 
 export interface HydratedInboxDelivery
   extends Omit<InboxDelivery, 'source' | 'actor' | 'preview' | 'recipientUserId'> {
+  documentDecisionNeedsResponse?: boolean;
   teamMemberId: TeamMemberId;
   orgName: string;
   projectId?: string;
@@ -150,6 +151,7 @@ export interface InboxRowView {
   sourceId?: string;
   commentId?: string;
   threadId?: string;
+  blockId?: string;
   sourceKind?: InboxSourceKind;
   /**
    * Tracker item type, when the delivery carried one and the reader may still

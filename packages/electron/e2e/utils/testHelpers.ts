@@ -1,10 +1,4 @@
-/**
- * AI Test Helpers
- *
- * Shared utilities for testing AI features in the Nimbalyst editor.
- * These helpers encapsulate common patterns for interacting with the AI chat,
- * agent mode, and document editing.
- */
+/** Shared helpers for AI chat, agent mode, and document editing E2E tests. */
 
 import type { Page, ElectronApplication } from '@playwright/test';
 import { expect } from '@playwright/test';
@@ -16,6 +10,11 @@ import { TEST_TIMEOUTS } from '../helpers';
  * Selectors for AI-related UI elements
  */
 export const PLAYWRIGHT_TEST_SELECTORS = {
+  projectAppearancePanel: '[data-testid="project-appearance-panel"]',
+  projectAppearanceInitials: '[data-testid="project-appearance-initials"]',
+  projectAppearanceColor: '[data-testid="project-appearance-color"]',
+  projectAppearanceFile: '[data-testid="project-appearance-file"]',
+  projectAppearanceSave: '[data-testid="project-appearance-save"]',
   // Mode switching
   editorModeButton: '[data-mode="files"]', // Note: "editor" mode is actually "files" mode in the UI
   agentModeButton: '[data-mode="agent"]',
@@ -33,7 +32,8 @@ export const PLAYWRIGHT_TEST_SELECTORS = {
   projectRail: '[data-testid="project-rail"]',
   projectRailItem: '[data-testid="project-rail-item"]',
 
-  // Workspace and file tree
+  // Workspace, file tree, and structured editors
+  spreadsheetGrid: 'revo-grid',
   workspaceSidebar: '.workspace-sidebar',
   fileTreeContainer: '.workspace-file-tree',
   fileTreeItem: '.file-tree-name',
@@ -68,6 +68,8 @@ export const PLAYWRIGHT_TEST_SELECTORS = {
   chatInput: 'textarea.ai-chat-input-field', // DEPRECATED: ambiguous - matches both Files mode and Agent mode. Use filesChatInput or agentChatInput instead.
   filesChatInput: '[data-testid="files-mode-chat-input"]',
   agentChatInput: '[data-testid="agent-mode-chat-input"]',
+  actionPromptsDropdown: '[data-testid="action-prompts-dropdown"]',
+  actionPromptsPanel: '[data-testid="action-prompts-dropdown-panel"]',
   newSessionButton: '[data-testid="new-session-button"]',
   noSessionSelected: 'text="No session selected"',
 
@@ -145,7 +147,17 @@ export const PLAYWRIGHT_TEST_SELECTORS = {
   sessionContainer: '[data-session-id]',
 
   // Editor
+  tabEditor: '.tab-editor',
+  autosaveConflictBanner: '[data-testid="autosave-conflict-banner"]',
+  autosaveConflictReload: '[data-testid="autosave-conflict-banner-reload"]',
+  editorMoreActions: 'button[title="More actions"]',
+  editorDropdownItem: 'button.dropdown-item',
+  monacoViewLines: '.monaco-editor .view-lines',
   contentEditable: '[contenteditable="true"]',
+  trackerQuickCreateTypeSearch: '[data-testid="tracker-quick-create-type-search"]',
+  trackerQuickCreateTitle: '[data-testid="tracker-quick-create-title"]',
+  trackerQuickCreateContent: '[data-testid="tracker-quick-create-description"]',
+  trackerQuickCreateImageInput: '[data-testid="tracker-quick-create-image-input"]',
 
   // History dialog
   historyDialog: '.history-dialog',
@@ -241,6 +253,7 @@ export const PLAYWRIGHT_TEST_SELECTORS = {
   trackerToolbarNewButton: '[data-testid="tracker-toolbar-new-button"]',
   trackerQuickAddInput: '[data-testid="tracker-quick-add-input"]',
   trackerItemDetail: '[data-testid="tracker-item-detail"]',
+  trackerDetailContentEditor: '[data-testid="tracker-detail-content-editor"]',
   trackerDetailTitle: '[data-testid="tracker-detail-title"]',
   trackerSourceDbBadge: '[data-testid="tracker-source-db-badge"]',
   customSelectOption: '.custom-select-option',

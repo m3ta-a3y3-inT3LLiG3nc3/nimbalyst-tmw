@@ -24,15 +24,17 @@ import { createHash } from 'crypto';
 import { existsSync } from 'fs';
 import { basename } from 'path';
 import { mkdir, stat } from 'fs/promises';
+import { registerOrganizationDirectoryHandler } from '../ipc/OrganizationDirectoryHandler';
 import { safeHandle } from '../utils/ipcRegistry';
 import { logger } from '../utils/logger';
 import { getGitRemoteIdentities, getRawGitRemote, normalizeGitRemote } from '../utils/gitUtils';
+import { repositoryNameFromRemote } from './repositoryNameFromRemote';
 import type { GitRemoteIdentities } from '../utils/gitUtils';
 import { resolveTeamForRemoteHash } from './teamProjectResolver';
 import { getCollabSyncHttpUrl } from '../utils/collabSyncUrl';
 import { assertJwtMatchesOrg, getJwtExp, getSubFromJwt, AuthContextMismatchError } from './jwtOrg';
 import { createSingleFlight } from '../utils/asyncCache';
-import { getWorkspaceState, updateWorkspaceState } from '../utils/store';
+import { getWorkspaceStateField, updateWorkspaceState } from '../utils/store';
 import { setHasOrganizationsForMenu } from '../menu/organizationMenuState';
 import {
   getAccounts,
@@ -667,6 +669,27 @@ async function fetchTeamApi(
     : accountOrgId
       ? getPersonalSessionJwtForAccount(accountOrgId)
       : getPersonalSessionJwt();
+  // A signed-in account whose primary session is team-scoped has no personal
+  // JWT until the first personal-org exchange runs. At launch that is several
+  // seconds after isAuthenticated() goes true, and every team lookup in the gap
+  // used to fail as "not signed in" -- one burst of 60+ failed directory reads
+  // per startup. Mint it now; the refresh is single-flight, so a burst of
+  // callers shares one exchange. A session token is required, so a genuinely
+  // signed-out account still fails fast without a network call.
+  if (!jwt && !orgId) {
+    const hasSessionToken = accountOrgId ? !!getSessionTokenForAccount(accountOrgId) : !!getSessionToken();
+    if (hasSessionToken) {
+      try {
+        if (accountOrgId) {
+          jwt = await refreshPersonalSessionForAccount(accountOrgId);
+        } else if (await refreshPersonalSession(getCollabServerUrl())) {
+          jwt = getPersonalSessionJwt();
+        }
+      } catch {
+        // Fall through to the not-authenticated error below.
+      }
+    }
+  }
   if (!jwt) {
     // Debug logging - uncomment if needed. Being signed out is an expected
     // steady state, and every caller already logs its own failure, so this
@@ -847,7 +870,7 @@ function sanitizeRemoteUrl(value: string): string | null {
  */
 async function captureWorkspaceRemote(
   workspacePath: string | undefined,
-): Promise<{ gitRemoteHash?: string; remoteUrl?: string }> {
+): Promise<{ gitRemoteHash?: string; remoteUrl?: string; repositoryName?: string }> {
   if (!workspacePath) return {};
   const raw = await getRawGitRemote(workspacePath);
   // A newly minted identity is always the canonical form, so a teammate who
@@ -855,9 +878,11 @@ async function captureWorkspaceRemote(
   const normalized = normalizeGitRemote(raw);
   if (!raw || !normalized) return {};
   const remoteUrl = sanitizeRemoteUrl(raw);
+  const repositoryName = repositoryNameFromRemote(raw);
   return {
     gitRemoteHash: hashGitRemote(normalized),
     ...(remoteUrl ? { remoteUrl } : {}),
+    ...(repositoryName ? { repositoryName } : {}),
   };
 }
 
@@ -1196,7 +1221,10 @@ export interface ListTeamsOptions {
 }
 
 export async function listTeams(options?: ListTeamsOptions): Promise<TeamDetails[]> {
-  return (await listTeamDirectory(options)).teams;
+  const directory = await listTeamDirectory(options);
+  // Array-only consumers cannot represent an unknown membership set.
+  if (!directory.complete) throw new Error('Organization directory is unavailable. Try again later.');
+  return directory.teams;
 }
 
 export async function listTeamDirectory(options?: ListTeamsOptions): Promise<TeamDirectory> {
@@ -1218,8 +1246,8 @@ export async function listTeamDirectory(options?: ListTeamsOptions): Promise<Tea
   }
 
   const promise = (async (): Promise<TeamDirectory> => {
-    let allAccountLookupsSucceeded = true;
     const allAccounts = getAccounts();
+    let allAccountLookupsSucceeded = allAccounts.length > 0;
     const teamsByOrgId = new Map<string, TeamDetails>();
     const allTeams: TeamDetails[] = [];
 
@@ -1227,7 +1255,8 @@ export async function listTeamDirectory(options?: ListTeamsOptions): Promise<Tea
     const results = await Promise.allSettled(
       allAccounts.map(async (account) => {
         const data = await fetchTeamApi('/api/teams', 'GET', undefined, undefined, account.personalOrgId) as { teams: RawTeamDetails[] };
-        return (data.teams || []).map((rawTeam) => ({
+        if (!data || !Array.isArray(data.teams)) throw new Error('Invalid organization directory response');
+        return data.teams.map((rawTeam) => ({
           ...brandTeamDetails(rawTeam),
           sourcePersonalOrgId: account.personalOrgId,
           sourceEmail: account.email,
@@ -1347,16 +1376,14 @@ export async function listTeamDirectory(options?: ListTeamsOptions): Promise<Tea
 /**
  * Get a specific team's details by orgId.
  */
-async function getTeamByOrgId(orgId: string): Promise<TeamDetails | null> {
+export async function getTeamByOrgId(orgId: string): Promise<TeamDetails | null> {
   if (!isAuthenticated()) return null;
 
-  try {
-    const teams = await listTeams();
-    return teams.find(t => t.orgId === orgId) || null;
-  } catch (err) {
-    logger.main.error('[TeamService] getTeamByOrgId error:', err);
-    return null;
-  }
+  // Null means "the directory is complete and this org is not in it". An
+  // unavailable directory is not that answer, so it propagates to the IPC
+  // caller as an error instead of being flattened into "not a member".
+  const teams = await listTeams();
+  return teams.find(t => t.orgId === orgId) || null;
 }
 
 /**
@@ -1365,7 +1392,7 @@ async function getTeamByOrgId(orgId: string): Promise<TeamDetails | null> {
  */
 function getLocalOrgBinding(workspacePath: string): { orgId: string; teamProjectId?: string } | null {
   try {
-    return getWorkspaceState(workspacePath).localOrgBinding ?? null;
+    return getWorkspaceStateField(workspacePath, 'localOrgBinding') ?? null;
   } catch (err) {
     logger.main.warn('[TeamService] Could not read the local org binding:', err);
     return null;
@@ -1514,7 +1541,11 @@ export async function findPendingInviteForWorkspace(workspacePath: string): Prom
   const remoteHashes = remoteHashCandidates(remote);
 
   try {
-    const teams = await listTeams();
+    // An incomplete directory means "could not tell", which listTeamDirectory's
+    // own per-account logging already reports. Throwing it again here wrote an
+    // error with a stack trace for every workspace lookup in a startup burst.
+    const { teams, complete } = await listTeamDirectory();
+    if (!complete) return null;
     const pendingTeams = teams.filter(t => t.membershipType && t.membershipType !== 'active_member');
     const match = pendingTeams.find(t => !!t.gitRemoteHash && remoteHashes.includes(t.gitRemoteHash)) || null;
     if (match) {
@@ -1579,6 +1610,11 @@ async function findTeamOrPendingInviteForWorkspace(workspacePath: string): Promi
   const { team, complete } = await resolveTeamForWorkspace(workspacePath);
   if (team) {
     return { success: true, team, complete: true };
+  }
+  // The pending-invite lookup reads the same directory; when that could not be
+  // read it can only fail the same way.
+  if (!complete) {
+    return { success: true, team: null, complete: false };
   }
   // Also check for pending invites matching this workspace
   const pendingInvite = await findPendingInviteForWorkspace(workspacePath);
@@ -1715,12 +1751,12 @@ async function addProjectToOrg(
   workspacePath?: string,
   name?: string,
 ): Promise<{ projectId: string; teamProjectId: string }> {
-  const { gitRemoteHash, remoteUrl } = await captureWorkspaceRemote(workspacePath);
+  const { gitRemoteHash, remoteUrl, repositoryName } = await captureWorkspaceRemote(workspacePath);
 
-  // With no remote the name is the only thing that identifies the project in
-  // the org's registry, so fall back to the folder name rather than minting a
-  // nameless row.
+  // Never mint a nameless row: the console would label it by its id. The
+  // repository name when there is a remote, else the folder name.
   const projectName = name
+    ?? repositoryName
     ?? (!gitRemoteHash && workspacePath ? basename(workspacePath) || null : null);
 
   const result = await fetchTeamApi(`/api/teams/${orgId}/projects`, 'POST', {
@@ -2326,6 +2362,11 @@ async function attemptAutoMatchTeam(workspacePath: string, attempt: number): Pro
   }
 }
 
+/** The project-access list is admin-only; asking as a member only produces a 403. */
+export function canListProjectAccess(team: Pick<TeamDetails, 'teamProjectId' | 'role'>): boolean {
+  return !!team.teamProjectId && (team.role === 'owner' || team.role === 'admin');
+}
+
 export async function syncOrgProjectionFromServer(knownTeams?: TeamDetails[]): Promise<{
   success: boolean;
   counts?: { orgs: number; projects: number; members: number; grants: number };
@@ -2383,7 +2424,7 @@ export async function syncOrgProjectionFromServer(knownTeams?: TeamDetails[]): P
     // document_read_only. Admin-only endpoint, so a non-admin member simply
     // keeps the role-derived projection.
     for (const team of teams) {
-      if (!team.teamProjectId) continue;
+      if (!canListProjectAccess(team) || !team.teamProjectId) continue;
       try {
         const grants = await listProjectAccess(team.orgId, team.teamProjectId);
         await reconcileProjectAccessFromServer(db, team.teamProjectId, grants);
@@ -2599,18 +2640,7 @@ export function registerTeamHandlers(): void {
     }
   });
 
-  safeHandle('team:list', async (_event, options?: { forceRefresh?: boolean }) => {
-    try {
-      // The directory cache is invalidated by events (join/create/delete/auth
-      // change); `forceRefresh` backs the manual Refresh affordance in Account
-      // settings for the cases those events miss (e.g. invited from elsewhere).
-      if (options?.forceRefresh) invalidateListTeamsCache();
-      const teams = await listTeams(options?.forceRefresh ? { forceFresh: true } : undefined);
-      return { success: true, teams };
-    } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
+  registerOrganizationDirectoryHandler(listTeamDirectory, invalidateListTeamsCache);
 
   safeHandle('team:find-for-workspace', async (_event, workspacePath: string) => {
     try {

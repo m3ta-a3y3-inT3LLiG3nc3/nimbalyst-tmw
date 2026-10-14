@@ -4,6 +4,7 @@ import type { NodeKey } from 'lexical';
 import type { Provider } from '@lexical/yjs';
 import type { Doc } from 'yjs';
 import type { CommentsConfig } from './commenting/types';
+import type { DecisionsConfig } from './decisions/types';
 
 /**
  * Configuration interface for the Nimbalyst component.
@@ -150,6 +151,9 @@ export interface EditorConfig {
   // Document header - renders at the top of the editor scroll pane
   documentHeader?: ReactNode;
 
+  /** False when the host lists the page's citations itself (desktop's Page info panel). Default true. */
+  showCitationSourcesLine?: boolean;
+
   // Collaboration mode
   /**
    * When set, the editor operates in collaborative mode:
@@ -182,6 +186,14 @@ export interface EditorConfig {
    * `commenting/types.ts`.
    */
   comments?: CommentsConfig;
+
+  /**
+   * When set, in-document decision blocks can be answered and sealed against
+   * the document's Y.Doc. Absent means the solo case: blocks still render and a
+   * lone reader can still pick and seal to markdown, but no votes are recorded.
+   * See `decisions/types.ts`.
+   */
+  decisions?: DecisionsConfig;
 }
 
 export const DEFAULT_EDITOR_CONFIG: EditorConfig = {

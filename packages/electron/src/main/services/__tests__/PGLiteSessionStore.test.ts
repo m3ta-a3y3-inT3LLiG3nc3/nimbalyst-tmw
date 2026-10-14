@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it, vi } from 'vitest';
 import {
   createPGLiteSessionStore,
@@ -71,6 +72,161 @@ describe('PGLiteSessionStore personal sync snapshot', () => {
     expect(sessions.map((session) => session.id)).toEqual([
       'personal-session',
     ]);
+  });
+
+  // The startup/incremental reconciliation used to load every session row in
+  // the database (with its full metadata blob) and throw away the disabled
+  // projects in JS afterwards. Push the filter into SQL, resolving worktree
+  // paths once per distinct project rather than once per session.
+  it('loads only sessions from projects the caller enabled', async () => {
+    const calls: Array<{ sql: string; params: any[] }> = [];
+    const db = {
+      query: vi.fn(async (sql: string, params: any[] = []) => {
+        calls.push({ sql, params });
+        if (sql.includes('DISTINCT')) {
+          return {
+            rows: [
+              { workspace_id: '/enabled' },
+              { workspace_id: '/enabled_worktrees/feature' },
+              { workspace_id: '/disabled' },
+            ],
+          };
+        }
+        return {
+          rows: [
+            {
+              id: 'enabled-session',
+              workspace_id: '/enabled',
+              provider: 'claude-code',
+              title: 'Enabled',
+              created_at: new Date(0),
+              updated_at: new Date(0),
+              metadata: null,
+            },
+          ],
+        };
+      }),
+    };
+    createPGLiteSessionStore(db as any);
+
+    const sessions = await getAllSessionsForSync(false, {
+      // Stands in for SyncManager's resolveProjectPath()-aware check.
+      isProjectEnabled: (workspaceId: string) => workspaceId.startsWith('/enabled'),
+    });
+
+    expect(sessions.map((s) => s.id)).toEqual(['enabled-session']);
+    const sessionQuery = calls.find((call) => !call.sql.includes('DISTINCT'))!;
+    expect(sessionQuery.sql).toContain('WHERE s.workspace_id IN ($1, $2)');
+    expect(sessionQuery.params).toEqual(['/enabled', '/enabled_worktrees/feature']);
+  });
+
+  it('never scans sessions when no project is enabled', async () => {
+    const db = {
+      query: vi.fn(async () => ({ rows: [{ workspace_id: '/disabled' }] })),
+    };
+    createPGLiteSessionStore(db as any);
+
+    const sessions = await getAllSessionsForSync(false, { isProjectEnabled: () => false });
+
+    expect(sessions).toEqual([]);
+    expect(db.query).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks the message count unknown so a metadata-only publish cannot zero it', async () => {
+    const db = {
+      query: vi.fn(async (sql: string) => ({
+        rows: sql.includes('DISTINCT') ? [] : [
+          {
+            id: 's1',
+            workspace_id: '/project',
+            provider: 'claude-code',
+            title: 'A',
+            created_at: new Date(0),
+            updated_at: new Date(0),
+            metadata: null,
+          },
+        ],
+      })),
+    };
+    createPGLiteSessionStore(db as any);
+
+    const [session] = await getAllSessionsForSync();
+
+    // This query has no COUNT join, so the 0 is a placeholder. The flag is what
+    // stops the sync producer publishing it over the server's real count.
+    expect(session.messageCount).toBe(0);
+    expect(session.messageCountKnown).toBe(false);
+  });
+
+  it('asks the database for the projected metadata, not the whole blob', async () => {
+    const calls: string[] = [];
+    const db = {
+      query: vi.fn(async (sql: string) => {
+        calls.push(sql);
+        return { rows: [] };
+      }),
+    };
+    createPGLiteSessionStore(db as any);
+
+    await getAllSessionsForSync();
+
+    // The projection has to be in SQL: trimming after the fact still pays the
+    // transfer cost for every session's transcript summaries.
+    expect(calls[0]).toContain("jsonb_build_object('tutorial', s.metadata->'tutorial'");
+    expect(calls[0]).not.toMatch(/,\s*s\.metadata\s+FROM/);
+    // Real-engine behavior for both backends is covered by
+    // syncMetadataProjection.dialects.test.ts.
+  });
+
+  it('drops null metadata keys the projection always emits, on both row shapes', async () => {
+    // What the SQL projection returns: every consumed key, null where the row
+    // did not have one.
+    const present = {
+      tokenUsage: { totalTokens: 10, contextWindow: 200_000 },
+      phase: 'implementing',
+      tags: ['sync'],
+      hostDeviceId: 'desktop-1',
+      tutorial: false,
+    };
+    // The projection emits all seven keys; these two were never set on the row.
+    const projected = { ...present, draftInput: null, draftUpdatedAt: null };
+    const db = {
+      query: vi.fn(async () => ({
+        rows: [
+          {
+            // SQLite hands back JSON columns as raw strings.
+            id: 'sqlite-row',
+            workspace_id: '/project',
+            provider: 'claude-code',
+            title: 'A',
+            created_at: new Date(0),
+            updated_at: new Date(0),
+            metadata: JSON.stringify(projected),
+          },
+          {
+            // PGLite hands back the parsed object.
+            id: 'pglite-row',
+            workspace_id: '/project',
+            provider: 'claude-code',
+            title: 'B',
+            created_at: new Date(0),
+            updated_at: new Date(0),
+            metadata: { ...projected },
+          },
+        ],
+      })),
+    };
+    createPGLiteSessionStore(db as any);
+
+    const sessions = await getAllSessionsForSync();
+
+    expect(sessions).toHaveLength(2);
+    for (const session of sessions) {
+      // A null draftInput must stay ABSENT: present-but-null would publish a
+      // draft clear the user never made.
+      expect(session.metadata).toEqual(present);
+      expect('draftInput' in (session.metadata ?? {})).toBe(false);
+    }
   });
 });
 
@@ -333,6 +489,38 @@ describe('PGLiteSessionStore.updateMetadata defense-in-depth', () => {
   });
 });
 
+describe('PGLiteSessionStore.updateMetadata concurrent writes', () => {
+  it('keeps both keys when two updates read before either writes', async () => {
+    // A question's hasPendingPrompt vanished when a token-usage write overlapped it:
+    // both read the same blob, and the second whole-blob write dropped the first key.
+    let row: Record<string, unknown> = { phase: 'planning' };
+    let reads = 0;
+    let releaseReads!: () => void;
+    const bothRead = new Promise<void>(resolve => { releaseReads = resolve; });
+    const db = {
+      query: vi.fn(async (sql: string, values: unknown[] = []) => {
+        if (/^SELECT metadata FROM ai_sessions/.test(sql)) {
+          const snapshot = JSON.stringify(row);
+          if (++reads === 2) releaseReads();
+          await bothRead;
+          return { rows: [{ metadata: snapshot }] };
+        }
+        const merge = sql.match(/metadata = COALESCE\(metadata, '\{\}'::jsonb\) \|\| \$(\d+)::jsonb/);
+        const replace = sql.match(/metadata = \$(\d+)/);
+        if (merge) row = { ...row, ...JSON.parse(values[Number(merge[1]) - 1] as string) };
+        else if (replace) row = JSON.parse(values[Number(replace[1]) - 1] as string);
+        return { rows: [] };
+      }),
+    };
+    const store = createPGLiteSessionStore(db as any);
+    await Promise.all([
+      store.updateMetadata('s1', { metadata: { hasPendingPrompt: true } }),
+      store.updateMetadata('s1', { metadata: { tokenUsage: { totalTokens: 5 } } }),
+    ]);
+    expect(row).toMatchObject({ phase: 'planning', hasPendingPrompt: true, tokenUsage: { totalTokens: 5 } });
+  });
+});
+
 describe('PGLiteSessionStore.updateMetadata nullable column clears', () => {
   // NIM-2308 / GH #1098: an expired Claude Code session could never be
   // recovered because the "clear the dead provider session id" write was a
@@ -365,5 +553,44 @@ describe('PGLiteSessionStore.updateMetadata nullable column clears', () => {
     );
     expect(updateCall).toBeDefined();
     expect(updateCall![0]).not.toContain('provider_session_id =');
+  });
+});
+
+
+describe('PGLiteSessionStore provider identity lookup', () => {
+  it('loads the local session behind a scoped provider resume handle', async () => {
+    const db = {
+      query: vi.fn()
+        .mockResolvedValueOnce({ rows: [{ id: 'local-id' }] })
+        .mockResolvedValueOnce({ rows: [{ id: 'local-id', provider: 'claude-code', provider_session_id: 'external-id', workspace_id: '/workspace', created_at: new Date(0), updated_at: new Date(0), metadata: '{"external":true}' }] }),
+    };
+    const store = createPGLiteSessionStore(db);
+    const session = await store.findByProviderSessionId!('claude-code', 'external-id', '/workspace');
+    expect(session).toMatchObject({ id: 'local-id', providerSessionId: 'external-id', workspacePath: '/workspace', metadata: { external: true } });
+    expect(db.query.mock.calls[0][1]).toEqual(['claude-code', 'external-id', '/workspace', 'claude-code-cli', '/workspace']);
+    expect(db.query.mock.calls[1][1]).toEqual(['local-id']);
+  });
+
+  it('returns no session when the scoped identity does not exist', async () => {
+    const db = { query: vi.fn().mockResolvedValue({ rows: [] }) };
+    const store = createPGLiteSessionStore(db);
+    expect(await store.findByProviderSessionId!('openai-codex', 'missing', '/workspace')).toBeNull();
+    expect(db.query).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe('external session list provenance', () => {
+  it.each([false, true])('reads validated provenance from metadata (JSON text: %s)', async (asText) => {
+    const metadata = { externalSource: 'openai-codex', externalLastActivityAt: 1234 };
+    const rows = [
+      { id: 'external', metadata: asText ? JSON.stringify(metadata) : metadata },
+      { id: 'invalid', metadata: asText ? '{"externalSource":"unknown","externalLastActivityAt":"1234"}' : { externalSource: 'unknown', externalLastActivityAt: '1234' } },
+    ];
+    const store = createPGLiteSessionStore({ query: vi.fn().mockResolvedValue({ rows }) });
+    const sessions = await store.list('/workspace');
+    expect(sessions[0]).toMatchObject(metadata);
+    expect(sessions[1].externalSource).toBeUndefined();
+    expect(sessions[1].externalLastActivityAt).toBeUndefined();
   });
 });

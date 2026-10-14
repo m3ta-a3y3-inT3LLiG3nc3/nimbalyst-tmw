@@ -1,3 +1,4 @@
+import { claimExternalSessionForLocalExecution } from '../externalSessions/ExternalSessionService';
 /**
  * Production wiring for `submitClaudeCliPrompt` (NIM-806 — input integration).
  *
@@ -18,12 +19,19 @@ import { AgentMessagesRepository } from '@nimbalyst/runtime';
 import { findAttachmentDenyRule } from '@nimbalyst/runtime/ai/server';
 import { ClaudeSettingsManager } from '../ClaudeSettingsManager';
 import { getAttachmentStagingConfig } from '../../utils/store';
+import { closeSupersededQuestions, snapshotQuestionsToSupersede } from './supersedeOpenQuestions';
 
 /** Submit a CLI prompt using the real terminal/log/analytics deps. */
 export async function submitClaudeCliPromptProduction(
   input: SubmitClaudeCliPromptInput,
 ): Promise<{ submitted: boolean }> {
+  await claimExternalSessionForLocalExecution(input.sessionId);
   const manager = getTerminalSessionManager();
+  const supersedeSnapshot = await snapshotQuestionsToSupersede({
+    sessionId: input.sessionId,
+    provider: 'claude-code-cli',
+    context: input.documentContext,
+  });
   const result = await submitClaudeCliPrompt(input, {
     writeToTerminal: (sessionId: string, data: string) => manager.writeToTerminal(sessionId, data),
     logUserPrompt: (p: {
@@ -52,6 +60,11 @@ export async function submitClaudeCliPromptProduction(
     },
     delay: (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)),
   });
+
+  // The CLI never runs through MessageStreamingHandler, so its human turns
+  // close earlier unanswered questions here. Snapshot first: the submit logs
+  // the new user row, and anything asked after it belongs to the new turn.
+  if (result.submitted) await closeSupersededQuestions(supersedeSnapshot);
 
   if (result.submitted && input.attachments?.length) {
     try {

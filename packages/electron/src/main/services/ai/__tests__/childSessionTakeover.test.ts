@@ -1,6 +1,7 @@
+// @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('@nimbalyst/runtime', () => ({
+vi.mock('@nimbalyst/runtime/storage/repositories/AISessionsRepository', () => ({
   AISessionsRepository: {
     updateMetadata: vi.fn(),
   },
@@ -12,9 +13,10 @@ vi.mock('../../../database/PGLiteDatabaseWorker', () => ({
   },
 }));
 
-import { AISessionsRepository } from '@nimbalyst/runtime';
+import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
 import { database } from '../../../database/PGLiteDatabaseWorker';
 import { disableParentNotificationsAfterDirectTakeover } from '../childSessionTakeover';
+import { deletePendingChildUpdates } from '../pendingChildUpdates';
 
 describe('disableParentNotificationsAfterDirectTakeover', () => {
   beforeEach(() => {
@@ -44,6 +46,17 @@ describe('disableParentNotificationsAfterDirectTakeover', () => {
     expect(database.query).not.toHaveBeenCalled();
   });
 
+  it('leaves a child whose owner routes its settles to itself alone', async () => {
+    await disableParentNotificationsAfterDirectTakeover({
+      id: 'child-owned',
+      createdBySessionId: 'parent-owned',
+      metadata: { sessionOwner: { extensionId: 'com.example.owner', key: 'ada', routeChildUpdatesToOwner: true } },
+    } as any);
+
+    expect(AISessionsRepository.updateMetadata).not.toHaveBeenCalled();
+    expect(database.query).not.toHaveBeenCalled();
+  });
+
   it('disables parent notifications and clears pending child updates', async () => {
     await disableParentNotificationsAfterDirectTakeover({
       id: 'child-3',
@@ -58,12 +71,29 @@ describe('disableParentNotificationsAfterDirectTakeover', () => {
       },
     });
     expect(database.query).toHaveBeenCalledWith(
-      `DELETE FROM queued_prompts
-     WHERE session_id = $1
-       AND status = 'pending'
-       AND prompt LIKE '[Child Session Update]%'
-       AND prompt LIKE $2`,
+      expect.stringContaining('DELETE FROM queued_prompts'),
       ['parent-3', '%(child-3)%']
     );
+  });
+});
+
+describe('deletePendingChildUpdates', () => {
+  beforeEach(() => {
+    vi.mocked(database.query).mockReset();
+  });
+
+  // Superseding must not reach past its own child or past rows already handed
+  // to the agent: deleting an `executing` row would strand a turn in flight,
+  // and an unscoped delete would silently drop sibling children's updates.
+  it('deletes only pending child-update rows for the named child on the named parent', async () => {
+    await deletePendingChildUpdates('parent-9', 'child-9');
+
+    expect(database.query).toHaveBeenCalledTimes(1);
+    const [sql, params] = vi.mocked(database.query).mock.calls[0];
+
+    expect(sql).toContain("status = 'pending'");
+    expect(sql).toContain("prompt LIKE '[Child Session Update]%'");
+    expect(sql).not.toContain('executing');
+    expect(params).toEqual(['parent-9', '%(child-9)%']);
   });
 });

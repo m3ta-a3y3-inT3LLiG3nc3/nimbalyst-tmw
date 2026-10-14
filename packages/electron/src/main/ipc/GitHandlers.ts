@@ -19,14 +19,18 @@
  * and `git:file-diff` (resolves the owning repo of the file it is given).
  */
 
+import { runCommitProposalOnce, commitProposalIdentity } from '../services/ai/CommitProposalExecution';
+import { resolveGitCommitProposalPromptId } from '../services/ai/gitCommitProposalPromptUtils';
 import { ipcMain } from 'electron';
-import simpleGit, { SimpleGit } from 'simple-git';
+import type { SimpleGit } from 'simple-git';
+import { createGit } from '../services/gitClient';
 import log from 'electron-log/main';
 import { existsSync } from 'fs';
 import { dirname, join, relative, isAbsolute, resolve } from 'path';
 import { gitOperationLock } from '../services/GitOperationLock';
 import { executeGitCommitAcrossRepos, toRepositoryRelativePath, type HunkSelection } from '../services/GitCommitService';
 import { getGitSubprocessEnv, simpleGitWithHookEnv } from '../services/gitEnv';
+import { simpleGitReadOnly } from '../services/gitReadOnly';
 import { SessionCommitService } from '../services/SessionCommitService';
 import { safeHandle } from '../utils/ipcRegistry';
 import { findGitRootForFile } from '../services/GitStatusService';
@@ -44,6 +48,7 @@ import {
   setGitStatusRefreshCoordinator,
 } from '../services/GitStatusRefreshCoordinator';
 import { isReadOnlyGitCommandLine } from '../services/gitCommandClassifier';
+import { validateGitCwd, validateGitOperand, validateGitOptions, validatedGitRebaseArgs } from '../services/gitOperandValidation';
 
 function isGitRepository(repoPath: string): boolean {
   try {
@@ -280,7 +285,7 @@ function parseGitStatusPorcelainV1Z(rawStatus: string): GitWorkingChanges {
  * vocabulary used by consumers.
  */
 export async function getWorkingChanges(repoPath: string): Promise<GitWorkingChanges> {
-  const git: SimpleGit = simpleGit(repoPath, { config: ['core.optionalLocks=false'] });
+  const git: SimpleGit = simpleGitReadOnly(repoPath);
   const rawStatus = await git.raw(['status', '--porcelain=v1', '-z', '--untracked-files=all']);
   return parseGitStatusPorcelainV1Z(rawStatus);
 }
@@ -329,12 +334,12 @@ export async function discardGitChanges(
 /**
  * Read the branch/ahead-behind snapshot the title bar and Git panel both render.
  *
- * `core.optionalLocks=false` tells git to skip the index refresh that would
+ * GIT_OPTIONAL_LOCKS=0 (simpleGitReadOnly) tells git to skip the index refresh that would
  * create `.git/index.lock`, so this read can run concurrently with writes
  * (commit/rebase/etc.) without queueing behind them on `gitOperationLock`.
  */
 export async function readBranchStatus(repoPath: string): Promise<GitStatusResult> {
-  const git: SimpleGit = simpleGit(repoPath, { config: ['core.optionalLocks=false'] });
+  const git: SimpleGit = simpleGitReadOnly(repoPath);
   const status = await git.status();
   return {
     branch: normalizeCurrentBranch(status.current) || 'HEAD',
@@ -425,7 +430,7 @@ export function registerGitHandlers(): void {
       }
 
       try {
-        const git: SimpleGit = simpleGit(repoPath);
+        const git: SimpleGit = createGit(repoPath);
 
         if (!(await hasCommits(git))) {
           return [];
@@ -493,7 +498,7 @@ export function registerGitHandlers(): void {
     if (!isGitRepository(repoPath)) return { branches: [], current: '' };
 
     try {
-      const git: SimpleGit = simpleGit(repoPath);
+      const git: SimpleGit = createGit(repoPath);
       const summary = await git.branch();
       let current = normalizeCurrentBranch(summary.current);
       let branches = summary.all;
@@ -525,7 +530,8 @@ export function registerGitHandlers(): void {
     'git:push',
     async (_event, repoPath: string, options?: { force?: boolean; setUpstream?: boolean; remote?: string; branch?: string }):
       Promise<{ success: boolean; error?: string }> => {
-      if (!repoPath) throw new Error('repoPath is required');
+      validateGitCwd(repoPath, 'repoPath');
+      validateGitOptions(options, ['force', 'setUpstream'], ['remote', 'branch']);
       if (!isGitRepository(repoPath)) return { success: false, error: 'Not a git repository' };
 
       return gitOperationLock.withLock(repoPath, 'git:push', async () => {
@@ -540,8 +546,9 @@ export function registerGitHandlers(): void {
             };
           }
 
+          validateGitOperand(branch, 'branch');
           const pushArgs: string[] = ['push'];
-          const remote = options?.remote || 'origin';
+          const remote = options?.remote === undefined ? 'origin' : options.remote;
 
           if (options?.setUpstream) {
             pushArgs.push('--set-upstream');
@@ -549,7 +556,7 @@ export function registerGitHandlers(): void {
             pushArgs.push('--force-with-lease');
           }
 
-          pushArgs.push(remote, branch);
+          pushArgs.push('--', remote, branch);
           const result = await runGitCommandStreaming(operationLog, repoPath, pushArgs);
           return result.success
             ? { success: true }
@@ -601,7 +608,7 @@ export function registerGitHandlers(): void {
 
           // Check for conflict markers in error message
           if (message.includes('CONFLICT') || message.includes('conflict')) {
-            const git: SimpleGit = simpleGit(repoPath);
+            const git: SimpleGit = createGit(repoPath);
             const status = await git.status();
             return { success: false, error: message, conflicts: status.conflicted };
           }
@@ -619,14 +626,15 @@ export function registerGitHandlers(): void {
     'git:fetch',
     async (_event, repoPath: string, options?: { remote?: string }):
       Promise<{ success: boolean; error?: string }> => {
-      if (!repoPath) throw new Error('repoPath is required');
+      validateGitCwd(repoPath, 'repoPath');
+      validateGitOptions(options, [], ['remote']);
       if (!isGitRepository(repoPath)) return { success: false, error: 'Not a git repository' };
 
       try {
         const result = await runGitCommandStreaming(
           operationLog,
           repoPath,
-          ['fetch', options?.remote || 'origin'],
+          ['fetch', '--', options?.remote === undefined ? 'origin' : options.remote],
         );
         return result.success ? { success: true } : { success: false, error: result.error };
       } catch (error) {
@@ -643,21 +651,14 @@ export function registerGitHandlers(): void {
     'git:rebase',
     async (_event, repoPath: string, options: { target?: string; action?: 'continue' | 'abort' | 'skip' }):
       Promise<{ success: boolean; error?: string; conflicts?: string[] }> => {
-      if (!repoPath) throw new Error('repoPath is required');
+      validateGitCwd(repoPath, 'repoPath');
+      const args = validatedGitRebaseArgs(options);
       if (!isGitRepository(repoPath)) return { success: false, error: 'Not a git repository' };
 
       return gitOperationLock.withLock(repoPath, 'git:rebase', async () => {
-        const args = options.action
-          ? ['rebase', `--${options.action}`]
-          : options.target
-            ? ['rebase', options.target]
-            : null;
-        if (!args) {
-          throw new Error('rebase requires either a target branch or an action (continue/abort/skip)');
-        }
         const result = await runGitCommandStreaming(operationLog, repoPath, args);
         if (result.success) return { success: true };
-        const status = await simpleGit(repoPath).status();
+        const status = await createGit(repoPath).status();
         return { success: false, error: result.error, conflicts: status.conflicted };
       });
     }
@@ -674,7 +675,7 @@ export function registerGitHandlers(): void {
       if (!isGitRepository(repoPath)) return { isRebasing: false, conflicts: [] };
 
       try {
-        const git: SimpleGit = simpleGit(repoPath);
+        const git: SimpleGit = createGit(repoPath);
 
         // Check for REBASE_HEAD file as indicator of active rebase
         const rebaseHeadPath = join(repoPath, '.git', 'REBASE_HEAD');
@@ -703,24 +704,26 @@ export function registerGitHandlers(): void {
     'git:set-upstream',
     async (_event, repoPath: string, remote: string, branch?: string):
       Promise<{ success: boolean; error?: string }> => {
-      if (!repoPath) throw new Error('repoPath is required');
-      if (!remote) throw new Error('remote is required');
+      validateGitCwd(repoPath, 'repoPath');
+      validateGitOperand(remote, 'remote');
+      if (branch !== undefined) validateGitOperand(branch, 'branch');
       if (!isGitRepository(repoPath)) return { success: false, error: 'Not a git repository' };
 
       try {
         const git: SimpleGit = simpleGitWithHookEnv(repoPath);
         const status = await git.status();
-        const targetBranch = branch || normalizeCurrentBranch(status.current);
+        const targetBranch = branch === undefined ? normalizeCurrentBranch(status.current) : branch;
         if (!targetBranch || targetBranch === 'HEAD') {
           return {
             success: false,
             error: 'You are in detached HEAD. Checkout a branch before setting upstream.',
           };
         }
+        validateGitOperand(targetBranch, 'branch');
         const result = await runGitCommandStreaming(
           operationLog,
           repoPath,
-          ['push', '--set-upstream', remote, targetBranch],
+          ['push', '--set-upstream', '--', remote, targetBranch],
         );
         return result.success ? { success: true } : { success: false, error: result.error };
       } catch (error) {
@@ -737,8 +740,8 @@ export function registerGitHandlers(): void {
     'git:checkout',
     async (_event, repoPath: string, ref: string):
       Promise<{ success: boolean; error?: string }> => {
-      if (!repoPath) throw new Error('repoPath is required');
-      if (!ref) throw new Error('ref is required');
+      validateGitCwd(repoPath, 'repoPath');
+      validateGitOperand(ref, 'ref');
       if (!isGitRepository(repoPath)) return { success: false, error: 'Not a git repository' };
 
       return gitOperationLock.withLock(repoPath, 'git:checkout', async () => {
@@ -755,14 +758,14 @@ export function registerGitHandlers(): void {
     'git:cherry-pick',
     async (_event, repoPath: string, hash: string):
       Promise<{ success: boolean; error?: string; conflicts?: string[] }> => {
-      if (!repoPath) throw new Error('repoPath is required');
-      if (!hash) throw new Error('hash is required');
+      validateGitCwd(repoPath, 'repoPath');
+      validateGitOperand(hash, 'hash');
       if (!isGitRepository(repoPath)) return { success: false, error: 'Not a git repository' };
 
       return gitOperationLock.withLock(repoPath, 'git:cherry-pick', async () => {
         const result = await runGitCommandStreaming(operationLog, repoPath, ['cherry-pick', hash]);
         if (result.success) return { success: true };
-        const status = await simpleGit(repoPath).status();
+        const status = await createGit(repoPath).status();
         return { success: false, error: result.error, conflicts: status.conflicted };
       });
     }
@@ -773,17 +776,18 @@ export function registerGitHandlers(): void {
    */
   safeHandle(
     'git:create-branch',
-    async (_event, repoPath: string, branchName: string, fromHash: string):
+    async (_event, repoPath: string, branchName: string, fromHash?: string):
       Promise<{ success: boolean; error?: string }> => {
-      if (!repoPath) throw new Error('repoPath is required');
-      if (!branchName) throw new Error('branchName is required');
+      validateGitCwd(repoPath, 'repoPath');
+      validateGitOperand(branchName, 'branchName');
+      if (fromHash !== undefined) validateGitOperand(fromHash, 'fromHash');
       if (!isGitRepository(repoPath)) return { success: false, error: 'Not a git repository' };
 
       return gitOperationLock.withLock(repoPath, 'git:create-branch', async () => {
         const result = await runGitCommandStreaming(
           operationLog,
           repoPath,
-          ['checkout', '-b', branchName, fromHash || 'HEAD'],
+          ['checkout', '-b', branchName, fromHash === undefined ? 'HEAD' : fromHash],
         );
         return result.success ? { success: true } : { success: false, error: result.error };
       });
@@ -805,7 +809,7 @@ export function registerGitHandlers(): void {
       if (!isGitRepository(repoPath)) return null;
 
       try {
-        const git: SimpleGit = simpleGit(repoPath);
+        const git: SimpleGit = createGit(repoPath);
 
         const [bodyRaw, numstatRaw, nameStatusRaw] = await Promise.all([
           git.raw(['show', '-s', '--format=%B', hash]),
@@ -869,7 +873,7 @@ export function registerGitHandlers(): void {
         return { staged: [], unstaged: [], untracked: [], conflicted: [] };
       }
 
-      // core.optionalLocks=false skips the index refresh that would create
+      // GIT_OPTIONAL_LOCKS=0 skips the index refresh that would create
       // .git/index.lock, allowing this read to run concurrently with writes
       // without queueing on gitOperationLock.
       try {
@@ -909,7 +913,7 @@ export function registerGitHandlers(): void {
       if (!isGitRepository(repoPath)) return { success: false, error: 'Not a git repository' };
 
       return gitOperationLock.withLock(repoPath, 'git:unstage', async () => {
-        const git: SimpleGit = simpleGit(repoPath);
+        const git: SimpleGit = createGit(repoPath);
         const args = await hasCommits(git)
           ? ['reset', 'HEAD', '--', ...files]
           : ['rm', '--cached', '--', ...files];
@@ -947,7 +951,7 @@ export function registerGitHandlers(): void {
       if (!isGitRepository(repoPath)) return '';
 
       try {
-        const git: SimpleGit = simpleGit(repoPath);
+        const git: SimpleGit = createGit(repoPath);
         const content = await git.show([`${hash}:${filePath}`]);
         return content;
       } catch (error) {
@@ -976,7 +980,7 @@ export function registerGitHandlers(): void {
       }
 
       try {
-        const git: SimpleGit = simpleGit(repoPath);
+        const git: SimpleGit = createGit(repoPath);
 
         // In a fresh repo with no commits, diff against an empty tree instead of HEAD
         if (!(await hasCommits(git))) {
@@ -1029,7 +1033,7 @@ export function registerGitHandlers(): void {
       if (!isGitRepository(gitWorkspacePath)) {
         return { unifiedDiff: '', isBinary: false };
       }
-      const git: SimpleGit = simpleGit(gitWorkspacePath);
+      const git: SimpleGit = createGit(gitWorkspacePath);
       const repoHasCommits = await hasCommits(git);
 
       try {
@@ -1126,7 +1130,7 @@ export function registerGitHandlers(): void {
       }
 
       try {
-        const git: SimpleGit = simpleGit(repoPath);
+        const git: SimpleGit = createGit(repoPath);
         const diff = await git.raw(['show', '--no-color', '--format=', hash, '--', filePath]);
         return { unifiedDiff: diff, isBinary: /\bBinary files\b/.test(diff) };
       } catch (error) {
@@ -1176,7 +1180,8 @@ export function registerGitHandlers(): void {
       // Optional: commit into this repository instead of resolving one per
       // file. Set when the caller already knows the repo (the widget's repo
       // header, an extension passing an explicit target).
-      repoPath?: string
+      repoPath?: string,
+      proposalId?: string
     ): Promise<{
       success: boolean;
       commitHash?: string;
@@ -1194,7 +1199,7 @@ export function registerGitHandlers(): void {
         ? await resolveSessionExtraCommitRoots(sessionId, workspacePath)
         : [];
 
-      const result = await withGitOperationLog(
+      const execute = () => withGitOperationLog(
         operationLog,
         workspacePath,
         ['commit', '-m', message],
@@ -1211,6 +1216,10 @@ export function registerGitHandlers(): void {
         }),
         result => result.commitHash ? `[${result.commitHash}] commit created` : undefined,
       );
+
+      const result = sessionId && proposalId
+        ? await runCommitProposalOnce(sessionId, await resolveGitCommitProposalPromptId(sessionId, proposalId, false), commitProposalIdentity(workspacePath, message, filesToStage, hunkSelections, repoPath), execute)
+        : await execute();
 
       if (sessionId) {
         // Record every commit the operation produced. A selection spanning two

@@ -20,7 +20,8 @@ import {
   PASTE_COMMAND,
   type LexicalEditor,
 } from 'lexical';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { DocumentPathProvider } from '../../../DocumentPathContext';
 
 import type { DocumentService } from '../../../core/DocumentService';
 import { DocumentLinkPlugin, type CollabReferenceSource } from '../index';
@@ -46,9 +47,10 @@ type TypeaheadProps = {
 
 afterEach(() => {
   setEmbeddableExtensions([]);
+  vi.unstubAllGlobals();
 });
 
-function renderTypeahead(source: CollabReferenceSource) {
+function renderTypeahead(source: CollabReferenceSource | null, documentPath: string | null = null) {
   let latest: TypeaheadProps | null = null;
   let editor: LexicalEditor | null = null;
 
@@ -73,12 +75,14 @@ function renderTypeahead(source: CollabReferenceSource) {
       }}
     >
       <CaptureEditor />
+      <DocumentPathProvider documentPath={documentPath}>
       <DocumentLinkPlugin
-        documentService={{} as DocumentService}
+        documentService={{ listDocuments: async () => [{ id: 'local-panel', name: 'Panel', path: 'docs/panel.mockup.html' }] } as unknown as DocumentService}
         TypeaheadMenuPlugin={TypeaheadStub}
         triggerFn={() => null}
         collabReferenceSource={source}
       />
+      </DocumentPathProvider>
     </LexicalComposer>,
   );
 
@@ -307,5 +311,48 @@ describe('collab reference paste', () => {
   it('ignores a paste that is not a shared-doc link', async () => {
     const harness = renderTypeahead(sourceWithSpec());
     expect(await pasteInto(harness, 'https://example.com/spec-1')).toBe(false);
+  });
+
+  it('turns a pasted link the source owns into a reference, whatever its scheme', async () => {
+    const PERSONAL_TARGET = 'https://console.nimbalyst.com/app/page/drawing-1';
+    const harness = renderTypeahead({
+      listOptions: () => [{ documentId: 'drawing-1', title: 'Architecture', target: PERSONAL_TARGET, icon: 'person' }],
+      openReference: () => {},
+      ownsTarget: (target) => target.startsWith('https://console.nimbalyst.com/app/'),
+    });
+
+    expect(await pasteInto(harness, PERSONAL_TARGET)).toBe(true);
+    expect(await pasteInto(harness, SPEC_TARGET)).toBe(false);
+  });
+});
+
+/** A local file's `@` lists its files after the source's pages; a page's lists only pages. */
+it('lists local files after the pages only when the source asks for them', async () => {
+  const source: CollabReferenceSource = {
+    listOptions: () => [{ documentId: 'spec-1', title: 'Product spec', target: 'nimbalyst://doc/spec-1?orgId=team-1' }],
+    openReference: () => {},
+  };
+  const page = renderTypeahead(source);
+  await act(async () => {
+    page.props.onOpen();
+  });
+  expect(page.props.options.map((option) => option.id)).toEqual(['doc-spec-1']);
+
+  const local = renderTypeahead({ ...source, includeLocalFiles: true }, '/ws/docs/host.md');
+  await act(async () => {
+    local.props.onOpen();
+  });
+  expect(local.props.options.map((option) => option.id).sort()).toEqual(['doc-local-panel', 'doc-spec-1']);
+});
+
+it('inserts a local picker embed relative to its host document', async () => {
+  vi.stubGlobal('__workspacePath', '/ws');
+  setEmbeddableExtensions(['.mockup.html']);
+  const harness = renderTypeahead(null, '/ws/docs/host.md');
+  await primeAndSelect(harness, 'local-panel');
+  harness.editor.getEditorState().read(() => {
+    const embed = $getRoot().getFirstChild();
+    if (!$isEmbeddedFileNode(embed)) throw new Error('Expected a file embed');
+    expect(embed.getSrc()).toBe('./panel.mockup.html');
   });
 });

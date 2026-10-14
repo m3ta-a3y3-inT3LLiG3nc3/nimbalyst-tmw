@@ -1,17 +1,22 @@
 // @vitest-environment jsdom
 import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { Provider } from 'jotai';
 
 vi.mock('@nimbalyst/runtime/ui/icons/MaterialSymbol', () => ({
   MaterialSymbol: ({ icon }: { icon: string }) => <span data-icon={icon} />,
 }));
 
+vi.mock('../../../../dialogs/requestConfirmation', () => ({ requestConfirmation: vi.fn() }));
+
 import { store } from '@nimbalyst/runtime/store';
+import { requestConfirmation } from '../../../../dialogs/requestConfirmation';
 import { DatabasePanel } from '../DatabasePanel';
-import { refreshDbRecoveryState } from '../../../../store/listeners/dbMigrationListeners';
+import type { MigrationOperationSnapshot } from '../../../../../shared/migrationOperation';
+import { hydrateMigrationOperation, refreshDbRecoveryState } from '../../../../store/listeners/dbMigrationListeners';
 import {
+  dbMigrationOperationAtom,
   dbMigratedCopiesAtom,
   dbMigrationBlockedAtom,
   dbRecoveryCandidatesAtom,
@@ -24,6 +29,8 @@ import {
 type Backend = 'pglite' | 'sqlite';
 
 interface RecoveryFixtures {
+  historyRowsQuarantined?: number;
+  operation?: MigrationOperationSnapshot;
   candidates?: RecoveryCandidateView[];
   migratedCopies?: MigratedCopyView[];
   migrationBlocked?: MigrationBlockedState | null;
@@ -53,6 +60,8 @@ function installMigrationApi(activeBackend: Backend, recovery: RecoveryFixtures 
       return {
         success: true,
         activeBackend,
+        historyRowsQuarantined: recovery.historyRowsQuarantined,
+        operation: recovery.operation,
         pgliteDirExists: activeBackend === 'pglite',
         sqliteDirExists: activeBackend === 'sqlite',
         migratedDirs: (recovery.migratedCopies ?? []).map((c) => c.name),
@@ -86,6 +95,9 @@ function installMigrationApi(activeBackend: Backend, recovery: RecoveryFixtures 
     if (channel === 'db:migration:clear-block' || channel === 'db:recovery:delete-migrated') {
       return { success: true };
     }
+    if (channel === 'db:migration:rollback') {
+      return { success: true, restoredFrom: '/u/pglite-db.migrated' };
+    }
     if (channel === 'db:migration:dry-run') {
       return { success: false, error: 'not expected in this test' };
     }
@@ -104,6 +116,7 @@ function renderPanel() {
 }
 
 function resetRecoveryAtoms() {
+  store.set(dbMigrationOperationAtom, null);
   store.set(dbRecoveryCandidatesAtom, []);
   store.set(dbRecoveryOfferAtom, null);
   store.set(dbMigratedCopiesAtom, []);
@@ -111,6 +124,13 @@ function resetRecoveryAtoms() {
 }
 
 describe('DatabasePanel dry-run eligibility', () => {
+  it('shows the durable partial-history warning after restart without an operation snapshot', async () => {
+    installMigrationApi('sqlite', { historyRowsQuarantined: 2 });
+    render(<Provider store={store}><DatabasePanel /></Provider>);
+    expect(await screen.findByText(/Migration completed with 2 document-history entries omitted/)).toBeTruthy();
+    expect(screen.getByText(/original data is retained in a local recovery record/)).toBeTruthy();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -283,5 +303,58 @@ describe('preserved PGLite copies', () => {
         acknowledgedRollbackLoss: true,
       });
     });
+  });
+
+  it('restores the preserved PGLite only after the confirmation is accepted', async () => {
+    const copy: MigratedCopyView = {
+      name: 'pglite-db.migrated-2026-08-19T09-00-00-000Z',
+      path: '/u/pglite-db.migrated-2026-08-19T09-00-00-000Z',
+      sizeBytes: 900 * 1024 * 1024,
+      createdAt: '2026-08-19T09:00:00.000Z',
+      isRollbackSource: true,
+    };
+    const invoke = installMigrationApi('sqlite', { migratedCopies: [copy] });
+    renderPanel();
+    const restore = await screen.findByRole('button', { name: /Restore from preserved PGLite/i });
+
+    vi.mocked(requestConfirmation).mockResolvedValueOnce(false);
+    fireEvent.click(restore);
+    await waitFor(() => expect(requestConfirmation).toHaveBeenCalledTimes(1));
+    expect(invoke).not.toHaveBeenCalledWith('db:migration:rollback');
+
+    vi.mocked(requestConfirmation).mockResolvedValueOnce(true);
+    fireEvent.click(restore);
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('db:migration:rollback'));
+  });
+});
+
+
+describe('migration operation hydration', () => {
+  beforeEach(resetRecoveryAtoms);
+  afterEach(() => { cleanup(); resetRecoveryAtoms(); delete (window as any).electronAPI; });
+  it('shows the retained successful result when Settings mounts after completion', async () => {
+    installMigrationApi('pglite', { operation: { id: 'complete', revision: 8, kind: 'dry-run', status: 'succeeded', response: { success: true, result: {
+      summary: { totalRowsCopied: 123, tablesCopied: [{ name: 'ai_sessions', rows: 123 }], durationMs: 100, foreignKeyViolations: 0, integrityCheck: 'ok', spotCheckCount: 1 },
+      dryRunDir: '/tmp/copy', sqliteFileBytes: 100, pgliteDirBytes: 200,
+    } } } });
+    renderPanel();
+    await screen.findAllByText('Rows copied');
+    screen.getAllByText('123');
+  });
+
+  it('rehydrates running progress after remount and ignores an older status response', async () => {
+    const operation: MigrationOperationSnapshot = { id: 'dry-1', revision: 5, kind: 'dry-run', status: 'running', progress: { currentTable: 'ai_sessions', tableRowsCopied: 20, tableRowsExpected: 100 }, phase: { phase: 'copying' } };
+    const invoke = installMigrationApi('pglite', { operation });
+    const first = renderPanel();
+    await screen.findByRole('button', { name: 'Running dry run...' });
+    first.unmount();
+    renderPanel();
+    await screen.findByRole('button', { name: 'Running dry run...' });
+    screen.getByText('ai_sessions');
+    await act(async () => { hydrateMigrationOperation({ ...operation, revision: 6, status: 'cancelled', response: { success: false, error: 'Cancelled after read settlement' } }); });
+    await screen.findByText(/Cancelled after read settlement/);
+    await act(async () => { hydrateMigrationOperation(operation); });
+    expect(store.get(dbMigrationOperationAtom)?.revision).toBe(6);
+    expect(invoke).not.toHaveBeenCalledWith('db:migration:dry-run');
   });
 });

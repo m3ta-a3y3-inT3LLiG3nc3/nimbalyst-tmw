@@ -1,15 +1,17 @@
 import { resolve } from 'path'
+import { createRequire } from 'node:module'
 import { defineConfig } from 'electron-vite'
 import react from '@vitejs/plugin-react'
 import viteNimbalystPlugin from '../shared/viteNimbalystPlugin.ts'
 import { viteStaticCopy } from 'vite-plugin-static-copy'
-import { nodePolyfills } from 'vite-plugin-node-polyfills'
+import inject from '@rollup/plugin-inject'
 import fs from 'fs'
 import { findMainBundleGraphViolations } from '../../scripts/main-bundle-graph-policy.mjs'
 import {
   findRequireCacheSelfEviction,
   stripRequireCacheSelfEviction,
 } from '../../scripts/main-bundle-require-policy.mjs'
+import dedupeWatcherAddsPlugin from './scripts/dedupeWatcherAddsPlugin.mjs'
 
 // Plugin to optimize Shiki language imports
 const optimizeShikiPlugin = () => {
@@ -115,8 +117,27 @@ const claudeAgentSdkVersion = (() => {
   }
   return 'unknown';
 })();
+const trackerSchemaSrcDir = resolve(__dirname, '../tracker-schema/src');
+const trackerEngineSrcDir = resolve(__dirname, '../tracker-engine/src');
 const trackerCoreSrcDir = resolve(__dirname, '../tracker-core/src');
+const collabProtocolSrcDir = resolve(__dirname, '../collab-protocol/src');
+const localWikiEntry = resolve(__dirname, '../local-wiki/src/index.ts');
 const runtimeSrcDir = resolve(__dirname, '../runtime/src');
+const configRequire = createRequire(resolve(__dirname, 'package.json'));
+
+// Locates a file inside an installed package the way Node would from this
+// package, bypassing the package's `exports` map (several of these do not
+// export the asset we copy). Throws so a missing asset fails the build instead
+// of shipping an app without it.
+function installedPackageFile(pkg: string, file: string): string {
+  for (const dir of configRequire.resolve.paths(pkg) ?? []) {
+    const candidate = resolve(dir, pkg, file);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  throw new Error(`[electron.vite.config] ${pkg}/${file} is not installed`);
+}
+const browserPath = configRequire.resolve('path-browserify/index.js');
+const browserProcess = configRequire.resolve('process/browser.js');
 const runtimeDistDir = resolve(__dirname, '../runtime/dist');
 const runtimeElectronMainEntry = resolve(runtimeSrcDir, 'electronMain.ts');
 const extensionSdkSrcDir = resolve(__dirname, '../extension-sdk/src');
@@ -262,7 +283,13 @@ const staticFileTypeInJimp = () => {
   };
 };
 
-export default defineConfig({
+// `dev-loop.sh` keeps the renderer dev server alive across `/restart` in its
+// own process (scripts/renderer-dev-server.mjs), so the per-restart
+// `electron-vite dev` builds main and preload only. Without this, every restart
+// recompiled ~2,600 renderer modules cold, ~30s before any window could paint.
+const externalRenderer = process.env.NIMBALYST_EXTERNAL_RENDERER === '1';
+
+const config = {
   main: {
     define: {
       'process.env.OFFICIAL_BUILD': JSON.stringify(isOfficialBuild ? 'true' : 'false'),
@@ -306,6 +333,11 @@ export default defineConfig({
         // Explicit subpath imports still resolve straight to runtime source.
         { find: '@nimbalyst/runtime', replacement: runtimeSrcDir },
         { find: '@nimbalyst/tracker-core', replacement: trackerCoreSrcDir },
+        { find: '@nimbalyst/tracker-schema', replacement: trackerSchemaSrcDir },
+        { find: '@nimbalyst/tracker-engine', replacement: trackerEngineSrcDir },
+        { find: '@nimbalyst/collab-protocol', replacement: collabProtocolSrcDir },
+        // The Local wiki library, from source like the other workspace packages.
+        { find: /^@nimbalyst\/local-wiki$/, replacement: localWikiEntry },
         // The public SDK barrel includes renderer hooks which import the public
         // runtime barrel. Main only needs validation and protocol helpers.
         { find: /^@nimbalyst\/extension-sdk$/, replacement: extensionSdkElectronMainEntry },
@@ -313,7 +345,8 @@ export default defineConfig({
       ]
     },
     build: {
-      target: 'node16',
+      // Target modern Node syntax supported by the bundled Electron runtime.
+      target: 'node22',
       sourcemap: isDev,
       rollupOptions: {
         input: {
@@ -353,7 +386,9 @@ export default defineConfig({
     resolve: {
       alias: {
         '@nimbalyst/runtime': runtimeSrcDir,
-        '@nimbalyst/tracker-core': trackerCoreSrcDir
+        '@nimbalyst/tracker-core': trackerCoreSrcDir,
+        '@nimbalyst/tracker-schema': trackerSchemaSrcDir,
+        '@nimbalyst/tracker-engine': trackerEngineSrcDir
       }
     },
     build: {
@@ -379,18 +414,7 @@ export default defineConfig({
       '__CLAUDE_AGENT_SDK_VERSION__': JSON.stringify(claudeAgentSdkVersion),
     },
     plugins: [
-      // Process polyfill for packaged builds - handles dependencies that access process globals.
-      // Must be first so transforms run before other plugins.
-      // Only polyfills in production builds; dev mode works fine with Vite's built-in handling.
-      nodePolyfills({
-        globals: {
-          Buffer: false,
-          global: false,
-          process: 'build',
-        },
-        include: [],
-        protocolImports: false,
-      }),
+      dedupeWatcherAddsPlugin(),
       // The Anthropic SDK's agent-toolset (server-side file tools, added in
       // @anthropic-ai/sdk 0.100.x) is dragged into the renderer bundle via the
       // runtime barrel (ai/models.ts value-imports the SDK for the model
@@ -479,15 +503,11 @@ export default defineConfig({
           targets.push({ src: toPosix(resolve(onboardingDir, '*')), dest: 'onboarding', overwrite: true });
         }
         // Copy es-module-shims for extension loading (enables dynamic import maps)
-        const esModuleShims = resolve(__dirname, '../../node_modules/es-module-shims/dist/es-module-shims.js');
-        if (fs.existsSync(esModuleShims)) {
-          targets.push({ src: toPosix(esModuleShims), dest: '', overwrite: true });
-        }
+        const esModuleShims = installedPackageFile('es-module-shims', 'dist/es-module-shims.js');
+        targets.push({ src: toPosix(esModuleShims), dest: '', overwrite: true });
         // Copy ghostty-web WASM file for terminal emulation
-        const ghosttyWasm = resolve(__dirname, '../../node_modules/ghostty-web/ghostty-vt.wasm');
-        if (fs.existsSync(ghosttyWasm)) {
-          targets.push({ src: toPosix(ghosttyWasm), dest: '', overwrite: true });
-        }
+        const ghosttyWasm = installedPackageFile('ghostty-web', 'ghostty-vt.wasm');
+        targets.push({ src: toPosix(ghosttyWasm), dest: '', overwrite: true });
         // Copy prismjs core so index.html can load it as a classic <script>
         // BEFORE any ESM module evaluates. Vite/esbuild's prebundling of
         // @lexical/code (which transitively imports @lexical/code-prism) ends
@@ -495,10 +515,8 @@ export default defineConfig({
         // before prismjs main, which the language files need to have set
         // `window.Prism`. Loading prismjs as a classic script in the HTML
         // sidesteps the reorder.
-        const prismCore = resolve(__dirname, '../../node_modules/prismjs/prism.js');
-        if (fs.existsSync(prismCore)) {
-          targets.push({ src: toPosix(prismCore), dest: '', overwrite: true });
-        }
+        const prismCore = installedPackageFile('prismjs', 'prism.js');
+        targets.push({ src: toPosix(prismCore), dest: '', overwrite: true });
         return viteStaticCopy({ targets });
       })()
     ].filter(Boolean),
@@ -527,16 +545,23 @@ export default defineConfig({
       target: 'chrome109',
       sourcemap: isDev,
       rollupOptions: {
+        // Rollup options also reach worker builds; inject only the free identifier.
+        plugins: [inject({ process: browserProcess })],
         input: {
-          index: resolve(__dirname, 'src/renderer/index.html')
+          index: resolve(__dirname, 'src/renderer/index.html'),
+          island: resolve(__dirname, 'src/renderer/island.html'),
         }
       }
     },
     resolve: {
       alias: [
+        { find: /^path$/, replacement: browserPath },
+        { find: /^process$/, replacement: browserProcess },
         // Ensure renderer also points runtime imports at source
         { find: '@nimbalyst/runtime', replacement: runtimeSrcDir },
         { find: '@nimbalyst/tracker-core', replacement: trackerCoreSrcDir },
+        { find: '@nimbalyst/tracker-schema', replacement: trackerSchemaSrcDir },
+        { find: '@nimbalyst/tracker-engine', replacement: trackerEngineSrcDir },
         ...extensionSdkSourceSubpaths,
         // Redirect `import ... from 'prismjs'` (exact match only) to a shim
         // that returns the window.Prism instance loaded by the classic
@@ -560,6 +585,7 @@ export default defineConfig({
         // which cause "registerNodeTransform: Type Class not in this Editor" errors
         '@lexical/clipboard',
         '@lexical/code',
+        '@lexical/code-core',
         '@lexical/devtools-core',
         '@lexical/dragon',
         '@lexical/file',
@@ -582,6 +608,8 @@ export default defineConfig({
         '@lexical/utils',
         '@lexical/yjs',
         '@nimbalyst/runtime',
+        '@nimbalyst/tracker-schema',
+        '@nimbalyst/tracker-engine',
         '@nimbalyst/tracker-core'
       ]
     },
@@ -602,6 +630,7 @@ export default defineConfig({
         '@floating-ui/react',
         '@lexical/clipboard',
         '@lexical/code',
+        '@lexical/code-core',
         '@lexical/dragon',
         '@lexical/extension',
         '@lexical/hashtag',
@@ -710,6 +739,11 @@ export default defineConfig({
         'refractor',
         'remark-gfm',
         'uuid',
+        // Chart blocks import these dynamically on first mount.
+        'vega',
+        'vega-embed',
+        'vega-interpreter',
+        'vega-lite',
         'virtua',
         'y-monaco',
         'y-protocols/awareness',
@@ -720,6 +754,8 @@ export default defineConfig({
         '@shikijs/langs',
         'prettier',
         '@nimbalyst/runtime',
+        '@nimbalyst/tracker-schema',
+        '@nimbalyst/tracker-engine',
         '@nimbalyst/tracker-core',
         // RevoGrid is a Stencil bundle: its runtime lazy-imports its own
         // component entry chunks at render time. Pre-bundled, those dynamic
@@ -739,4 +775,6 @@ export default defineConfig({
       }
     }
   }
-})
+};
+
+export default defineConfig(externalRenderer ? { ...config, renderer: undefined } : config);

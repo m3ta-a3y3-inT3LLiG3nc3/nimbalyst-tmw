@@ -1,3 +1,11 @@
+import type { SessionPayloadReference, SessionPayloadClientMessage, SessionPayloadServerMessage } from './sessionPayload.js';
+import type {
+  IndexPageRequestMessage,
+  IndexPageResponseMessage,
+  IndexChangesAvailableMessage,
+  PersonalStatePageRequestMessage,
+  PersonalStatePageResponseMessage,
+} from './indexReplication.js';
 /**
  * PersonalSessionRoom + PersonalIndexRoom wire protocol.
  *
@@ -6,12 +14,15 @@
  * and one `ClientMessage` / `ServerMessage` union here.
  */
 
-
 // ============================================================================
 // Client -> Server Messages
 // ============================================================================
 
 export type ClientMessage =
+  | SessionPayloadClientMessage
+  | { type: 'beginSessionReplay'; activityAt: number }
+  | IndexPageRequestMessage
+  | PersonalStatePageRequestMessage
   | SyncRequestMessage
   | AppendMessageMessage
   | UpdateMetadataMessage
@@ -31,6 +42,7 @@ export type ClientMessage =
   | VoiceToolRequestMessage
   | VoiceToolResponseMessage
   | SessionControlCommandMessage
+  | SessionContextUpdateMessage
   | RegisterPushTokenMessage
   | UnregisterPushTokenMessage
   | RegisterLiveActivityTokenMessage
@@ -50,6 +62,7 @@ export interface PingMessage {
 
 /** Request messages since a cursor */
 export interface SyncRequestMessage {
+  sinceRevision?: number;
   type: 'syncRequest';
   sinceId?: string;
   sinceSeq?: number;
@@ -58,6 +71,7 @@ export interface SyncRequestMessage {
 /** Append a new message to the session */
 export interface AppendMessageMessage {
   type: 'appendMessage';
+  expectedRevision?: number;
   message: EncryptedMessage;
 }
 
@@ -267,6 +281,27 @@ export interface SessionControlMessage {
   targetDeviceId?: string;
 }
 
+/**
+ * A session's live context-window usage, relayed to the user's other devices
+ * and never stored. Every assistant step changes it; persisting each value
+ * cost an index row rewrite plus a replication journal entry. The stored
+ * index row still gets the last value at the turn boundary.
+ *
+ * `encryptedContext` decrypts to client-metadata JSON holding only
+ * `currentContext: { tokens, contextWindow }`. `at` orders updates.
+ */
+export interface LiveSessionContext {
+  sessionId: string;
+  encryptedContext: string;
+  contextIv: string;
+  at: number;
+}
+
+export interface SessionContextUpdateMessage {
+  type: 'sessionContextUpdate';
+  update: LiveSessionContext;
+}
+
 /** Register a push notification token for this device */
 export interface RegisterPushTokenMessage {
   type: 'registerPushToken';
@@ -324,6 +359,8 @@ export interface UnregisterLiveActivityTokenMessage {
   type: 'unregisterLiveActivityToken';
   deviceId: string;
   kind?: LiveActivityTokenKind;
+  /** Optional identity prevents an old activity from unregistering a newer token. */
+  token?: string;
 }
 
 /**
@@ -503,6 +540,11 @@ export interface EncryptedSettingsPayload {
 // ============================================================================
 
 export type ServerMessage =
+  | SessionPayloadServerMessage
+  | { type: 'indexSessionExpired'; sessionId: string; activityAt: number }
+  | IndexChangesAvailableMessage
+  | IndexPageResponseMessage
+  | PersonalStatePageResponseMessage
   | SyncResponseMessage
   | MessageBroadcastMessage
   | MetadataBroadcastMessage
@@ -522,6 +564,7 @@ export type ServerMessage =
   | VoiceToolRequestBroadcastMessage
   | VoiceToolResponseBroadcastMessage
   | SessionControlBroadcastMessage
+  | SessionContextBroadcastMessage
   | SettingsSyncBroadcastMessage
   | ReadReceiptSyncBroadcastMessage
   | TrackerPersonalStateSyncBroadcastMessage
@@ -530,6 +573,7 @@ export type ServerMessage =
 
 /** Response to syncRequest */
 export interface SyncResponseMessage {
+  revisionCursor?: number;
   type: 'syncResponse';
   messages: EncryptedMessage[];
   metadata: SessionMetadata | null;
@@ -669,6 +713,13 @@ export interface SessionControlBroadcastMessage {
   fromConnectionId?: string;
 }
 
+/** Relay of a `sessionContextUpdate` to the user's other devices. */
+export interface SessionContextBroadcastMessage {
+  type: 'sessionContextBroadcast';
+  update: LiveSessionContext;
+  fromConnectionId?: string;
+}
+
 /** Broadcast encrypted settings to other devices (mobile receives this) */
 export interface SettingsSyncBroadcastMessage {
   type: 'settingsSyncBroadcast';
@@ -731,6 +782,7 @@ export interface ErrorMessage {
   type: 'error';
   code: string;
   message: string;
+  requestId?: string;
 }
 
 // ============================================================================
@@ -744,6 +796,8 @@ export interface ErrorMessage {
 export interface DeviceInfo {
   /** Unique device ID (stable across sessions, generated per device) */
   deviceId: string;
+  /** Server-owned inventory visibility; never affects session ownership. */
+  inventoryHidden?: boolean;
   /** Human-readable device name (e.g., "MacBook Pro", "iPhone 15") */
   name: string;
   /** Device type for icon display */
@@ -771,6 +825,9 @@ export interface DeviceInfo {
  * Content is E2E encrypted - server only sees ciphertext.
  */
 export interface EncryptedMessage {
+  projectionVersion?: number;
+  revision?: number;
+  payload?: SessionPayloadReference;
   /** ULID for global ordering */
   id: string;
   /** Monotonic sequence within session */
@@ -816,6 +873,26 @@ export interface SessionMetadata {
   isExecuting?: boolean;
 }
 
+/** Encrypted queued-prompt preview retained in the personal session index. */
+export interface IndexEncryptedQueuedPrompt {
+  options?: { mode?: "agent" | "planning"; model?: string; effortLevel?: string };
+  id: string;
+  encryptedPrompt: string;
+  iv: string;
+  timestamp: number;
+  source?: string;
+  encryptedAttachments?: Array<{
+    id: string;
+    filename: string;
+    mimeType: string;
+    encryptedData: string;
+    iv: string;
+    size: number;
+    width?: number;
+    height?: number;
+  }>;
+}
+
 /** Session entry in the PersonalIndexRoom */
 export interface SessionIndexEntry {
   sessionId: string;
@@ -830,14 +907,19 @@ export interface SessionIndexEntry {
   provider: string;
   model?: string;
   mode?: 'agent' | 'planning';
-  messageCount: number;
+  /** Omit when a metadata-only publisher has no authoritative count. */
+  messageCount?: number;
   lastMessageAt: number;
   createdAt: number;
   updatedAt: number;
   /** Whether the session is currently executing (processing AI request) */
   isExecuting?: boolean;
-  /** Parent session ID for workstream/worktree hierarchy (plaintext UUID) */
-  parentSessionId?: string;
+  /** Omitted preserves the stored queue; zero is an explicit empty queue. */
+  queuedPromptCount?: number;
+  /** Omitted preserves the stored preview; an empty array clears it. */
+  encryptedQueuedPrompts?: IndexEncryptedQueuedPrompt[];
+  /** Parent session ID (plaintext UUID); omitted preserves, null clears. */
+  parentSessionId?: string | null;
   /** Structural type: 'session' (normal), 'workstream' (parent container), 'blitz' (quick task) */
   sessionType?: string;
   /** Worktree ID for git worktree association (plaintext UUID) */
@@ -846,8 +928,8 @@ export interface SessionIndexEntry {
   hostDeviceId?: string;
   /** Agent role marker (e.g. 'meta-agent', 'standard'). Plaintext - drives mobile meta-agent grouping. */
   agentRole?: string;
-  /** Meta-agent parent session ID for spawned children (plaintext UUID). Drives mobile meta-agent grouping. */
-  createdBySessionId?: string;
+  /** Manager session ID (plaintext UUID); omitted preserves, null clears. */
+  createdBySessionId?: string | null;
   /** Whether the session is archived */
   isArchived?: boolean;
   /** Whether the session is pinned */

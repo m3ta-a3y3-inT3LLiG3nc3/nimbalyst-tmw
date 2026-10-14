@@ -9,8 +9,8 @@
  *
  * Semantics
  *  - Each chunk that lands as a "pure text update" (same event id, no
- *    structural change) is applied as an in-place patch to the cached
- *    projected message: O(1) work per chunk.
+ *    structural change) replaces just that projected message with a copy
+ *    carrying the new text; the array is copied once per frame, not per chunk.
  *  - Any structural change (new event id, payload thinking/model added,
  *    eventType/parent/subagent change) marks the session for a full
  *    re-projection on the next flush.
@@ -25,6 +25,7 @@
  */
 
 import { TranscriptProjector } from '@nimbalyst/runtime/ai/server/transcript/TranscriptProjector';
+import { latestTranscriptGeneration, reconcileTranscriptMessages } from './transcriptReconciliation';
 import type {
   TranscriptViewMessage,
 } from '@nimbalyst/runtime/ai/server/transcript/TranscriptProjector';
@@ -41,11 +42,14 @@ export interface AccumulatorOutput {
 export type Scheduler = (cb: () => void) => void;
 
 interface SessionState {
+  transcriptGeneration?: number;
+  /** The atom array last seen; differs from our own publication only on snapshot loads. */
+  observedSnapshot?: TranscriptViewMessage[];
   /** Live canonical events keyed by id for O(1) lookup. */
   eventsById: Map<number, TranscriptEvent>;
-  /** Last published merged messages array (DB messages + live messages, sorted by id). */
+  /** Last published merged messages array (DB messages + live messages, sorted by sequence). */
   currentMessages: TranscriptViewMessage[];
-  /** Index of each event id in `currentMessages`, for O(1) in-place patches. */
+  /** Index of each event id in `currentMessages`, for O(1) text patches. */
   messageIndexById: Map<number, number>;
   /** True when a structural change requires a full re-projection on next flush. */
   needsRebuild: boolean;
@@ -53,6 +57,8 @@ interface SessionState {
   flushScheduled: boolean;
   /** True when at least one apply() call has been made since the last flush. */
   dirty: boolean;
+  /** `currentMessages` was already copied for this frame's text patches. */
+  patchedSinceFlush: boolean;
 }
 
 export interface AccumulatorOptions {
@@ -69,6 +75,13 @@ export interface AccumulatorOptions {
    * tests pass a manual queue.
    */
   schedule: Scheduler;
+  /**
+   * Whether this window holds (or is loading) the session's data. Main sends
+   * every session's events to every window; events for a session this window
+   * has not loaded are dropped instead of retained. Its later load reads the
+   * persisted transcript, and later events re-enter here.
+   */
+  isSessionTracked?: (sessionId: string) => boolean;
 }
 
 export class TranscriptStreamAccumulator {
@@ -82,7 +95,17 @@ export class TranscriptStreamAccumulator {
    * then schedules a flush if one is not already pending.
    */
   apply(event: TranscriptEvent): void {
+    if (this.opts.isSessionTracked && !this.opts.isSessionTracked(event.sessionId)) {
+      this.sessions.delete(event.sessionId);
+      return;
+    }
     const state = this.ensureSession(event.sessionId);
+    // A snapshot can replace the atom while older callbacks are still queued.
+    this.observeSnapshot(event.sessionId, state);
+    const eventGeneration = latestTranscriptGeneration([event]);
+    if (state.transcriptGeneration !== undefined &&
+        (eventGeneration === undefined || eventGeneration < state.transcriptGeneration)) return;
+    this.acceptGeneration(state, eventGeneration);
     const existing = state.eventsById.get(event.id);
 
     if (existing && this.canPatchInPlace(existing, event)) {
@@ -91,7 +114,13 @@ export class TranscriptStreamAccumulator {
       state.eventsById.set(event.id, event);
       const idx = state.messageIndexById.get(event.id);
       if (idx !== undefined && state.currentMessages[idx]?.id === event.id) {
-        applyTextPatch(state.currentMessages[idx], event);
+        // Replace, don't mutate: transcript rows are memoized on message
+        // identity, and the published array must change for the atom to fire.
+        if (!state.patchedSinceFlush) {
+          state.currentMessages = state.currentMessages.slice();
+          state.patchedSinceFlush = true;
+        }
+        state.currentMessages[idx] = withPatchedText(state.currentMessages[idx], event);
       } else {
         // The event id is known to the accumulator but isn't represented
         // as a 1:1 view message -- e.g. the projector fused two adjacent
@@ -128,6 +157,11 @@ export class TranscriptStreamAccumulator {
     return this.sessions.get(sessionId)?.flushScheduled ?? false;
   }
 
+  /** For tests: how many live events are held for a session. */
+  retainedEventCount(sessionId: string): number {
+    return this.sessions.get(sessionId)?.eventsById.size ?? 0;
+  }
+
   // ---------------- Internals ----------------
 
   private ensureSession(sessionId: string): SessionState {
@@ -140,6 +174,7 @@ export class TranscriptStreamAccumulator {
         needsRebuild: false,
         flushScheduled: false,
         dirty: false,
+        patchedSinceFlush: false,
       };
       this.sessions.set(sessionId, state);
     }
@@ -158,6 +193,8 @@ export class TranscriptStreamAccumulator {
     state.flushScheduled = false;
     if (!state.dirty) return;
     state.dirty = false;
+    state.patchedSinceFlush = false;
+    this.observeSnapshot(sessionId, state);
 
     if (state.needsRebuild || state.currentMessages.length === 0) {
       this.rebuild(sessionId, state);
@@ -165,29 +202,41 @@ export class TranscriptStreamAccumulator {
     }
 
     this.opts.emit({ sessionId, messages: state.currentMessages });
+    // The atom normally holds this exact array after our synchronous emit.
+    // Do not treat our own publication as a new external snapshot next frame.
+    // If an observer replaced it meanwhile, let observeSnapshot inspect that.
+    if (this.opts.readDbMessages(sessionId) === state.currentMessages)
+      state.observedSnapshot = state.currentMessages;
+  }
+
+  private observeSnapshot(sessionId: string, state: SessionState): TranscriptViewMessage[] {
+    const snapshot = this.opts.readDbMessages(sessionId);
+    if (snapshot !== state.observedSnapshot) {
+      state.observedSnapshot = snapshot;
+      this.acceptGeneration(state, latestTranscriptGeneration(snapshot));
+      state.needsRebuild = true;
+    }
+    return snapshot;
+  }
+
+  private acceptGeneration(state: SessionState, generation: number | undefined): void {
+    if (generation === undefined || generation <= (state.transcriptGeneration ?? 0)) return;
+    state.transcriptGeneration = generation;
+    state.eventsById.clear();
+    state.currentMessages = [];
+    state.messageIndexById.clear();
+    state.needsRebuild = true;
   }
 
   private rebuild(sessionId: string, state: SessionState): void {
-    const events = Array.from(state.eventsById.values()).sort((a, b) => a.id - b.id);
-    const liveViewModel = TranscriptProjector.project(events);
-    const liveMessages = liveViewModel.messages;
-    const dbMessages = this.opts.readDbMessages(sessionId);
-
-    const liveIds = new Set(liveMessages.map((m) => m.id));
-    const hasLiveUserMessage = liveMessages.some((m) => m.type === 'user_message');
-
-    const merged: TranscriptViewMessage[] = [];
-    for (const m of dbMessages) {
-      if (liveIds.has(m.id)) continue;
-      // Drop optimistic messages (negative ids) once a real user_message
-      // is in the live set -- the real version replaces the optimistic
-      // copy we'd otherwise duplicate.
-      if (m.id < 0 && hasLiveUserMessage) continue;
-      merged.push(m);
-    }
-    for (const m of liveMessages) merged.push(m);
-    merged.sort((a, b) => a.id - b.id);
-
+    const dbMessages = this.observeSnapshot(sessionId, state);
+    const events = Array.from(state.eventsById.values()).sort((a, b) => a.sequence - b.sequence || a.id - b.id);
+    const liveMessages = TranscriptProjector.project(events).messages;
+    // Filter even when the current generation has no live events yet: a late
+    // snapshot must never resurrect the retired generation in the atom.
+    const current = dbMessages.filter(message => message.id < 0 ||
+      state.transcriptGeneration === undefined || message.transcriptGeneration === state.transcriptGeneration);
+    const merged = reconcileTranscriptMessages(current, liveMessages, { stream: true });
     state.currentMessages = merged;
     state.messageIndexById = new Map();
     for (let i = 0; i < merged.length; i++) {
@@ -223,12 +272,9 @@ export class TranscriptStreamAccumulator {
 }
 
 /**
- * Update the projected message in-place to reflect the new event's text
- * and any payload metadata that the projector's per-event mapping would
- * have copied from the assistant_message payload.
+ * A copy of the projected message carrying the new event's text. The other
+ * payload fields are unchanged by definition of canPatchInPlace.
  */
-function applyTextPatch(message: TranscriptViewMessage, event: TranscriptEvent): void {
-  message.text = event.searchableText ?? undefined;
-  // mode/thinking/model are unchanged by definition of canPatchInPlace,
-  // so we don't touch them here.
+function withPatchedText(message: TranscriptViewMessage, event: TranscriptEvent): TranscriptViewMessage {
+  return { ...message, text: event.searchableText ?? undefined };
 }

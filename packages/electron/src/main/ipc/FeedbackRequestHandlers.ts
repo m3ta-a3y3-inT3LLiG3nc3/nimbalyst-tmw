@@ -1,3 +1,4 @@
+import { registerDocumentFeedbackIndexHandlers } from './DocumentFeedbackIndexHandlers';
 import { BrowserWindow } from 'electron';
 
 import type {
@@ -23,14 +24,18 @@ import {
   shutdownFeedbackRequestService,
 } from '../services/FeedbackRequestService';
 import { safeHandle } from '../utils/ipcRegistry';
+import { ensureDocumentDecisionTracker } from '../services/DocumentDecisionTrackerService';
+import type { DocumentDecisionTrackerInput } from '../../shared/documentDecisionTracker';
 
 let cleanupSubscription: (() => void) | null = null;
 let cleanupIndexSubscription: (() => void) | null = null;
 
 export function registerFeedbackRequestHandlers(): void {
   if (cleanupSubscription) return;
+  registerDocumentFeedbackIndexHandlers();
   const service = getFeedbackRequestService();
   const indexService = getFeedbackRequestIndexService();
+  safeHandle('document-decision:ensure-tracker', async (_event, input: DocumentDecisionTrackerInput) => ensureDocumentDecisionTracker(input));
   cleanupSubscription = service.subscribe((state) => {
     for (const window of BrowserWindow.getAllWindows()) {
       if (!window.isDestroyed()) {

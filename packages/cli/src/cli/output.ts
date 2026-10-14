@@ -128,12 +128,12 @@ const CONTROL_CHARS_KEEPING_WHITESPACE = new RegExp(
  * lose. A filter like `[^\x20-\x7E]` would have eaten the text instead of the
  * attack.
  */
-function safeText(value: string): string {
+export function safeText(value: string): string {
   return value.replace(ANSI_SEQUENCE, '').replace(CONTROL_CHARS, '');
 }
 
 /** As `safeText`, keeping the tabs and newlines a multi-line block needs. */
-function safeBlock(value: string): string {
+export function safeBlock(value: string): string {
   return value.replace(ANSI_SEQUENCE, '').replace(CONTROL_CHARS_KEEPING_WHITESPACE, '');
 }
 
@@ -302,7 +302,7 @@ function csvColumns(records: TrackerRecord[], opts: OutputOptions): string[] {
 const FORMULA_LEAD = /^[=+\-@\t\r]/;
 const PLAIN_NUMBER = /^[+-]?\d+(?:\.\d+)?$/;
 
-function csvCell(value: string): string {
+export function csvCell(value: string): string {
   const text = safeBlock(value);
   const escaped = text.replace(/"/g, '""');
   if (FORMULA_LEAD.test(text) && !PLAIN_NUMBER.test(text)) return `"'${escaped}"`;

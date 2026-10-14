@@ -4,16 +4,12 @@ import { Provider } from 'jotai';
 import { act, cleanup, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('@nimbalyst/runtime', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@nimbalyst/runtime')>();
+vi.mock('@nimbalyst/runtime/ui/icons/MaterialSymbol', () => ({ MaterialSymbol: () => null }));
+vi.mock('@nimbalyst/runtime/ui/icons/ProviderIcons', () => ({ ProviderIcon: () => null, resolveProviderIcon: (provider: string) => provider }));
+vi.mock('@nimbalyst/runtime/utils/clipboard', () => ({ copyToClipboard: vi.fn() }));
+vi.mock('@nimbalyst/runtime/ui/AgentTranscript/session/sessionRefAtoms', async () => {
   const { atom } = await import('jotai');
-  return {
-    ...actual,
-    MaterialSymbol: () => null,
-    ProviderIcon: () => null,
-    copyToClipboard: vi.fn(),
-    sessionRefMapAtom: atom(new Map()),
-  };
+  return { sessionRefMapAtom: atom(new Map()) };
 });
 vi.mock('../SessionContextMenu', () => ({ SessionContextMenu: () => null }));
 vi.mock('../SessionRelativeTime', () => ({ SessionRelativeTime: () => null }));
@@ -148,8 +144,8 @@ describe('expanded workstream title reconciliation (NIM-420)', () => {
     const view = renderExpandedChild();
 
     screen.getByText('Loaded child title');
-    screen.getByText(parentTitle);
-    expect(document.querySelectorAll('.workstream-session-item')).toHaveLength(1);
+    expect(screen.queryByText(parentTitle)).toBeNull();
+    expect(document.querySelectorAll('.session-list-item')).toHaveLength(1);
 
     act(() => {
       handlers.get('session:title-updated')?.({
@@ -178,8 +174,8 @@ describe('expanded workstream title reconciliation (NIM-420)', () => {
     });
 
     screen.getByText('Second external rename');
-    screen.getByText(parentTitle);
-    expect(document.querySelectorAll('.workstream-session-item')).toHaveLength(1);
+    expect(screen.queryByText(parentTitle)).toBeNull();
+    expect(document.querySelectorAll('.session-list-item')).toHaveLength(1);
     expectNoChildRefetch();
 
     view.rerender(
@@ -198,7 +194,7 @@ describe('expanded workstream title reconciliation (NIM-420)', () => {
         />
       </Provider>
     );
-    expect(document.querySelectorAll('.workstream-session-item')).toHaveLength(0);
+    expect(document.querySelectorAll('.session-list-item')).toHaveLength(1);
 
     view.rerender(
       <Provider store={store}>
@@ -217,7 +213,7 @@ describe('expanded workstream title reconciliation (NIM-420)', () => {
       </Provider>
     );
     screen.getByText('Second external rename');
-    screen.getByText(parentTitle);
+    expect(screen.queryByText(parentTitle)).toBeNull();
 
     // A full session-view refresh reconstructs the structural cache from the
     // latest database metadata. This was the observed pre-fix recovery path.

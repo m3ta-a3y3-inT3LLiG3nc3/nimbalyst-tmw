@@ -8,10 +8,11 @@
  * from the room on every connect, and nothing in this host originates a change
  * to them. So they live in memory, and a reload replays them.
  *
- * This is deliberately read-only. Creating a folder, renaming a tracker, or
- * editing a type definition is a desktop action -- `listUnsynced` returns
- * nothing, so this host never pushes into either lane and never has a local
- * change the server could refuse.
+ * Mostly read-only. Creating a folder, renaming a tracker, or editing an
+ * existing type definition is a desktop action. The one write is a brand-new
+ * team type from the Pages "New type..." dialog (`defineTeamType`): it waits
+ * in memory until the room answers, so a refusal is reported to the person
+ * who asked and is never re-sent on a later connect.
  *
  * Two things make the schema lane more than "parse the JSON":
  *
@@ -34,20 +35,36 @@
  * the type arrives.
  */
 
-import type { SyncId } from '@nimbalyst/runtime/sync/trackerProtocol';
+import { isPermanentTrackerRejection, type SyncId, type TrackerMutationRejectCode } from '@nimbalyst/tracker-engine';
 import type {
   TrackerNavigationSyncHooks,
   TrackerSchemaSyncHooks,
-} from '@nimbalyst/runtime/sync/TrackerSyncEngine';
+} from '@nimbalyst/tracker-engine';
 import {
   compareTrackerNavigationEntries,
   isTrackerNavigationEntry,
   type TrackerNavigationEntry,
 } from '@nimbalyst/runtime/sync/trackerNavigation';
-import { globalRegistry, type TrackerDataModel } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/TrackerDataModel';
-import { decodeTrackerSchemaPayload } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/schemaSyncPayload';
-import { resolveTrackerSchemaPatch } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/schemaPatch';
-import { normalizeTrackerSharingModel } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/YAMLParser';
+import {
+  emptyLabelRegistry,
+  globalRegistry,
+  type LabelRegistry,
+  type PredicateDefinition,
+  type TrackerDataModel,
+} from '@nimbalyst/tracker-schema';
+import {
+  isDerivedTrackerTypeDeclaration,
+  resolveTrackerTypeInheritance,
+  type TrackerTypeDeclaration,
+} from '@nimbalyst/tracker-schema';
+import {
+  decodeTrackerSchemaPayload,
+  encodeTrackerSchemaModelPayload,
+  TRACKER_LABEL_REGISTRY_SCHEMA_TYPE,
+  TRACKER_PREDICATE_REGISTRY_SCHEMA_TYPE,
+} from '@nimbalyst/runtime/plugins/TrackerPlugin/models/schemaSyncPayload';
+import { resolveTrackerSchemaPatch } from '@nimbalyst/tracker-schema';
+import { normalizeTrackerSharingModel } from '@nimbalyst/tracker-schema';
 
 export interface BrowserTrackerSchemaStoreOptions {
   /**
@@ -67,9 +84,22 @@ export interface BrowserTrackerSchemaState {
   trackerTypes: TrackerDataModel[];
   /** The team's synced sidebar tree, sorted the way every host sorts it. */
   navigationEntries: TrackerNavigationEntry[];
+  /**
+   * The room's predicate registry: the labels and inverse labels of the
+   * relations wiki pages use. Empty until the room publishes
+   * one; an unreadable publish leaves the previous registry in place.
+   */
+  predicates: PredicateDefinition[];
+  /** The room's label registry (labels.yaml), same rules as `predicates`. */
+  labels: LabelRegistry;
 }
 
-const EMPTY_STATE: BrowserTrackerSchemaState = { trackerTypes: [], navigationEntries: [] };
+const EMPTY_STATE: BrowserTrackerSchemaState = {
+  trackerTypes: [],
+  navigationEntries: [],
+  predicates: [],
+  labels: emptyLabelRegistry(),
+};
 
 /** A type this host has no lane for: personal items never reach a team room. */
 export function isPersonalTrackerModel(model: TrackerDataModel): boolean {
@@ -96,6 +126,9 @@ export function resolveBrowserTrackerSchema(
   const decoded = decodeTrackerSchemaPayload(type, json);
   if (!decoded) return null;
   if (decoded.kind === 'model') return normalizeTrackerSharingModel(decoded.model, 'team');
+  // A predicate registry is not a tracker type. It arrives under its own
+  // reserved schema type and is handled by `applyRemote` before this is called.
+  if (decoded.kind === 'predicates' || decoded.kind === 'labels') return null;
   const seed = builtinSeed(type);
   if (!seed) return null;
   try {
@@ -105,13 +138,34 @@ export function resolveBrowserTrackerSchema(
   }
 }
 
+/** What the "New type" dialog tells the person when the room did not take their type. */
+function describeDefinitionRefusal(type: string, error: { code: string; message: string } | undefined): string {
+  const code = error?.code ?? 'unknown';
+  if (code === 'schemaExists') return `Someone else just created a type named "${type}". Pick another name.`;
+  if (code === 'rotationLocked') {
+    return `The team's server is not accepting changes to this project right now (rotationLocked). The type was not created.`;
+  }
+  if (code === 'createOnlyUnsupported' || isPermanentTrackerRejection(code as TrackerMutationRejectCode)) {
+    return error?.message || `The team room refused the new type (${code}).`;
+  }
+  return `The team's server couldn't take the new type right now (${code}). Try again.`;
+}
+
 export class BrowserTrackerSchemaStore {
   private readonly builtins = new Map<string, TrackerDataModel>();
   private readonly models = new Map<string, TrackerDataModel>();
   private readonly navigation = new Map<string, TrackerNavigationEntry>();
+  private predicates: PredicateDefinition[] = [];
+  private labels: LabelRegistry = emptyLabelRegistry();
   private readonly listeners = new Set<(state: BrowserTrackerSchemaState) => void>();
   private state: BrowserTrackerSchemaState = EMPTY_STATE;
   private disposed = false;
+  /** New team types waiting on the room, by type id. */
+  private readonly pendingDefinitions = new Map<string, {
+    payload: string;
+    resolve: () => void;
+    reject: (error: Error) => void;
+  }>();
 
   private readonly reportError?: (error: unknown, context: string) => void;
 
@@ -134,9 +188,54 @@ export class BrowserTrackerSchemaStore {
    * no cursor -- see the note on `TrackerSchemaSyncHooks`.
    */
   readonly schemaSync: TrackerSchemaSyncHooks = {
-    listUnsynced: async () => [],
+    listUnsynced: async () => [...this.pendingDefinitions.entries()]
+      .map(([type, pending]) => ({ type, model: pending.payload, deleted: false, createOnly: 'required' as const })),
+    // A new type settles only on the answer to its own mutation. A delta for the
+    // same id from another client is that client's type, not this creation's
+    // success; the room refuses this one with `schemaExists` instead.
+    onSettled: ({ type, model, accepted, error }) => {
+      const pending = this.pendingDefinitions.get(type);
+      if (!pending || pending.payload !== model) return;
+      if (accepted) {
+        this.pendingDefinitions.delete(type);
+        queueMicrotask(pending.resolve);
+        return;
+      }
+      // Every refusal settles, temporary ones included. Nothing re-sends a
+      // creation until the socket reconnects, so leaving one queued is a dialog
+      // that never finishes; the person can try again instead.
+      this.pendingDefinitions.delete(type);
+      pending.reject(new Error(describeDefinitionRefusal(type, error)));
+    },
     applyRemote: async ({ type, model }) => {
       if (this.disposed) return;
+      // The predicate registry (knowledge-scopes 4.1) rides this lane under a
+      // reserved schema type. Registering it here is what makes section 7's
+      // "the same violation reports the same code in the web console" true:
+      // `TrackerDataModelRegistry.validate` is the same validator on both
+      // hosts, and it needs the same registry in front of it.
+      if (type === TRACKER_PREDICATE_REGISTRY_SCHEMA_TYPE) {
+        const decoded = model === null ? null : decodeTrackerSchemaPayload(type, model);
+        if (model !== null && decoded?.kind !== 'predicates') {
+          this.reportError?.(new Error('Unreadable predicate registry'), 'tracker schema');
+          return;
+        }
+        this.predicates = decoded?.kind === 'predicates' ? decoded.predicates : [];
+        globalRegistry.setPredicates(this.predicates);
+        this.emit();
+        return;
+      }
+      if (type === TRACKER_LABEL_REGISTRY_SCHEMA_TYPE) {
+        const decoded = model === null ? null : decodeTrackerSchemaPayload(type, model);
+        if (model !== null && decoded?.kind !== 'labels') {
+          this.reportError?.(new Error('Unreadable label registry'), 'tracker schema');
+          return;
+        }
+        this.labels = decoded?.kind === 'labels' ? decoded.registry : emptyLabelRegistry();
+        globalRegistry.setLabels(this.labels);
+        this.emit();
+        return;
+      }
       if (model === null) {
         this.models.delete(type);
         const builtin = this.builtins.get(type);
@@ -198,6 +297,35 @@ export class BrowserTrackerSchemaStore {
     return this.state;
   }
 
+  /**
+   * Queue a brand-new team type for the room as a create-only mutation.
+   * Resolves on the room's acceptance of this mutation, rejects on its refusal
+   * (including `schemaExists` when another client created the id first, and a
+   * room too old to refuse an existing type). The caller flushes the schema lane.
+   *
+   * Creation never replaces: an id this room already defines (or a builtin)
+   * is refused here, before anything is sent.
+   */
+  defineTeamType(declared: TrackerTypeDeclaration): Promise<void> {
+    if (this.disposed) return Promise.reject(new Error('The tracker room is closed.'));
+    if (declared.sharing === 'personal') {
+      return Promise.reject(new Error('The team section holds only team types.'));
+    }
+    const type = declared.type;
+    if (this.models.has(type) || this.builtins.has(type) || this.pendingDefinitions.has(type)) {
+      return Promise.reject(new Error(`A type named "${type}" already exists.`));
+    }
+    const { model, errors } = resolveTrackerTypeInheritance(declared, (key) => this.models.get(key));
+    if (!model) return Promise.reject(new Error(errors[0]?.message ?? `Type '${type}' could not be resolved.`));
+    const payload = encodeTrackerSchemaModelPayload(
+      normalizeTrackerSharingModel(model, 'team'),
+      isDerivedTrackerTypeDeclaration(declared) ? declared : null,
+    );
+    return new Promise<void>((resolve, reject) => {
+      this.pendingDefinitions.set(type, { payload, resolve, reject });
+    });
+  }
+
   subscribe(listener: (state: BrowserTrackerSchemaState) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -207,6 +335,10 @@ export class BrowserTrackerSchemaStore {
     if (this.disposed) return;
     this.disposed = true;
     this.listeners.clear();
+    for (const pending of this.pendingDefinitions.values()) {
+      pending.reject(new Error('The tracker room closed before the new type was saved.'));
+    }
+    this.pendingDefinitions.clear();
     // The registry is process-wide. Leaving one room's custom types registered
     // would let them surface in the next room this tab opens.
     globalRegistry.clearWorkspaceSchemas();
@@ -216,6 +348,8 @@ export class BrowserTrackerSchemaStore {
     return {
       trackerTypes: [...this.models.values()].sort((left, right) => left.type.localeCompare(right.type)),
       navigationEntries: [...this.navigation.values()].sort(compareTrackerNavigationEntries),
+      predicates: this.predicates,
+      labels: this.labels,
     };
   }
 

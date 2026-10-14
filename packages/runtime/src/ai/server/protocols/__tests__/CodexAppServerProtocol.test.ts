@@ -1,3 +1,5 @@
+// @vitest-environment node
+import {setCodexShellTrackingHost} from '../codexAppServer/shellTracking';
 // Unit tests for CodexAppServerProtocol against a mock JSON-RPC peer.
 //
 // We stub `child_process.spawn` so the protocol talks to a fake codex
@@ -65,6 +67,12 @@ class FakeChildProcess extends EventEmitter {
 
   /** Push a server -> client line. */
   emitLine(msg: unknown): void {
+    // Model the real server's effective-policy response for ordinary fixtures.
+    const frame = msg as any;
+    if (frame.result?.thread && !('sandbox' in frame.result)) {
+      const request = this.writtenLines.find((line: any) => line.id === frame.id) as any;
+      frame.result.sandbox = { type: request?.params?.sandbox === 'danger-full-access' ? 'dangerFullAccess' : 'workspaceWrite' };
+    }
     this.stdout.write(JSON.stringify(msg) + '\n');
   }
 }
@@ -135,7 +143,67 @@ describe('CodexAppServerProtocol', () => {
   });
 
   afterEach(() => {
+    setCodexShellTrackingHost(undefined);
     if (!child.killed) child.kill();
+  });
+
+  it.each(['start','resume'])('binds host hooks to %s and trusts only the exact session hook hashes',async(kind)=>{
+    const dispose=vi.fn(),endTurn=vi.fn(),toolCompleted=vi.fn();
+    const host=vi.fn(async()=>({command:'owned-hook',env:{NIMBALYST_SHELL_HOOK_URL:'http://fixture'},dispose,endTurn,toolCompleted}));setCodexShellTrackingHost(host);
+    const protocol=new CodexAppServerProtocol();const options={workspacePath:'/tmp/ws',raw:{nimbalystSessionId:'owner'}};
+    const promise=kind==='start'?protocol.createSession(options):protocol.resumeSession('thread-hook',options);
+    const init=await nextWrittenMatching(child,'initialize');child.emitLine({id:init.id,result:{}});
+    const list=await nextWrittenMatching(child,'hooks/list');
+    const own=(eventName:string)=>({source:'sessionFlags',handlerType:'command',command:'owned-hook',matcher:'^(Bash|apply_patch|mcp__.*)$',eventName,key:eventName,currentHash:'hash-'+eventName,enabled:true});
+    child.emitLine({id:list.id,result:{data:[{hooks:[own('preToolUse'),own('postToolUse'),{...own('preToolUse'),source:'user',key:'untrusted-user',command:'other-hook'}]}]}});
+    const request=await nextWrittenMatching(child,'thread/'+kind);const config=(request.params as any).config;
+    expect(Object.keys(config.hooks.state).sort()).toEqual(['postToolUse','preToolUse']);
+    expect(config.hooks.PreToolUse[0].hooks[0].command).toBe('owned-hook');
+    expect(host).toHaveBeenCalledWith('owner','/tmp/ws');
+    expect(spawnMock.mock.calls[0][2].env.NIMBALYST_SHELL_HOOK_URL).toBe('http://fixture');
+    child.emitLine({id:request.id,result:{thread:{id:'thread-hook'}}});const session=await promise;
+    // Failed MCP tools omit PostToolUse. Terminal notifications must retire the
+    // window even without an active sendMessage iterator; yielded shells stay open.
+    const completed = (threadId: string, item: Record<string, unknown>) =>
+      child.emitLine({method:'item/completed',params:{threadId,turnId:'t',item}});
+    completed('another-thread',{type:'mcpToolCall',id:'foreign',status:'failed'});
+    completed('thread-hook',{type:'commandExecution',id:'running',status:'completed',exitCode:null});
+    completed('thread-hook',{type:'mcpToolCall',id:'pending',status:'inProgress'});
+    expect(toolCompleted).not.toHaveBeenCalled();
+    completed('thread-hook',{type:'mcpToolCall',id:'failed-lookup',status:'failed'});
+    completed('thread-hook',{type:'fileChange',id:'failed-patch',status:'failed'});
+    completed('thread-hook',{type:'commandExecution',id:'exited-shell',status:'completed',exitCode:0});
+    expect(toolCompleted.mock.calls).toEqual([['failed-lookup'],['failed-patch'],['exited-shell']]);
+    child.emitLine({method:'turn/completed',params:{threadId:'thread-hook',turn:{id:'t',status:'completed'}}});expect(endTurn).toHaveBeenCalled();
+    protocol.cleanupSession(session);expect(dispose).toHaveBeenCalled();
+  });
+
+  it.each(['start', 'resume'])('preserves authorized roots on %s', async (kind) => {
+    const protocol = new CodexAppServerProtocol();
+    const options = { workspacePath: '/workspace', raw: { additionalDirectories: ['/parent', '/parent'], codexConfigOverrides: { 'sandbox_workspace_write.network_access': true } } };
+    const pending = kind === 'start' ? protocol.createSession(options) : protocol.resumeSession('existing', options);
+    const init = await nextWrittenMatching(child, 'initialize');
+    child.emitLine({ id: init.id, result: {} });
+    const request = await nextWrittenMatching(child, 'thread/' + kind);
+    child.emitLine({ id: request.id, result: { thread: { id: 'existing' }, sandbox: { type: 'workspaceWrite', writableRoots: ['/parent'] } } });
+    const session = await pending;
+    protocol.cleanupSession(session);
+    expect((request.params as any).config).toMatchObject({ 'sandbox_workspace_write.writable_roots': ['/parent'], 'sandbox_workspace_write.network_access': true });
+    expect((request.params as any).config).not.toHaveProperty('additional_writable_roots');
+  });
+
+  it.each(['start', 'resume'])('rejects a read-only downgrade on %s before any turn', async (kind) => {
+    const protocol = new CodexAppServerProtocol();
+    const options = { workspacePath: '/workspace' };
+    const pending = kind === 'start' ? protocol.createSession(options) : protocol.resumeSession('existing', options);
+    const rejected = expect(pending).rejects.toThrow(/read.only/i);
+    const init = await nextWrittenMatching(child, 'initialize');
+    child.emitLine({ id: init.id, result: {} });
+    const request = await nextWrittenMatching(child, 'thread/' + kind);
+    child.emitLine({ id: request.id, result: { thread: { id: 'existing' }, sandbox: { type: 'readOnly' } } });
+    await rejected;
+    expect(child.killed).toBe(true);
+    expect(child.writtenLines.some((line: any) => line.method === 'turn/start')).toBe(false);
   });
 
   it('spawns the codex binary, completes the initialize handshake, and starts a thread', async () => {
@@ -338,7 +406,14 @@ describe('CodexAppServerProtocol', () => {
       type: 'complete',
       contextFillTokens: 4555,
       contextWindow: 258400,
-      usage: { input_tokens: 19146, output_tokens: 5, total_tokens: 19151 },
+      // Codex counts cached input inside inputTokens; the event splits it out.
+      usage: {
+        input_tokens: 19146 - 9984,
+        cache_read_input_tokens: 9984,
+        cache_creation_input_tokens: 0,
+        output_tokens: 5,
+        total_tokens: 19151,
+      },
     });
 
     protocol.cleanupSession(session);
@@ -593,6 +668,48 @@ describe('CodexAppServerProtocol', () => {
 
     const errorEvent = events.find((e) => e.type === 'error');
     expect(errorEvent?.error).toContain('model unavailable');
+
+    protocol.cleanupSession(session);
+  });
+
+  it('keeps streaming after a retryable error until the turn completes (#1523)', async () => {
+    const protocol = new CodexAppServerProtocol();
+    const sessionPromise = protocol.createSession({ workspacePath: '/tmp/ws' });
+    const initReq = await nextWrittenMatching(child, 'initialize');
+    child.emitLine({ id: initReq.id, result: { codexHome: '/fake', platformFamily: 'unix', platformOs: 'macos', userAgent: 'fake/0' } });
+    const startReq = await nextWrittenMatching(child, 'thread/start');
+    child.emitLine({ id: startReq.id, result: { thread: { id: 't-1' } } });
+    const session = await sessionPromise;
+
+    const events: ProtocolEvent[] = [];
+    const collector = (async () => {
+      for await (const ev of protocol.sendMessage(session, { content: 'recover please' })) {
+        events.push(ev);
+      }
+    })();
+
+    const turnReq = await nextWrittenMatching(child, 'turn/start');
+    child.emitLine({ id: turnReq.id, result: { turn: { id: 'turn-1', items: [], status: 'inProgress' } } });
+    child.emitLine({
+      method: 'error',
+      params: {
+        threadId: 't-1',
+        turnId: 'turn-1',
+        error: { message: 'Reconnecting... 2/5' },
+        willRetry: true,
+      },
+    });
+    child.emitLine({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 't-1', turnId: 'turn-1', itemId: 'msg-1', delta: 'Recovered' },
+    });
+    child.emitLine({ method: 'turn/completed', params: { threadId: 't-1', turn: { id: 'turn-1', status: 'completed' } } });
+
+    await collector;
+
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(events).toContainEqual(expect.objectContaining({ type: 'text', content: 'Recovered' }));
+    expect(events).toContainEqual(expect.objectContaining({ type: 'complete', content: 'Recovered' }));
 
     protocol.cleanupSession(session);
   });
@@ -1135,5 +1252,89 @@ describe('CodexAppServerProtocol', () => {
     expect(response).toBeDefined();
     expect((response as { result?: { decision?: string } }).result?.decision).toBe('denied');
     expect(approveFileChange).toHaveBeenCalledTimes(1);
+  });
+
+  // Codex occasionally announces an MCP tool call via item/started and never
+  // sends a terminal item/completed. The call never reaches our MCP server and
+  // nothing settles it, so the transcript keeps it in flight forever and the
+  // agent goes on believing it is merely slow. Measured at 13/3856 (0.34%) of
+  // update_session_meta calls, clustered per session.
+  describe('orphaned MCP tool calls', () => {
+    type PushEntry =
+      | { kind: 'event'; event: ProtocolEvent }
+      | { kind: 'end' }
+      | { kind: 'fail'; error: Error };
+
+    /** Drive dispatchNotification directly -- the JSON-RPC harness adds nothing here. */
+    function drive(notifications: Array<[string, unknown]>): PushEntry[] {
+      const protocol = new CodexAppServerProtocol();
+      const pushed: PushEntry[] = [];
+      for (const [method, params] of notifications) {
+        (protocol as unknown as {
+          dispatchNotification: (
+            m: string, p: unknown, push: (e: PushEntry) => void,
+            raw: unknown, appendText: (s: string) => void,
+            setUsage: (u: unknown) => void, setContext: (c: unknown) => void,
+          ) => void;
+        }).dispatchNotification(method, params, (e) => pushed.push(e), {}, () => {}, () => {}, () => {});
+      }
+      return pushed;
+    }
+
+    const started = (id: string, tool: string) => [
+      'item/started',
+      { threadId: 't-1', turnId: 'turn-1', item: { id, type: 'mcpToolCall', server: 'nimbalyst', tool, arguments: { phase: 'validating' } } },
+    ] as [string, unknown];
+
+    const completed = (id: string, tool: string) => [
+      'item/completed',
+      { threadId: 't-1', turnId: 'turn-1', item: { id, type: 'mcpToolCall', server: 'nimbalyst', tool, status: 'completed', result: {} } },
+    ] as [string, unknown];
+
+    const turnCompleted = ['turn/completed', { threadId: 't-1', turn: { id: 'turn-1', status: 'completed' } }] as [string, unknown];
+
+    const toolCalls = (pushed: PushEntry[]) =>
+      pushed.filter((e): e is { kind: 'event'; event: ProtocolEvent } =>
+        e.kind === 'event' && e.event.type === 'tool_call');
+
+    it('settles a call that never completed, flagged for the host to repair', () => {
+      const calls = toolCalls(drive([started('call_1', 'update_session_meta'), turnCompleted]));
+
+      // One for item/started, one synthesized by the sweep.
+      expect(calls).toHaveLength(2);
+      const swept = calls[1].event.toolCall as { name?: string; result?: { success?: boolean }; orphaned?: boolean; arguments?: unknown };
+      expect(swept.name).toBe('mcp__nimbalyst__update_session_meta');
+      expect(swept.result?.success).toBe(false);
+      // The host re-applies from these, so they must survive the sweep.
+      expect(swept.orphaned).toBe(true);
+      expect(swept.arguments).toEqual({ phase: 'validating' });
+    });
+
+    it('leaves a normally-completed call alone', () => {
+      const pushed = drive([started('call_1', 'update_session_meta'), completed('call_1', 'update_session_meta'), turnCompleted]);
+      const orphaned = toolCalls(pushed).filter(
+        (c) => (c.event.toolCall as { orphaned?: boolean }).orphaned);
+      expect(orphaned).toHaveLength(0);
+    });
+
+    it('sweeps only the unsettled call when a turn mixes both', () => {
+      const calls = toolCalls(drive([
+        started('call_1', 'update_session_meta'),
+        started('call_2', 'tracker_get'),
+        completed('call_2', 'tracker_get'),
+        turnCompleted,
+      ]));
+      const orphaned = calls.filter((c) => (c.event.toolCall as { orphaned?: boolean }).orphaned);
+      expect(orphaned).toHaveLength(1);
+      expect((orphaned[0].event.toolCall as { name?: string }).name).toBe('mcp__nimbalyst__update_session_meta');
+    });
+
+    it('sweeps on a failed turn too, so a crash does not strand the call', () => {
+      const pushed = drive([started('call_1', 'update_session_meta'), ['error', { error: { message: 'boom' } }]]);
+      const orphaned = toolCalls(pushed).filter(
+        (c) => (c.event.toolCall as { orphaned?: boolean }).orphaned);
+      expect(orphaned).toHaveLength(1);
+      expect(pushed.at(-1)).toMatchObject({ kind: 'fail' });
+    });
   });
 });

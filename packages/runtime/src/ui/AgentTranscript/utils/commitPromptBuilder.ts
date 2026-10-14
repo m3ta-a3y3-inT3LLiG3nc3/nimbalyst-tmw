@@ -1,3 +1,4 @@
+import { shellCoverageDetails, type ShellCoverageSummary } from '../../../ai/shellTrackingCoverage';
 /**
  * Producer half of the commit-request contract. The consumer half —
  * `isCommitRequestMessage` / `parseCommitRequest` in `../components/CommitRequestCard`
@@ -21,6 +22,7 @@ export interface CommitPromptFile {
 }
 
 export interface CommitContext {
+  coverage?: ShellCoverageSummary[];
   success: boolean;
   files: CommitPromptFile[];
   scenario: 'single' | 'workstream' | 'worktree';
@@ -138,6 +140,12 @@ export function buildCommitPrompt({
   workstreamSessionCount?: number;
 }): string {
   let message = COMMIT_PROMPT_PREFIX;
+  const coverageReasons = shellCoverageDetails(commitContext.coverage ?? []);
+  if (coverageReasons.length) {
+    message += '\n\nFile tracking incomplete: ' + coverageReasons.join('; ') + '. ' +
+      'The recorded file list may omit edits. Reconcile your actual work with current diffs and git status before proposing a commit. ' +
+      'Git status does not establish session ownership. Preserve explicitly selected file boundaries and do not include unrelated changes.';
+  }
 
   if (commitContext.success && commitContext.files.length > 0) {
     let formatted: ReturnType<typeof formatFileSection>;
@@ -170,10 +178,9 @@ export function buildCommitPrompt({
       );
       message += `\n\n${formatted.section}`;
       message += formatExcludedFileNotice(formatted.excludedFileCount);
-      message += '\n\nThis list covers safely representable files edited directly. If you ALSO ran commands this session that change files as a side effect ' +
-        '(e.g. npm install rewriting package-lock.json, a build/codegen step, license regeneration), include those changed files too -- ' +
-        'check git status for them. If you ran no such commands, the list above is complete except for any explicitly reported excluded paths; do not go looking. ' +
-        'Either way, do NOT add unrelated uncommitted changes -- other concurrent sessions may have their own work in this repo.';
+      message += '\n\nThis list includes recorded edits and may include inferred shell edits. File links do not establish exclusive ownership of a whole-file diff. ' +
+        'Review the listed diffs against this session\'s work before committing. Shell tracking can miss ambiguous, delayed, or external writes; ' +
+        'if commands changed additional files, check git status for those paths. Do NOT add unrelated changes from other sessions.';
       message += formatted.fileList
         ? '\n\nThen call developer_git_commit_proposal with the file list.'
         : '\n\nNo safely representable file paths remain. Do not create a commit proposal.';

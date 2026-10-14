@@ -8,10 +8,11 @@
 
 import { useMemo } from 'react';
 import { globalRegistry } from '../models';
-import type {
-  FieldDefinition,
-  TrackerSchemaRole,
-} from '../models/TrackerDataModel';
+import {
+  isSingleValuedField,
+  type FieldDefinition,
+  type TrackerSchemaRole,
+} from '@nimbalyst/tracker-schema';
 import type { TrackerRecord } from '../../../core/TrackerRecord';
 
 /** Semantic roles, in the order a reader scans them. */
@@ -49,8 +50,16 @@ const CHIP_UNSUPPORTED_FIELD_TYPES = new Set(['multiselect', 'object']);
  * Opaque objects, structural fields, and read-only values stay in the ordinary
  * detail view instead of turning a compact header into a second inspector.
  * Custom text fields remain eligible; only the built-in description is omitted.
+ *
+ * `singleValuedOnly` is for page headers: lists of any kind (arrays, labels,
+ * multi-valued links) stay out of them. Every other surface (StatusBar, the
+ * classic detail pane, quick create) keeps tags and collections.
  */
-export function getTrackerFieldLayout(trackerType: string): FieldDefinition[] {
+export function getTrackerFieldLayout(
+  trackerType: string,
+  labelFields: readonly FieldDefinition[] = [],
+  options: { singleValuedOnly?: boolean } = {},
+): FieldDefinition[] {
   const model = globalRegistry.get(trackerType);
   if (!model) return [];
 
@@ -64,6 +73,7 @@ export function getTrackerFieldLayout(trackerType: string): FieldDefinition[] {
       || BUILTIN_FIELDS.has(field.name)
       || field.readOnly
       || CHIP_UNSUPPORTED_FIELD_TYPES.has(field.type)
+      || (options.singleValuedOnly && !isSingleValuedField(field))
     ) {
       return;
     }
@@ -76,12 +86,25 @@ export function getTrackerFieldLayout(trackerType: string): FieldDefinition[] {
     add(name ? byName.get(name) : undefined);
   }
   for (const field of model.fields) add(field);
+  // Properties the item's labels bring follow the type's own fields.
+  for (const field of labelFields) add(field);
   return ordered;
 }
 
 /** Memoized `getTrackerFieldLayout` for component use. */
-export function useTrackerFieldLayout(trackerType: string): FieldDefinition[] {
-  return useMemo(() => getTrackerFieldLayout(trackerType), [trackerType]);
+export function useTrackerFieldLayout(
+  trackerType: string,
+  labelFields: readonly FieldDefinition[] = NO_FIELDS,
+): FieldDefinition[] {
+  return useMemo(() => getTrackerFieldLayout(trackerType, labelFields), [trackerType, labelFields]);
+}
+
+const NO_FIELDS: readonly FieldDefinition[] = [];
+
+/** Header text for a field: a label property's own label, else the formatted name. */
+export function trackerFieldDisplayLabel(field: FieldDefinition): string {
+  const displayLabel = (field as { displayLabel?: unknown }).displayLabel;
+  return typeof displayLabel === 'string' && displayLabel ? displayLabel : formatTrackerFieldLabel(field.name);
 }
 
 /**
@@ -93,6 +116,23 @@ export function formatTrackerFieldLabel(name: string): string {
     .replace(/([A-Z])/g, ' $1')
     .replace(/^./, (character) => character.toUpperCase())
     .trim();
+}
+
+const SELF_ANONYMOUS_FIELD_TYPES = new Set([
+  'date', 'datetime', 'url', 'user', 'relationship', 'reference', 'citation',
+]);
+
+/** Empty pills already show their field name. Selected option icons identify compact selects. */
+export function shouldLabelTrackerField(
+  field: FieldDefinition,
+  value: unknown,
+  labelFields = false,
+): boolean {
+  if (isTrackerFieldEmpty(value)) return false;
+  if (SELF_ANONYMOUS_FIELD_TYPES.has(field.type)) return true;
+  if (!labelFields) return false;
+  return field.type !== 'select'
+    || !field.options?.find(option => option.value === value)?.icon;
 }
 
 /** True when a field value should render as "not set". */

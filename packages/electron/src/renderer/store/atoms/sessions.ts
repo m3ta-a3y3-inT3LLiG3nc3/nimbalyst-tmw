@@ -1,3 +1,5 @@
+import { buildSessionTree, sessionTreeRootId } from '../../components/AgenticCoding/sessionTreeModel';
+import {selectedMachineAtom, machineSessionSelectionsAtom} from './remoteMachines';
 /**
  * AI Session Atoms
  *
@@ -14,12 +16,16 @@
  * 4. Use addSessionAtom/removeSessionAtom for optimistic updates
  */
 
-import { atom } from 'jotai';
+import { atom, type Getter, type Setter } from 'jotai';
 import { atomFamily } from '../debug/atomFamilyRegistry';
 import { store } from '@nimbalyst/runtime/store';
-import { ModelIdentifier, type ChatAttachment, type SessionData, type TranscriptViewMessage } from '@nimbalyst/runtime/ai/server/types';
+import { ModelIdentifier, type ChatAttachment, type SessionData } from '@nimbalyst/runtime/ai/server/types';
+import { stripMcpPrefix } from '@nimbalyst/runtime/ai/server/interactivePromptTools';
 import type { SessionMeta } from '@nimbalyst/runtime';
 import deepEqual from 'fast-deep-equal';
+import { captureTranscriptMessages, reconcileTranscriptMessages } from '../transcriptReconciliation';
+import { sessionLaunchCountsAtom } from './sessionLaunchCounts';
+import { sessionListMetadata } from './sessionListMetadata';
 import { workstreamStateAtom, setWorkstreamActiveChildAtom } from './workstreamState';
 import { aiInputHistoryAtom } from './aiInputUndo';
 
@@ -327,9 +333,7 @@ const INTERACTIVE_PROMPT_TOOLS = new Set([
 // MCP tools arrive as `mcp__<server>__<toolName>` (server name may contain dashes).
 // Match the bare name first; if not found, peel off the MCP prefix and recheck.
 export function isInteractivePromptTool(toolName: string): boolean {
-  if (INTERACTIVE_PROMPT_TOOLS.has(toolName)) return true;
-  const match = toolName.match(/^mcp__[^_]+(?:_[^_]+)*__(.+)$/);
-  return !!match && INTERACTIVE_PROMPT_TOOLS.has(match[1]);
+  return INTERACTIVE_PROMPT_TOOLS.has(toolName) || INTERACTIVE_PROMPT_TOOLS.has(stripMcpPrefix(toolName));
 }
 
 /**
@@ -673,6 +677,10 @@ export const sessionStoreAtom = atomFamily((_sessionId: string) =>
   atom<SessionData | null>(null)
 );
 
+export const sessionRemoteHostAtom = atomFamily((sessionId: string) => atom(get =>
+  get(sessionRegistryAtom).get(sessionId)?.remoteHostDeviceId ?? get(sessionStoreAtom(sessionId))?.metadata?.remoteHostDeviceId
+));
+
 /**
  * @deprecated Use sessionStoreAtom instead
  */
@@ -683,10 +691,19 @@ export const sessionDataAtom = sessionStoreAtom;
  * Includes SessionData fields plus electron-specific metadata fields.
  */
 interface SessionUpdateFields extends Partial<SessionData> {
+  createdBySessionId?: string | null;
+  childCount?: number;
+  descendantCount?: number;
   uncommittedCount?: number;  // From SessionMeta, not in SessionData
 }
 
 const EMPTY_SESSION_TODOS: unknown[] = [];
+
+/** Update fields mirrored into sessionRegistryAtom by updateSessionStoreAtom. */
+const REGISTRY_UPDATE_FIELDS = [
+  'title', 'updatedAt', 'isArchived', 'isPinned', 'parentSessionId', 'worktreeId',
+  'provider', 'model', 'sessionType', 'uncommittedCount', 'createdBySessionId', 'childCount', 'descendantCount',
+] as const satisfies ReadonlyArray<keyof SessionUpdateFields>;
 
 /**
  * Unified session update atom.
@@ -711,7 +728,10 @@ export const updateSessionStoreAtom = atom(
       set(sessionStoreAtom(sessionId), { ...current, ...normalizedUpdates });
     }
 
-    // 2. Always update registry with metadata fields
+    // 2. Update registry with metadata fields. Skip updates that carry none
+    // (tokenUsage arrives every assistant step): a new registry Map re-renders
+    // the session list and every session reference in open transcripts.
+    if (!REGISTRY_UPDATE_FIELDS.some(field => updates[field] !== undefined)) return;
     const registry = new Map(get(sessionRegistryAtom));
     const meta = registry.get(sessionId);
     if (meta) {
@@ -723,6 +743,9 @@ export const updateSessionStoreAtom = atom(
         ...(updates.isArchived !== undefined && { isArchived: updates.isArchived }),
         ...(updates.isPinned !== undefined && { isPinned: updates.isPinned }),
         ...(updates.parentSessionId !== undefined && { parentSessionId: updates.parentSessionId }),
+        ...(updates.createdBySessionId !== undefined && { createdBySessionId: updates.createdBySessionId }),
+        ...(updates.childCount !== undefined && { childCount: updates.childCount }),
+        ...(updates.descendantCount !== undefined && { descendantCount: updates.descendantCount }),
         ...(updates.worktreeId !== undefined && { worktreeId: updates.worktreeId }),
         ...(updates.provider !== undefined && { provider: updates.provider }),
         ...(updates.model !== undefined && { model: updates.model }),
@@ -927,8 +950,13 @@ export const sessionTokenUsageAtom = atomFamily((sessionId: string) =>
 );
 
 export const sessionLoadedAtom = atomFamily((sessionId: string) =>
-  atom((get) => get(sessionStoreAtom(sessionId)) !== null)
+  atom((get) => isSessionDataResident(get(sessionStoreAtom(sessionId))))
 );
+
+/** Messages are in memory: the store is loaded and has not been evicted. */
+export function isSessionDataResident(data: SessionData | null): boolean {
+  return data !== null && !data.messagesEvicted;
+}
 
 export const sessionUpdatedAtAtom = atomFamily((sessionId: string) =>
   atom((get) => get(sessionStoreAtom(sessionId))?.updatedAt ?? null)
@@ -1067,15 +1095,15 @@ export const sessionOrChildProcessingAtom = atomFamily((sessionId: string) =>
       }
     }
 
-    // Check children from pre-computed registry index (works even before workstream is opened)
-    // Uses parentToChildIdsAtom for O(1) lookup instead of scanning the full registry
-    const childIds = get(parentToChildIdsAtom).get(sessionId);
-    if (childIds) {
-      for (const childId of childIds) {
-        if (get(sessionProcessingAtom(childId))) {
-          return true;
-        }
-      }
+    const index = get(parentToChildIdsAtom);
+    const visited = new Set([sessionId]);
+    const pending = [...(index.get(sessionId) ?? [])];
+    while (pending.length) {
+      const childId = pending.pop()!;
+      if (visited.has(childId)) continue;
+      visited.add(childId);
+      if (get(sessionProcessingAtom(childId))) return true;
+      pending.push(...(index.get(childId) ?? []));
     }
 
     return false;
@@ -1157,39 +1185,13 @@ export const loadSessionChildrenAtom = atom(
         // console.log('[loadSessionChildrenAtom] Setting children:', childIds);
         set(sessionChildrenAtom(parentSessionId), childIds);
 
-        // Set parent ID for each child and populate registry from list-children metadata
-        // NOTE: We do NOT call loadSessionDataAtom here - that loads ALL messages which is expensive.
-        // The list-children endpoint already returns all metadata needed for the list view.
-        // Full session data (with messages) is loaded lazily when a session tab is actually opened.
+        // list-children returns a complete flat subtree; preserve each direct edge.
+        const registry = new Map(get(sessionRegistryAtom));
         for (const child of result.children) {
-          set(sessionParentIdAtom(child.id), parentSessionId);
-
-          // Update registry with metadata from list-children (no messages needed for list view)
-          const registry = new Map(get(sessionRegistryAtom));
-          if (!registry.has(child.id)) {
-            registry.set(child.id, {
-              id: child.id,
-              title: child.title || 'Untitled Session',
-              createdAt: child.createdAt,
-              updatedAt: child.updatedAt,
-              provider: child.provider,
-              sessionType: child.sessionType || 'session',
-              messageCount: child.messageCount || 0,
-              workspaceId: get(sessionListWorkspaceAtom) || '',
-              isArchived: child.isArchived || false,
-              isPinned: child.isPinned || false,
-              worktreeId: child.worktreeId,
-              parentSessionId: parentSessionId,
-              childCount: 0,
-              uncommittedCount: child.uncommittedCount || 0,
-              // Metadata fields for TrackerPanel and kanban
-              ...(child.phase && { phase: child.phase }),
-              ...(child.tags && { tags: child.tags }),
-              ...(child.linkedTrackerItemIds && { linkedTrackerItemIds: child.linkedTrackerItemIds }),
-            });
-            set(sessionRegistryAtom, registry);
-          }
+          set(sessionParentIdAtom(child.id), child.parentSessionId ?? null);
+          registry.set(child.id, { ...registry.get(child.id), ...sessionListMetadata(child, workspacePath) });
         }
+        set(sessionRegistryAtom, registry);
 
         // Update the unified workstream state with children
         // This is critical for workstreamHasChildrenAtom to work
@@ -1201,13 +1203,14 @@ export const loadSessionChildrenAtom = atom(
         // Determine the active child:
         // - If has children: use current active if valid, else first child
         // - If no children (single session): use the parent session itself
-        const newActiveChild = childIds.length > 0
-          ? (currentActive && childIds.includes(currentActive) ? currentActive : childIds[0])
-          : parentSessionId;
+        const isWrapper = registry.get(parentSessionId)?.sessionType === 'workstream';
+        const tabIds = isWrapper ? childIds : [parentSessionId, ...childIds];
+        const newActiveChild = currentActive && tabIds.includes(currentActive) ? currentActive : tabIds[0] ?? parentSessionId;
         // console.log('[loadSessionChildrenAtom] Setting activeChildId to:', newActiveChild);
 
         set(workstreamStateAtom(parentSessionId), {
-          type: childIds.length > 0 ? 'workstream' : 'single',
+          type: childIds.length > 0 ? 'workstream' : registry.get(parentSessionId)?.worktreeId ? 'worktree' : 'single',
+          worktreeId: registry.get(parentSessionId)?.worktreeId ?? null,
           childSessionIds: childIds,
           activeChildId: newActiveChild,
         });
@@ -1257,7 +1260,7 @@ export const createChildSessionAtom = atom(
     try {
       // Get parent session to inherit worktree_id
       const parentData = get(sessionStoreAtom(parentSessionId));
-      const worktreeId = parentData?.worktreeId;
+      const worktreeId = parentData?.worktreeId ?? get(sessionRegistryAtom).get(parentSessionId)?.worktreeId;
       console.log(`[sessions:createChildSessionAtom] Parent data: worktreeId=${worktreeId}, hasMessages=${!!parentData?.messages?.length}`);
 
       // Derive provider from model ID to prevent provider/model mismatches
@@ -1293,6 +1296,7 @@ export const createChildSessionAtom = atom(
         // This prevents showing default values before loadSessionDataAtom runs
         set(sessionStoreAtom(result.sessionId), {
           id: result.sessionId,
+          ...(result.remoteHostDeviceId ? {metadata: {remoteHostDeviceId: result.remoteHostDeviceId}} : {}),
           title: 'New Session',
           provider: resolvedProvider,
           model: model || 'claude-code:sonnet',
@@ -1304,29 +1308,11 @@ export const createChildSessionAtom = atom(
           updatedAt: Date.now(),
         } as SessionData);
 
-        // Make it the active child (both atoms need to be updated) and mark as read
-        set(sessionActiveChildAtom(parentSessionId), result.sessionId);
-        set(setWorkstreamActiveChildAtom, { workstreamId: parentSessionId, childId: result.sessionId });
-        set(markSessionReadAtom, result.sessionId);
-
-        // Update unified workstream state
-        const { addWorkstreamChildAtom } = await import('./workstreamState');
-        set(addWorkstreamChildAtom, {
-          workstreamId: parentSessionId,
-          childId: result.sessionId,
-        });
-
-        // Update the parent's child count in the session list so the UI updates.
-        // Why max-with-existing: sessionChildrenAtom(parent) may not have been
-        // hydrated yet (e.g. user clicked "+" before loadSessionChildrenAtom
-        // populated it), in which case newChildren.length is 1 even though the
-        // DB has many siblings. Lowering the registry's existing childCount
-        // would mask the new child from SessionHistory's refresh check.
-        const existingChildCount = get(sessionRegistryAtom).get(parentSessionId)?.childCount ?? 0;
-        set(updateSessionFullAtom, {
-          id: parentSessionId,
-          childCount: Math.max(newChildren.length, existingChildCount + 1),
-        });
+        await set(refreshSessionListAtom);
+        const rootId = sessionTreeRootId(parentSessionId, get(sessionRegistryAtom));
+        await set(loadSessionChildrenAtom, { parentSessionId: rootId, workspacePath });
+        set(setActiveSessionInWorkstreamAtom, {workstreamId: rootId, sessionId: result.sessionId});
+        set(setSelectedWorkstreamAtom, {workspacePath, selection: {type: 'workstream', id: rootId}});
 
         return result.sessionId;
       }
@@ -1354,12 +1340,16 @@ export const reparentSessionAtom = atom(
     sessionId,
     oldParentId,
     newParentId,
-    workspacePath
+    workspacePath,
+    restoreManagerId,
+    onMoved,
   }: {
     sessionId: string;
     oldParentId: string | null;
     newParentId: string | null;
     workspacePath: string;
+    restoreManagerId?: string | null;
+    onMoved?: (previous: { parentId: string | null; managerId: string | null }) => void;
   }) => {
     if (!sessionId || !workspacePath || !window.electronAPI) {
       return false;
@@ -1372,7 +1362,8 @@ export const reparentSessionAtom = atom(
         {
           sessionId,
           newParentId,
-          workspacePath
+          workspacePath,
+          ...(restoreManagerId !== undefined ? { restoreManagerId } : {}),
         }
       );
 
@@ -1381,60 +1372,57 @@ export const reparentSessionAtom = atom(
         return false;
       }
 
-      // Update atoms
-      // 1. Update dragged session's parent
+      // Reconcile navigation synchronously after acknowledgement, before the list
+      // refresh yields. Read the current selection so a user navigation during the
+      // request is preserved rather than restoring the selection at drag start.
+      const registry = get(sessionRegistryAtom);
+      const affectedIds = new Set([sessionId]);
+      const collectAncestors = (id: string | null) => {
+        const seen = new Set<string>();
+        while (id && !seen.has(id)) {
+          seen.add(id);
+          affectedIds.add(id);
+          id = registry.get(id)?.parentSessionId ?? null;
+        }
+      };
+      collectAncestors(result.previousParentId === undefined ? oldParentId : result.previousParentId);
+      collectAncestors(newParentId);
+      const selection = get(selectedWorkstreamAtom(workspacePath));
+      const activeId = selection && get(workstreamStateAtom(selection.id)).activeChildId;
       set(sessionParentIdAtom(sessionId), newParentId);
-
-      // 2. Remove from old parent's children (if had a parent)
-      if (oldParentId) {
-        const oldChildren = get(sessionChildrenAtom(oldParentId));
-        const newOldChildren = oldChildren.filter(id => id !== sessionId);
-        set(sessionChildrenAtom(oldParentId), newOldChildren);
-
-        // Update old parent's workstream state
-        set(workstreamStateAtom(oldParentId), {
-          childSessionIds: newOldChildren,
-        });
+      set(updateSessionStoreAtom, { sessionId, updates: { parentSessionId: newParentId, createdBySessionId: restoreManagerId !== undefined ? restoreManagerId : newParentId } });
+      const updatedRegistry = get(sessionRegistryAtom);
+      const nodes = buildSessionTree([...updatedRegistry.values()]);
+      const reconcile = (node: typeof nodes[number]) => {
+        if (affectedIds.has(node.session.id)) {
+          const id = node.session.id;
+          const childIds = node.ids.filter(childId => childId !== id);
+          const tabIds = node.session.sessionType === 'workstream' ? childIds : node.ids;
+          const previousActive = get(workstreamStateAtom(id)).activeChildId;
+          set(sessionChildrenAtom(id), childIds);
+          set(workstreamStateAtom(id), {
+            childSessionIds: childIds,
+            type: childIds.length ? 'workstream' : node.session.worktreeId ? 'worktree' : 'single',
+            worktreeId: node.session.worktreeId ?? null,
+            activeChildId: previousActive && tabIds.includes(previousActive) ? previousActive : tabIds[0] ?? null,
+          });
+        }
+        node.children.forEach(reconcile);
+      };
+      nodes.forEach(reconcile);
+      if (selection && affectedIds.has(selection.id) && activeId && updatedRegistry.has(activeId)) {
+        const rootId = sessionTreeRootId(activeId, updatedRegistry);
+        if (rootId !== selection.id) {
+          const state = get(workstreamStateAtom(rootId));
+          set(setActiveSessionInWorkstreamAtom, { workstreamId: rootId, sessionId: activeId });
+          set(setSelectedWorkstreamAtom, {
+            workspacePath,
+            selection: { id: rootId, type: state.type === 'workstream' ? 'workstream' : state.type === 'worktree' ? 'worktree' : 'session' },
+          });
+        }
       }
-
-      // 3. Add to new parent's children (if has a new parent)
-      if (newParentId) {
-        const newChildren = get(sessionChildrenAtom(newParentId));
-        const updatedNewChildren = [...newChildren, sessionId];
-        set(sessionChildrenAtom(newParentId), updatedNewChildren);
-
-        // Update new parent's workstream state
-        set(workstreamStateAtom(newParentId), {
-          childSessionIds: updatedNewChildren,
-        });
-
-        // Make the reparented session the active child in the new parent and mark as read
-        set(setWorkstreamActiveChildAtom, { workstreamId: newParentId, childId: sessionId });
-        set(markSessionReadAtom, sessionId);
-      }
-
-      // 4. Update session list
-      set(updateSessionFullAtom, {
-        id: sessionId,
-        parentSessionId: newParentId,
-      });
-
-      // Update child counts in session list
-      if (oldParentId) {
-        const oldChildren = get(sessionChildrenAtom(oldParentId));
-        set(updateSessionFullAtom, {
-          id: oldParentId,
-          childCount: oldChildren.length,
-        });
-      }
-      if (newParentId) {
-        const newChildren = get(sessionChildrenAtom(newParentId));
-        set(updateSessionFullAtom, {
-          id: newParentId,
-          childCount: newChildren.length,
-        });
-      }
-
+      await set(refreshSessionListAtom);
+      onMoved?.({ parentId: result.previousParentId === undefined ? oldParentId : result.previousParentId, managerId: result.previousManagerId ?? null });
       return true;
     } catch (error) {
       console.error(`[sessions] Failed to reparent session ${sessionId}:`, error);
@@ -1665,8 +1653,8 @@ export const convertToWorkstreamAtom = atom(
       // (skipSiblingCreation=true) initialize childSessionIds; otherwise subsequent
       // reparentSession calls operate on uninitialized state and the workstream's
       // child list never reflects further drops.
-      const { convertToWorkstreamAtom: convertToWorkstreamStateAtom } = await import('./workstreamState');
-      set(convertToWorkstreamStateAtom, {
+      const { transferSessionStateToWrapperAtom } = await import('./workstreamState');
+      set(transferSessionStateToWrapperAtom, {
         sessionId,
         parentId: parentSessionId,
         ...(siblingResult.success && siblingResult.sessionId
@@ -1739,6 +1727,85 @@ export const openSessionsAtom = atom<OpenSession[]>([]);
  * IPC round-trip + DB query (2+ seconds each for large sessions).
  */
 const loadSessionPromises = new Map<string, Promise<SessionData | null>>();
+const loadSessionWorkspaces = new Map<string, string>();
+
+export function isSessionLoadInFlight(sessionId: string): boolean {
+  return loadSessionPromises.has(sessionId);
+}
+/** Non-atom transcript caches release their references at the same boundary. */
+export const sessionDataReleaseListenersAtom = atom<ReadonlySet<(sessionId: string) => void>>(new Set<(sessionId: string) => void>());
+const closedSessionWorkspacesAtom = atom<Set<string>>(new Set<string>());
+const sessionWorkspaceGenerationsAtom = atom<Map<string, object>>(new Map());
+
+function canReleaseSessionData(get: Getter, sessionId: string): boolean {
+  return !get(sessionProcessingAtom(sessionId)) && !get(sessionHasPendingInteractivePromptAtom(sessionId));
+}
+
+function releaseSessionData(get: Getter, set: Setter, sessionId: string, next: SessionData | null): void {
+  set(sessionStoreAtom(sessionId), next);
+  for (const release of get(sessionDataReleaseListenersAtom)) release(sessionId);
+  // Unmounted derived atoms can otherwise keep their last large value cached.
+  for (const family of [sessionMessagesAtom, sessionCurrentTeammatesAtom, sessionCurrentTodosAtom, sessionDocumentContextAtom]) {
+    for (const id of family.getParams()) {
+      if (id === sessionId) { get<unknown>(family(sessionId)); break; }
+    }
+  }
+}
+
+/** Drop full history only. Drafts and atom identities survive close/reopen. */
+export const pruneClosedSessionDataAtom = atom(null, (get, set) => {
+  const closed = get(closedSessionWorkspacesAtom);
+  if (closed.size === 0) return;
+  for (const sessionId of sessionStoreAtom.getParams()) {
+    const data = get(sessionStoreAtom(sessionId));
+    if (!data?.workspacePath || !closed.has(data.workspacePath) || !canReleaseSessionData(get, sessionId)) continue;
+    releaseSessionData(get, set, sessionId, null);
+  }
+});
+
+/**
+ * Drop a session's messages but keep its metadata (title, archived, worktree,
+ * token usage), which the workstream tabs and panels read without a viewer.
+ * Returns false when the session is busy and must stay resident.
+ */
+export const evictSessionMessagesAtom = atom(null, (get, set, sessionId: string): boolean => {
+  if (!canReleaseSessionData(get, sessionId)) return false;
+  const data = get(sessionStoreAtom(sessionId));
+  if (!isSessionDataResident(data) || isSessionLoadInFlight(sessionId)) return true;
+  releaseSessionData(get, set, sessionId, { ...data!, messages: [], messagesEvicted: true });
+  return true;
+});
+
+export const setSessionWorkspaceOpenAtom = atom(
+  null,
+  (get, set, { workspacePath, isOpen }: { workspacePath: string; isOpen: boolean }) => {
+    const closed = new Set(get(closedSessionWorkspacesAtom));
+    if (isOpen) {
+      closed.delete(workspacePath);
+    } else {
+      closed.add(workspacePath);
+      const generations = new Map(get(sessionWorkspaceGenerationsAtom));
+      generations.set(workspacePath, {});
+      set(sessionWorkspaceGenerationsAtom, generations);
+      for (const [id, path] of loadSessionWorkspaces) {
+        if (path === workspacePath) {
+          loadSessionPromises.delete(id);
+          loadSessionWorkspaces.delete(id);
+          set(sessionLoadingAtom(id), false);
+        }
+      }
+      for (const [id, reload] of pendingReloads) {
+        if (reload.workspacePath === workspacePath) {
+          reload.aborted = true;
+          pendingReloads.delete(id);
+        }
+      }
+    }
+    set(closedSessionWorkspacesAtom, closed);
+    set(pruneClosedSessionDataAtom);
+  }
+);
+
 
 /**
  * Load session data into the atom.
@@ -1751,6 +1818,10 @@ export const loadSessionDataAtom = atom(
       return null;
     }
 
+    if (get(closedSessionWorkspacesAtom).has(workspacePath) && canReleaseSessionData(get, sessionId)) return null;
+    const generation = get(sessionWorkspaceGenerationsAtom).get(workspacePath);
+    loadSessionWorkspaces.set(sessionId, workspacePath);
+
     // Deduplicate: if a load is already in-flight for this session, reuse its promise
     const existing = loadSessionPromises.get(sessionId);
     if (existing) {
@@ -1762,9 +1833,12 @@ export const loadSessionDataAtom = atom(
     const draftWasHydrated = get(sessionDraftHydratedAtom(sessionId));
     const draftModifiedAtStart = get(sessionDraftLocalModifiedAtAtom(sessionId));
 
+    const messagesAtStart = captureTranscriptMessages(get(sessionStoreAtom(sessionId))?.messages ?? []);
     const loadPromise = (async () => {
     try {
       const sessionData = await window.electronAPI.aiLoadSession(sessionId, workspacePath);
+      if (get(sessionWorkspaceGenerationsAtom).get(workspacePath) !== generation ||
+          (get(closedSessionWorkspacesAtom).has(workspacePath) && canReleaseSessionData(get, sessionId))) return null;
       if (sessionData) {
         // Validate model field (for debugging)
         const model = sessionData.model;
@@ -1772,6 +1846,10 @@ export const loadSessionDataAtom = atom(
           console.warn(`[sessions] Session ${sessionId} has invalid model "${model}" - this indicates a bug in session creation`);
         }
 
+        sessionData.messages = reconcileTranscriptMessages(
+          get(sessionStoreAtom(sessionId))?.messages ?? [], sessionData.messages ?? [],
+          { startedWith: messagesAtStart },
+        );
         // Set sessionStoreAtom - derived atoms (mode, model, archived) will automatically sync
         set(sessionStoreAtom(sessionId), sessionData);
 
@@ -1802,7 +1880,9 @@ export const loadSessionDataAtom = atom(
     } catch (error) {
       console.error(`[sessions] Failed to load session ${sessionId}:`, error);
     } finally {
-      set(sessionLoadingAtom(sessionId), false);
+      if (get(sessionWorkspaceGenerationsAtom).get(workspacePath) === generation) {
+        set(sessionLoadingAtom(sessionId), false);
+      }
     }
 
     return null;
@@ -1812,7 +1892,10 @@ export const loadSessionDataAtom = atom(
     try {
       return await loadPromise;
     } finally {
-      loadSessionPromises.delete(sessionId);
+      if (loadSessionPromises.get(sessionId) === loadPromise) {
+        loadSessionPromises.delete(sessionId);
+        loadSessionWorkspaces.delete(sessionId);
+      }
     }
   }
 );
@@ -1839,7 +1922,7 @@ export const updateSessionDataAtom = atom(
  * When multiple reload requests come in rapidly (e.g., multiple message-logged events),
  * only the latest fetch should update the state to avoid stale data overwrites.
  */
-const pendingReloads = new Map<string, { version: number; aborted: boolean }>();
+const pendingReloads = new Map<string, { version: number; aborted: boolean; workspacePath: string }>();
 
 function preserveEquivalentArrayRef<T>(current: T[] | undefined, next: T[] | undefined): T[] | undefined {
   if (!current || !next) return next;
@@ -1924,6 +2007,12 @@ export const reloadSessionDataAtom = atom(
       return;
     }
 
+    if (get(closedSessionWorkspacesAtom).has(workspacePath) && canReleaseSessionData(get, sessionId)) return;
+    // Background triggers (message-logged, completion) refresh a session this
+    // window holds; they must not load the full history of one nobody is
+    // viewing. A viewer mounting calls loadSessionDataAtom instead.
+    if (!isSessionDataResident(get(sessionStoreAtom(sessionId))) && !isSessionLoadInFlight(sessionId)) return;
+
     // Create a new version for this reload request
     const existingPending = pendingReloads.get(sessionId);
     if (existingPending) {
@@ -1932,62 +2021,26 @@ export const reloadSessionDataAtom = atom(
     }
 
     const currentVersion = (existingPending?.version || 0) + 1;
-    const thisReload = { version: currentVersion, aborted: false };
+    const thisReload = { version: currentVersion, aborted: false, workspacePath };
     pendingReloads.set(sessionId, thisReload);
+    const messagesAtStart = captureTranscriptMessages(get(sessionStoreAtom(sessionId))?.messages ?? []);
 
     try {
       const sessionData = await window.electronAPI.aiLoadSession(sessionId, workspacePath);
 
       // Check if this reload was superseded by a newer one
-      if (thisReload.aborted) {
+      if (thisReload.aborted ||
+          (get(closedSessionWorkspacesAtom).has(workspacePath) && canReleaseSessionData(get, sessionId))) {
         return;
       }
 
       if (sessionData) {
         const current = get(sessionStoreAtom(sessionId));
 
-        // Merge messages: preserve local-only optimistic messages not yet in database.
-        // Optimistic messages (added in-memory by the renderer before the provider
-        // persists them) have negative IDs (id < 0). They must be preserved across
-        // DB reloads so chat bubbles don't flicker away while waiting for the
-        // provider to persist the canonical version.
+        sessionData.messages = reconcileTranscriptMessages(
+          current?.messages ?? [], sessionData.messages ?? [], { startedWith: messagesAtStart },
+        );
         if (current) {
-          const dbMessages = sessionData.messages || [];
-          const localMessages = current.messages || [];
-
-          // Collect optimistic messages (negative IDs) that aren't yet in the DB.
-          // These were added locally before the provider persisted them.
-          // Drop any optimistic message whose type+text matches a DB message
-          // with a similar timestamp (within 5s tolerance). The timestamp check
-          // avoids premature eviction when a user sends two identical messages
-          // (e.g. "yes" twice). Use safe getTime() in case createdAt is a string
-          // after IPC serialization rather than a Date object.
-          const safeGetTime = (d: Date | string | unknown): number => {
-            if (d instanceof Date) return d.getTime();
-            if (typeof d === 'string') return new Date(d).getTime();
-            return 0;
-          };
-          const optimisticMessages = localMessages.filter(
-            (m: TranscriptViewMessage) =>
-              m.id < 0 &&
-              !dbMessages.some(
-                (db: TranscriptViewMessage) =>
-                  db.type === m.type &&
-                  db.text === m.text &&
-                  Math.abs(safeGetTime(db.createdAt) - safeGetTime(m.createdAt)) < 5000
-              )
-          );
-
-          if (optimisticMessages.length > 0) {
-            // Append optimistic messages after DB messages so they appear at
-            // the correct position (end of transcript). They'll be naturally
-            // replaced on the next reload once the provider has persisted
-            // canonical versions with real positive IDs.
-            sessionData.messages = [...dbMessages, ...optimisticMessages];
-          } else {
-            sessionData.messages = dbMessages;
-          }
-
           // Preserve read state
           const preservedTimestamp = current.lastReadMessageTimestamp || 0;
           const dbTimestamp = sessionData.lastReadMessageTimestamp || 0;
@@ -2015,7 +2068,7 @@ export const reloadSessionDataAtom = atom(
     } finally {
       // Clean up if this was the latest reload
       const currentPending = pendingReloads.get(sessionId);
-      if (currentPending?.version === currentVersion) {
+      if (currentPending === thisReload) {
         pendingReloads.delete(sessionId);
       }
     }
@@ -2149,12 +2202,12 @@ export const sessionListRootAtom = atom<SessionListItem[]>((get) => {
   const registry = get(sessionRegistryAtom);
   const workspacePath = get(sessionListWorkspaceAtom) || '';
   const showArchived = get(showArchivedSessionsAtom);
+  const host = get(selectedMachineAtom(workspacePath));
 
   return Array.from(registry.values())
     .filter(s => {
+      if ((s.remoteHostDeviceId ?? "") !== host) return false;
       if (!showArchived && s.isArchived) return false;
-      // Meta-agent sessions are included - they're rendered via MetaAgentGroup in SessionHistory
-      if (s.agentRole === 'meta-agent') return true;
       // Root sessions (no parent) are always included
       if (!s.parentSessionId) return true;
       // Blitz child sessions must also be included so they appear in worktreeGroupsData
@@ -2210,6 +2263,8 @@ export const showArchivedSessionsAtom = atom<boolean>(false);
  *   If provided, uses this value instead of reading from showArchivedSessionsAtom.
  *   This avoids race conditions when the atom is updated but not yet committed.
  */
+let sessionListRefreshVersion = 0;
+
 export const refreshSessionListAtom = atom(
   null,
   async (get, set, includeArchivedOverride?: boolean) => {
@@ -2218,6 +2273,7 @@ export const refreshSessionListAtom = atom(
       return;
     }
 
+    const refreshVersion = ++sessionListRefreshVersion;
     const showArchived = includeArchivedOverride ?? get(showArchivedSessionsAtom);
 
     try {
@@ -2226,36 +2282,13 @@ export const refreshSessionListAtom = atom(
         includeArchived: showArchived,
       });
 
+      if (get(sessionListWorkspaceAtom) !== workspacePath || refreshVersion !== sessionListRefreshVersion) return;
+
       if (result.success && Array.isArray(result.sessions)) {
         // Map IPC results directly into registry (single pass, no intermediate type)
         const registry = new Map<string, SessionMeta>();
         for (const s of result.sessions) {
-          registry.set(s.id, {
-            id: s.id,
-            title: s.title || 'Untitled Session',
-            createdAt: s.createdAt,
-            updatedAt: s.updatedAt,
-            provider: s.provider || 'claude',
-            model: s.model,
-            sessionType: s.sessionType || 'session',
-            agentRole: s.agentRole || 'standard',
-            createdBySessionId: s.createdBySessionId || null,
-            messageCount: s.messageCount || 0,
-            workspaceId: workspacePath,
-            isArchived: s.isArchived || false,
-            isPinned: s.isPinned || false,
-            parentSessionId: s.parentSessionId || null,
-            worktreeId: s.worktreeId || null,
-            childCount: s.childCount || 0,
-            uncommittedCount: s.uncommittedCount || 0,
-            // Kanban board phase and tags from metadata JSONB
-            ...(s.phase && { phase: s.phase }),
-            ...(s.tags && { tags: s.tags }),
-            // Linked tracker item IDs from metadata JSONB
-            ...(s.linkedTrackerItemIds && { linkedTrackerItemIds: s.linkedTrackerItemIds }),
-            ...(s.agentRole && { agentRole: s.agentRole }),
-            ...(s.createdBySessionId !== undefined && { createdBySessionId: s.createdBySessionId }),
-          });
+          registry.set(s.id, sessionListMetadata(s, workspacePath));
 
           // Initialize unread state from database metadata (for cross-device sync)
           if (s.hasUnread) {
@@ -2270,11 +2303,12 @@ export const refreshSessionListAtom = atom(
         }
 
         set(sessionRegistryAtom, registry);
+        set(sessionLaunchCountsAtom, result.launchedSessionCounts ?? {});
       }
     } catch (error) {
       console.error('[sessions] Failed to refresh session list:', error);
     } finally {
-      set(sessionListLoadingAtom, false);
+      if (refreshVersion === sessionListRefreshVersion) set(sessionListLoadingAtom, false);
     }
   }
 );
@@ -2304,6 +2338,7 @@ export async function initSessionList(workspacePath: string): Promise<void> {
   }
 
   lastInitWorkspacePath = workspacePath;
+  if (store.get(sessionListWorkspaceAtom) !== workspacePath) store.set(sessionLaunchCountsAtom, {});
   store.set(sessionListWorkspaceAtom, workspacePath);
 
   // Trigger initial load and track the promise
@@ -2388,6 +2423,8 @@ export const updateSessionFullAtom = atom(
         ...(update.parentSessionId !== undefined && { parentSessionId: update.parentSessionId }),
         ...(update.worktreeId !== undefined && { worktreeId: update.worktreeId }),
         ...(update.childCount !== undefined && { childCount: update.childCount }),
+        ...(update.descendantCount !== undefined && { descendantCount: update.descendantCount }),
+        ...(update.createdBySessionId !== undefined && { createdBySessionId: update.createdBySessionId }),
         ...(update.uncommittedCount !== undefined && { uncommittedCount: update.uncommittedCount }),
         ...(update.messageCount !== undefined && { messageCount: update.messageCount }),
         ...(update.provider !== undefined && { provider: update.provider }),
@@ -2476,6 +2513,14 @@ export const setSelectedWorkstreamAtom = atom(
   }) => {
     const prev = get(selectedWorkstreamAtom(workspacePath));
     set(selectedWorkstreamAtom(workspacePath), selection);
+    if (selection) {
+      const session = get(sessionRegistryAtom).get(selection.id);
+      if (session) {
+        const host = session.remoteHostDeviceId ?? '';
+        set(selectedMachineAtom(workspacePath), host);
+        set(machineSessionSelectionsAtom(workspacePath), previous => ({...previous, [host]: selection.id}));
+      }
+    }
 
     // Fire the selection hook (e.g., exit kanban view).
     // This fires on EVERY selection, including re-selecting the same session,
@@ -2516,51 +2561,19 @@ export const workstreamSessionsAtom = atomFamily((workstreamId: string) =>
     const filterArchived = (sessionIds: string[]) =>
       sessionIds.filter(id => !get(sessionArchivedAtom(id)));
 
-    // Check if this is a parent with children already loaded
-    const children = get(sessionChildrenAtom(workstreamId));
-    if (children.length > 0) {
-      // This is a workstream parent - only return non-archived children
-      // The parent is a structural container, not a displayable session
-      return filterArchived(children);
-    }
-
-    // Get session data and registry for further checks
-    const sessionData = get(sessionStoreAtom(workstreamId));
     const registry = get(sessionRegistryAtom);
-
-    // Check if this session has a worktree_id
-    if (sessionData?.worktreeId) {
-      // This is a worktree session - find all non-archived sessions with the same worktreeId
-      const worktreeSessions = Array.from(registry.values())
-        .filter(s => s.worktreeId === sessionData.worktreeId)
-        .sort((a, b) => a.createdAt - b.createdAt)
-        .map(s => s.id);
-      // If no sessions found in registry (might not be populated yet), at least include self
-      if (worktreeSessions.length === 0) {
-        // console.log('[workstreamSessionsAtom]', workstreamId, 'worktree session - returning self');
-        return filterArchived([workstreamId]);
-      }
-      // console.log('[workstreamSessionsAtom]', workstreamId, 'returning worktree sessions:', worktreeSessions);
-      return filterArchived(worktreeSessions);
+    const meta = registry.get(workstreamId);
+    const subtree = buildSessionTree([...registry.values()]).find(node => node.session.id === workstreamId);
+    const loadedChildren = get(sessionChildrenAtom(workstreamId));
+    if (subtree && subtree.ids.length > 1) {
+      return filterArchived(meta?.sessionType === 'workstream' ? subtree.ids.slice(1) : subtree.ids);
     }
-
-    // Check if this is a workstream root that hasn't had children loaded yet
-    // Look up childCount from the registry (more reliable than metadata)
-    const sessionMeta = registry.get(workstreamId);
-    // console.log('[workstreamSessionsAtom]', workstreamId, 'sessionMeta:', sessionMeta?.id, 'childCount:', sessionMeta?.childCount);
-    if (sessionMeta?.childCount && sessionMeta.childCount > 0) {
-      // This is a workstream parent - find non-archived children from registry by parentSessionId
-      // This works even before the workstream is opened
-      const childrenFromRegistry = Array.from(registry.values())
-        .filter(s => s.parentSessionId === workstreamId)
-        .sort((a, b) => a.createdAt - b.createdAt)
-        .map(s => s.id);
-      // console.log('[workstreamSessionsAtom]', workstreamId, 'returning children from registry:', childrenFromRegistry);
-      return filterArchived(childrenFromRegistry);
+    if (loadedChildren.length) return filterArchived(meta?.sessionType === 'workstream' ? loadedChildren : [workstreamId, ...loadedChildren]);
+    const worktreeId = meta?.worktreeId ?? get(sessionStoreAtom(workstreamId))?.worktreeId;
+    if (worktreeId && registry.get(meta?.parentSessionId ?? '')?.sessionType === 'blitz') {
+      const sessions = [...registry.values()].filter(row => row.worktreeId === worktreeId).sort((a,b) => a.createdAt-b.createdAt).map(row=>row.id);
+      return filterArchived(sessions.length ? sessions : [workstreamId]);
     }
-
-    // Single session with no children and no worktree
-    // console.log('[workstreamSessionsAtom]', workstreamId, 'returning self as single session');
     return filterArchived([workstreamId]);
   })
 );

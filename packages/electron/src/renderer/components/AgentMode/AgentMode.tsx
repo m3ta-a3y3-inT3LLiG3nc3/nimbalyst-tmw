@@ -11,8 +11,9 @@
  * the massive re-renders caused by holding sessionTabs[] in useState.
  */
 
-import React, { forwardRef, useImperativeHandle, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { forwardRef, useImperativeHandle, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react';
 import { atom, useAtomValue, useSetAtom } from 'jotai';
+import { moveWorkstreamEditorAtom } from '../../store/atoms/agentFileViewer';
 import { ResizablePanel } from '../AgenticCoding/ResizablePanel';
 import { SessionHistory } from '../AgenticCoding/SessionHistory';
 import { SessionKanbanBoard } from '../TrackerMode/SessionKanbanBoard';
@@ -157,6 +158,7 @@ export const AgentMode = forwardRef<AgentModeRef, AgentModeProps>(function Agent
   const setSelectedWorkstream = useSetAtom(setSelectedWorkstreamAtom);
   const toggleFilesSidebar = useSetAtom(toggleWorkstreamFilesSidebarAtom);
   const setRightPanelMode = useSetAtom(setWorkstreamRightPanelModeAtom);
+  const moveEditor = useSetAtom(moveWorkstreamEditorAtom);
   const rightPanelVisible = useAtomValue(
     workstreamFilesSidebarVisibleAtom(selectedWorkstreamId ?? '__no_workstream__'),
   );
@@ -224,10 +226,11 @@ export const AgentMode = forwardRef<AgentModeRef, AgentModeProps>(function Agent
     store.set(activeSessionIdAtom, actualActiveSessionId);
   }, [actualActiveSessionId]);
 
-  // Initialize on mount
-  useEffect(() => {
+  // Initialize before child passive effects write workspace state. Restored
+  // projects can already have Git status when GitOperationsPanel mounts.
+  useLayoutEffect(() => {
     initSessionList(workspacePath);
-    initAgentModeLayout(workspacePath);
+    initAgentModeLayout(workspacePath, { setActive: false });
     initSessionEditors(workspacePath);
     // Initialize unified workstream state
     initWorkstreamState(workspacePath);
@@ -529,6 +532,10 @@ export const AgentMode = forwardRef<AgentModeRef, AgentModeProps>(function Agent
     },
     showRightPanel: (mode: AgentRightPanelMode) => {
       if (selectedWorkstreamId && !isSelectedMetaAgent) {
+        if (mode === 'file-viewer') {
+          moveEditor({ workstreamId: selectedWorkstreamId, placement: 'right' });
+          return;
+        }
         setRightPanelMode({ workstreamId: selectedWorkstreamId, mode });
         if (!rightPanelVisible) {
           toggleFilesSidebar(selectedWorkstreamId);
@@ -547,6 +554,7 @@ export const AgentMode = forwardRef<AgentModeRef, AgentModeProps>(function Agent
     rightPanelVisible,
     selectedWorkstreamId,
     setRightPanelMode,
+    moveEditor,
     toggleFilesSidebar,
   ]);
 

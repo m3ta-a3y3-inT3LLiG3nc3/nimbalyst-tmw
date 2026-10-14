@@ -1,10 +1,10 @@
+import { codexSessionConfigurationKey } from '../protocols/codexAppServer/windowsSandbox';
 import path from 'path';
 import crypto from 'crypto';
 import OpenAI from 'openai';
 import { BaseAgentProvider } from './BaseAgentProvider';
 import { buildUserMessageAddition } from './documentContextUtils';
 import { describeUnusableWorkspacePath } from './workspacePreconditions';
-import { buildClaudeCodeSystemPrompt, buildMetaAgentSystemPrompt, type MetaAgentWorkflowPreset } from '../../prompt';
 import { DEFAULT_MODELS } from '../../modelConstants';
 import { AIToolCall, AIToolResult } from '../../types';
 import {
@@ -21,6 +21,7 @@ import { AgentCapabilities, BUILTIN_AGENT_CAPABILITIES } from '../agentCapabilit
 import type { FileChangeFidelity } from '../providerFileTracking';
 import { CodexSDKProtocol } from '../protocols/CodexSDKProtocol';
 import { CodexAppServerProtocol, type CodexAppServerHostBindings } from '../protocols/CodexAppServerProtocol';
+import {setCodexShellTrackingHost} from '../protocols/codexAppServer/shellTracking';
 import { AgentProtocol, ProtocolEvent, ProtocolSession } from '../protocols/ProtocolInterface';
 import { isNonRenderingAppServerItemStarted } from '../transcript/parsers/CodexAppServerRawParser';
 import { capAppServerItemParamsForStorage } from '../../../storage/toolOutputBudget';
@@ -28,8 +29,9 @@ import { ToolPermissionService } from '../permissions/ToolPermissionService';
 import { PermissionMode, TrustChecker, PermissionPatternSaver, PermissionPatternChecker, SecurityLogger } from './ProviderPermissionMixin';
 import { CodexSdkModuleLike, loadCodexSdkModule } from './codex/codexSdkLoader';
 import { resolvePackagedCodexBinaryPath } from './codex/codexBinaryPath';
+import { buildCodexSystemPrompt } from './codex/codexSystemPrompt';
 import { McpConfigService } from '../services/McpConfigService';
-import { getMcpConfigService, isInternalMcpServerEnabled, areTrackerToolsEnabled, resolveTrackersWorkspacePath } from '../services/mcpServerConfig';
+import { getMcpConfigService } from '../services/mcpServerConfig';
 import { MCPServerConfig } from '../../../types/MCPServerConfig';
 import { safeJSONSerialize } from '../../../utils/serialization';
 import { AskUserQuestionPrompt, AskUserQuestionPromptOption } from './shared/askUserQuestionTypes';
@@ -119,6 +121,13 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     contextWindow: number;
     maxTokens: number;
   }> = [
+    // GPT-6 catalog entries require codex >= 0.153.0 (Astra), >= 0.155.0
+    // (Sol, Luna), and >= 0.159.1 (6.1 Sol); the catalog lists a 272k default
+    // context window for all of them.
+    { id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol', contextWindow: 272000, maxTokens: 128000 },
+    { id: 'gpt-6-sol', name: 'GPT-6 Sol', contextWindow: 272000, maxTokens: 128000 },
+    { id: 'gpt-6-astra', name: 'GPT-6 Astra', contextWindow: 272000, maxTokens: 128000 },
+    { id: 'gpt-6-luna', name: 'GPT-6 Luna', contextWindow: 272000, maxTokens: 128000 },
     { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', contextWindow: 372000, maxTokens: 128000 },
     { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', contextWindow: 372000, maxTokens: 128000 },
     { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', contextWindow: 372000, maxTokens: 128000 },
@@ -127,6 +136,9 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini', contextWindow: 400000, maxTokens: 128000 },
   ];
   private static readonly MODEL_FALLBACK_PRIORITY: ReadonlyArray<string> = [
+    'gpt-6.1-sol',
+    'gpt-6-sol',
+    'gpt-6-luna',
     'gpt-5.6-sol',
     'gpt-5.6-terra',
     'gpt-5.6-luna',
@@ -311,6 +323,10 @@ export class OpenAICodexProvider extends BaseAgentProvider {
 
   public static setAppServerHostBindings(bindings: CodexAppServerHostBindings | null): void {
     OpenAICodexProvider.appServerHostBindings = bindings;
+  }
+
+  public static setShellTrackingHost(host: Parameters<typeof setCodexShellTrackingHost>[0]): void {
+    setCodexShellTrackingHost(host);
   }
 
   // Host-supplied auth gate. Returns whether OpenAI auth is currently required
@@ -510,7 +526,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
   static normalizeModelSelection(modelId: string): string {
     const normalized = modelId.trim().toLowerCase();
     if (OpenAICodexProvider.LEGACY_MODEL_ALIASES.has(normalized)) {
-      return 'openai-codex:gpt-5.6-sol';
+      return OpenAICodexProvider.DEFAULT_MODEL;
     }
 
     const parsed = ModelIdentifier.tryParse(modelId);
@@ -966,7 +982,11 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     const agentRole = await this.getAgentRole(sessionId);
     const isMetaAgent = agentRole === 'meta-agent';
     const workflowPreset = isMetaAgent ? await this.getWorkflowPreset(sessionId) : 'default';
-    const systemPrompt = this.buildSystemPrompt(documentContext, isMetaAgent, workflowPreset);
+    const systemPrompt = buildCodexSystemPrompt({
+      documentContext, isMetaAgent, workflowPreset, model: this.config?.model ?? undefined,
+      sessionDirective: await this.getSessionDirective(sessionId),
+      hasOutOfBandNaming: this.isNamedOutOfBand(sessionId, documentContext),
+    });
     const { userMessageAddition, messageWithContext } = buildUserMessageAddition(message, documentContext);
     const unsupportedAttachmentHints = attachments?.filter(
       (attachment) => attachment.type !== 'image' && attachment.type !== 'document'
@@ -1057,7 +1077,12 @@ export class OpenAICodexProvider extends BaseAgentProvider {
       //   2. A persisted thread id (`this.sessions.getSessionId`) from a prior
       //      Nimbalyst process. Call `resumeSession` to attach to it.
       //   3. Otherwise, `createSession`.
-      const permissionKey = `${permissionDecision.permissionMode ?? 'none'}:${permissionDecision.agentVerified === true}`;
+      // Include authorized sibling roots in the cache key so new worktrees take effect next turn.
+      const additionalDirectories = OpenAICodexProvider.additionalDirectoriesLoader
+        ? OpenAICodexProvider.additionalDirectoriesLoader(workspacePath)
+        : [];
+
+      const permissionKey = codexSessionConfigurationKey(permissionDecision.permissionMode, permissionDecision.agentVerified === true, workspacePath, additionalDirectories);
       let cachedLiveSession = sessionId ? this.liveProtocolSessions.get(sessionId) : undefined;
       if (
         sessionId &&
@@ -1096,12 +1121,8 @@ export class OpenAICodexProvider extends BaseAgentProvider {
       // Merge in shell env vars and the enhanced PATH so the Codex agent can see system tools.
       let codexEnv = OpenAICodexProvider.buildCodexEnvironment();
 
-      // Layer session-specific env vars for the PreToolUse hook. The hook
-      // script reads NIMBALYST_PRE_EDIT_DIR to know where to write per-path
-      // pre-edit snapshots, and ELECTRON_RUN_AS_NODE makes process.execPath
-      // (an Electron binary) run as plain Node so we don't have to ship a
-      // separate Node runtime. When the resolver isn't wired up (tests, older
-      // electron builds) the hook is simply not configured.
+      // The SDK pre-edit hook uses Electron as Node and writes snapshots to
+      // this session's sidecar directory. App-server observation is host-owned.
       const sidecarDir = this.transport === 'sdk' && sessionId
         ? OpenAICodexProvider.preEditSidecarDirResolver?.(sessionId)
         : undefined;
@@ -1119,20 +1140,9 @@ export class OpenAICodexProvider extends BaseAgentProvider {
         baseEnv.ELECTRON_RUN_AS_NODE = '1';
         codexEnv = baseEnv;
         // console.log('[CODEX] Pre-edit hook env configured:', { sessionId, sidecarDir });
-      } else if (sessionId) {
-        // console.log('[CODEX] Pre-edit hook sidecar dir resolver returned undefined', { sessionId });
       }
 
       const resolvedModel = await this.getConfiguredModel();
-
-      // Sibling worktrees and the parent project root the agent is allowed to
-      // write to, in addition to its workingDirectory. Without this, Codex's
-      // workspace-write sandbox blocks orchestrator edits across worktrees and
-      // `git rebase --continue` from inside a worktree (the .git common dir
-      // sits outside the worktree). Issue #37 problem 1.
-      const additionalDirectories = OpenAICodexProvider.additionalDirectoriesLoader
-        ? OpenAICodexProvider.additionalDirectoriesLoader(workspacePath)
-        : [];
 
       const sessionOptions = {
         workspacePath,
@@ -1144,6 +1154,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
           disallowedTools: ['Read', 'Write', 'Edit', 'MultiEdit', 'Glob', 'Grep', 'LS', 'Bash', 'WebFetch', 'WebSearch', 'Task', 'Agent'].filter(t => !BaseAgentProvider.META_AGENT_ALLOWED_TOOLS.includes(t)),
         } : {}),
         raw: {
+          nimbalystSessionId: sessionId,
           systemPrompt,
           abortSignal: abortController.signal,
           agentVerified: permissionDecision.agentVerified === true,
@@ -1883,44 +1894,13 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     super.destroy();
   }
 
-  /**
-   * Build system prompt for Codex using the same addendum as Claude Code.
-   * Uses buildClaudeCodeSystemPrompt to include Nimbalyst-specific instructions
-   * for visual tools, worktrees, session naming, etc.
-   */
-  protected buildSystemPrompt(documentContext?: DocumentContext, isMetaAgent: boolean = false, workflowPreset: MetaAgentWorkflowPreset = 'default'): string {
-    if (isMetaAgent) {
-      return buildMetaAgentSystemPrompt('codex', workflowPreset, {
-        provider: 'openai-codex',
-        model: this.config?.model ?? undefined,
-      });
-    }
-
-    const hasSessionNaming = isInternalMcpServerEnabled();
-    const worktreePath = documentContext?.worktreePath;
-    const isVoiceMode = (documentContext as any)?.isVoiceMode;
-    const voiceModeCodingAgentPrompt = (documentContext as any)?.voiceModeCodingAgentPrompt;
-    // Note: Agent teams are not currently supported for Codex
-    const enableAgentTeams = false;
-
-    return buildClaudeCodeSystemPrompt({
-      hasSessionNaming,
-      toolReferenceStyle: 'codex',
-      worktreePath,
-      isVoiceMode,
-      voiceModeCodingAgentPrompt,
-      enableAgentTeams,
-      trackersEnabled: areTrackerToolsEnabled(resolveTrackersWorkspacePath(documentContext)),
-    });
-  }
-
   private async getConfiguredModel(): Promise<string> {
     const configured = this.config?.model || OpenAICodexProvider.DEFAULT_MODEL;
     const parsed = ModelIdentifier.tryParse(configured);
     const resolved = parsed ? parsed.model : configured.replace(/^openai-codex:/, '');
     const normalized = resolved.toLowerCase();
     if (normalized === 'openai-codex-cli' || normalized === 'default' || normalized === 'cli') {
-      return 'gpt-5.6-sol';
+      return 'gpt-6.1-sol';
     }
 
     // Pass the model directly to the Codex SDK without pre-validation.

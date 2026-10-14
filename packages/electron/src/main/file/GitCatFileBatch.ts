@@ -120,12 +120,21 @@ export class GitCatFileBatch {
       this.buffer = Buffer.alloc(0);
       this.awaitingBody = null;
 
-      child.stdout.on('data', (chunk: Buffer) => this.onData(chunk));
+      // A replaced child can still flush output it wrote before it died; feeding
+      // that to the parser would answer the new child's reads with old bytes.
+      child.stdout.on('data', (chunk: Buffer) => {
+        if (this.child === child) this.onData(chunk);
+      });
       // Bind these to *this* child: a killed process emits `exit` asynchronously,
       // and by then a replacement may already be serving reads. An unbound
       // handler would tear down its successor and null out that caller's result.
       child.on('error', () => this.handleExit(child));
       child.on('exit', () => this.handleExit(child));
+      // Pipe failures are emitted by stdin, not the child or the write's
+      // try/catch. Keep this listener after disposal to absorb late EPIPEs.
+      child.stdin.on('error', () => {
+        if (this.child === child) this.dispose();
+      });
       // Drain stderr so a non-repo directory's complaint cannot fill the pipe.
       child.stderr.resume();
 
@@ -187,6 +196,7 @@ export class GitCatFileBatch {
 
     if (header.endsWith(' missing')) {
       this.queue.shift()?.resolve(null);
+      if (this.queue.length === 0) this.touchIdleTimer();
       return true;
     }
 
@@ -224,6 +234,9 @@ export class GitCatFileBatch {
     this.awaitingBody = null;
     const pending = this.queue.shift();
     if (!pending) return true;
+    // A slow read may outlive the timer set when it was enqueued. Start the
+    // idle interval when the last response drains, including oversized bodies.
+    if (this.queue.length === 0) this.touchIdleTimer();
 
     if (body.discard) {
       pending.resolve(null);

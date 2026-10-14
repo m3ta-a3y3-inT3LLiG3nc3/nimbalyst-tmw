@@ -1,0 +1,15 @@
+{
+  "name": "nimbalyst",
+  "description": "Claude Code plugins from Nimbalyst.",
+  "owner": {
+    "name": "Nimbalyst",
+    "url": "https://nimbalyst.com"
+  },
+  "plugins": [
+    {
+      "name": "nimbalyst-wiki",
+      "source": "./plugins/nimbalyst-wiki",
+      "description": "A local wiki your agents write for you, so you can think, organize, and set direction. Capture decisions, track typed pages, edit locally, and optionally share with your team."
+    }
+  ]
+}

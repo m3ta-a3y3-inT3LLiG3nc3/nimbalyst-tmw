@@ -1,5 +1,12 @@
 import { resolveSaveFailureType, type FileSaveResult } from '../../utils/fileSaveResult';
 
+export function customEditorSaveBaseline(local: string, acknowledged: string | ArrayBuffer | null): string {
+  // Custom editors receive reloads directly through their host subscription.
+  // The model advances only after clean recipients accept the notification;
+  // the built-in editor's local cache does not participate in that path.
+  return typeof acknowledged === 'string' ? acknowledged : local;
+}
+
 export interface SaveAttemptResult extends FileSaveResult {
   /** Always set by the main process, on both the success and failure paths. */
   filePath: string;
@@ -34,7 +41,7 @@ export interface SaveAttemptDeps {
     source: 'auto' | 'manual',
   ): Promise<SaveAttemptResult | null>;
   /** Returns true to overwrite external changes, false to reload from disk. */
-  confirmOverwrite(): boolean;
+  confirmOverwrite(): Promise<boolean>;
 }
 
 export interface SaveAttemptParams {
@@ -71,7 +78,7 @@ export async function resolveSaveAttempt(
       return { kind: 'autosave-conflict', diskContent, baseline: expectedDiskContent };
     }
 
-    if (!deps.confirmOverwrite()) {
+    if (!(await deps.confirmOverwrite())) {
       // Only reload when the main process actually handed back disk content;
       // otherwise there is nothing to replace the buffer with and this stays
       // a failure so the buffer is preserved.

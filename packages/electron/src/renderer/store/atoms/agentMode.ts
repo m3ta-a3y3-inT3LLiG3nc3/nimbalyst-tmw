@@ -39,6 +39,8 @@ export interface SessionHistoryLayout {
   collapsedGroups: string[];
   sortOrder: 'updated' | 'created';
   viewMode: 'list' | 'kanban';
+  /** One line per session row instead of title plus a metadata line. */
+  compactRows: boolean;
 }
 
 /**
@@ -54,6 +56,8 @@ export interface AgentModeLayout {
   teammatePanelCollapsed: boolean;
   agentPanelCollapsed: boolean;
   trackerPanelCollapsed: boolean;
+  /** Whether the meta-agent "Delegated Sessions" dashboard is collapsed. */
+  metaAgentDashboardCollapsed: boolean;
 }
 
 export const MIN_AGENT_RIGHT_PANEL_WIDTH = 150;
@@ -82,6 +86,7 @@ const DEFAULT_SESSION_HISTORY_LAYOUT: SessionHistoryLayout = {
   collapsedGroups: [],
   sortOrder: 'updated',
   viewMode: 'list',
+  compactRows: false,
 };
 
 const DEFAULT_LAYOUT: AgentModeLayout = {
@@ -92,6 +97,7 @@ const DEFAULT_LAYOUT: AgentModeLayout = {
   teammatePanelCollapsed: false,
   agentPanelCollapsed: false,
   trackerPanelCollapsed: false,
+  metaAgentDashboardCollapsed: false,
 };
 
 /**
@@ -108,6 +114,7 @@ export function mergeWithDefaults(persisted: Partial<AgentModeLayout> | undefine
     // otherwise brick the workspace on every launch with no in-app recovery.
     // Coerce any value other than the two known ones back to 'updated'.
     sortOrder: persisted?.sessionHistoryLayout?.sortOrder === 'created' ? 'created' : 'updated',
+    compactRows: persisted?.sessionHistoryLayout?.compactRows === true,
   };
   // Only pick known layout fields from persisted data.
   // agenticCodingWindowState stores both layout AND selectedWorkstream at the same level.
@@ -121,6 +128,8 @@ export function mergeWithDefaults(persisted: Partial<AgentModeLayout> | undefine
     teammatePanelCollapsed: persisted?.teammatePanelCollapsed ?? DEFAULT_LAYOUT.teammatePanelCollapsed,
     agentPanelCollapsed: persisted?.agentPanelCollapsed ?? DEFAULT_LAYOUT.agentPanelCollapsed,
     trackerPanelCollapsed: persisted?.trackerPanelCollapsed ?? DEFAULT_LAYOUT.trackerPanelCollapsed,
+    metaAgentDashboardCollapsed:
+      persisted?.metaAgentDashboardCollapsed ?? DEFAULT_LAYOUT.metaAgentDashboardCollapsed,
   };
 }
 
@@ -186,6 +195,11 @@ export const sortOrderAtom = atom(
   (get) => get(agentModeLayoutAtom).sessionHistoryLayout.sortOrder
 );
 
+/** Whether session rows render on a single line */
+export const compactRowsAtom = atom(
+  (get) => get(agentModeLayoutAtom).sessionHistoryLayout.compactRows
+);
+
 /** View mode for session history (list or kanban) */
 export const viewModeAtom = atom(
   (get) => get(agentModeLayoutAtom).sessionHistoryLayout.viewMode
@@ -214,6 +228,11 @@ export const agentPanelCollapsedAtom = atom(
 /** Whether the tracker panel is collapsed */
 export const trackerPanelCollapsedAtom = atom(
   (get) => get(agentModeLayoutAtom).trackerPanelCollapsed
+);
+
+/** Whether the meta-agent delegated-sessions dashboard is collapsed */
+export const metaAgentDashboardCollapsedAtom = atom(
+  (get) => get(agentModeLayoutAtom).metaAgentDashboardCollapsed
 );
 
 /** Per-session derived atom for current teammates from session metadata */
@@ -418,6 +437,16 @@ export const setSortOrderAtom = atom(
 );
 
 /**
+ * Toggle single-line session rows.
+ */
+export const setCompactRowsAtom = atom(
+  null,
+  (_get, set, compactRows: boolean) => {
+    set(setSessionHistoryLayoutAtom, { compactRows });
+  }
+);
+
+/**
  * Set view mode.
  */
 export const setViewModeAtom = atom(
@@ -436,6 +465,29 @@ export const toggleTodoPanelCollapsedAtom = atom(
     const workspacePath = get(activeWorkspacePathAtom);
     const current = get(agentModeLayoutAtom);
     const newLayout = { ...current, todoPanelCollapsed: !current.todoPanelCollapsed };
+
+    set(agentModeLayoutAtom, newLayout);
+
+    if (!workspacePath) {
+      console.warn('[agentMode] Cannot persist layout - no active workspace');
+      return;
+    }
+    schedulePersist(workspacePath, newLayout);
+  }
+);
+
+/**
+ * Toggle the meta-agent delegated-sessions dashboard collapsed state.
+ */
+export const toggleMetaAgentDashboardCollapsedAtom = atom(
+  null,
+  (get, set) => {
+    const workspacePath = get(activeWorkspacePathAtom);
+    const current = get(agentModeLayoutAtom);
+    const newLayout = {
+      ...current,
+      metaAgentDashboardCollapsed: !current.metaAgentDashboardCollapsed,
+    };
 
     set(agentModeLayoutAtom, newLayout);
 

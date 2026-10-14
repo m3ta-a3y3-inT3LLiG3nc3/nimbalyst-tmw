@@ -16,9 +16,9 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
-vi.mock('electron', () => ({
+vi.mock('electron', async () => ({
   app: {
-    getPath: vi.fn(() => '/mock/path'),
+    getPath: (await import('../../../../../test-stubs/privateUserData')).testApp.getPath,
     getName: vi.fn(() => 'test-app'),
     getVersion: vi.fn(() => '1.0.0'),
     on: vi.fn(),
@@ -39,7 +39,10 @@ import {
   listUnsyncedTrackerSchemaDefs,
   materializeYamlTrackerTypeDef,
   markTrackerTypeDefProjected,
+  markTrackerSchemaDefRejected,
+  isTrackerTypeConfirmedByTeam,
 } from '../trackerTypeDefStore';
+import { registerTrackerSchemaFlushHandler, TRACKER_SCHEMA_FLUSH_DEBOUNCE_MS } from '../trackerSchemaFlush';
 import type { TrackerDataModel } from '@nimbalyst/runtime/plugins/TrackerPlugin/models';
 
 const SCHEMA_DIR = path.resolve(__dirname, '..', '..', '..', 'database', 'sqlite', 'schemas');
@@ -378,6 +381,41 @@ describe('trackerTypeDefStore materialization lifecycle (SQLite, migration 0012)
       expect(JSON.parse(all[0].model)).toEqual(edited);
       expect(all[0].sync_id).toBe(14); // still team-owned; server assigns the next version
       expect(JSON.parse(all[0].synced_model!)).toEqual(shared); // baseline stays server truth
+      expect(out[0].createOnly).toBeUndefined(); // an edit of the room's type is an update
+    });
+
+    it('pushes a team type the room has never held as create-only, so it cannot replace a concurrent one', async () => {
+      const customer = model('customer', { displayName: 'Customer', sharing: 'team' });
+      await materializeYamlTrackerTypeDef(WS, customer, db);
+
+      const out = await listUnsyncedTrackerSchemaDefs(WS, db);
+      expect(out).toHaveLength(1);
+      expect(out[0]).toMatchObject({ type: 'customer', deleted: false, createOnly: 'whenSupported' });
+    });
+
+    it('asks the connected engine to push a queued edit instead of waiting for a reconnect (NIM-6654)', async () => {
+      // Let flushes debounced by earlier tests on this workspace fire unobserved.
+      await new Promise(resolve => setTimeout(resolve, TRACKER_SCHEMA_FLUSH_DEBOUNCE_MS + 20));
+      const flush = vi.fn();
+      const unregister = registerTrackerSchemaFlushHandler(flush);
+      try {
+        await applyRemoteTrackerSchemaDef(WS, def('bug', shared, 14), db);
+        await markTrackerTypeDefProjected(WS, 'bug', JSON.stringify(shared), db);
+        await materializeYamlTrackerTypeDef(
+          WS,
+          model('bug', { displayName: 'Defect', fields: [{ name: 'collection' }] }),
+          db,
+        );
+        // A brand-new team type and a deletion enter the same outbox.
+        await materializeYamlTrackerTypeDef(WS, model('ontology-proposal', { sharing: 'team' }), db);
+        await removeTrackerTypeDef(WS, 'ontology-proposal', db);
+
+        await vi.waitFor(() => expect(flush).toHaveBeenCalledWith(WS));
+        // Debounced: a burst of saves is one push, not one per write.
+        expect(flush).toHaveBeenCalledTimes(1);
+      } finally {
+        unregister();
+      }
     });
 
     it('carries the full activity trail forward and attributes a real YAML edit', async () => {
@@ -551,6 +589,26 @@ describe('trackerTypeDefStore materialization lifecycle (SQLite, migration 0012)
       await materializeTrackerTypeDef(WS, model('noSync'), 'cli', db);
       const out = await listUnsyncedTrackerSchemaDefs(WS, db);
       expect(out.map((r) => r.type)).toContain('noSync');
+    });
+
+    it('gives a refused YAML type another attempt once its file changes, but not before', async () => {
+      await materializeYamlTrackerTypeDef(WS, model('customer', { sharing: 'team' }), db);
+      await markTrackerSchemaDefRejected(WS, 'customer', db);
+      // Reloading the same file is not a new attempt; the room would refuse it again.
+      await materializeYamlTrackerTypeDef(WS, model('customer', { sharing: 'team' }), db);
+      expect((await listUnsyncedTrackerSchemaDefs(WS, db)).map((r) => r.type)).not.toContain('customer');
+
+      await materializeYamlTrackerTypeDef(WS, model('customer', { sharing: 'team', displayName: 'Client' }), db);
+      expect((await listUnsyncedTrackerSchemaDefs(WS, db)).map((r) => r.type)).toContain('customer');
+    });
+
+    it('counts a custom type as confirmed by the team only once the room has delivered it, and not after it is retracted', async () => {
+      await materializeYamlTrackerTypeDef(WS, model('competitor', { sharing: 'team' }), db);
+      expect(await isTrackerTypeConfirmedByTeam(WS, 'competitor', db)).toBe(false);
+      await applyRemoteTrackerSchemaDef(WS, { type: 'competitor', model: JSON.stringify(model('competitor', { sharing: 'team' })), syncId: 1 }, db);
+      expect(await isTrackerTypeConfirmedByTeam(WS, 'competitor', db)).toBe(true);
+      await applyRemoteTrackerSchemaDef(WS, { type: 'competitor', model: null, syncId: 2 }, db);
+      expect(await isTrackerTypeConfirmedByTeam(WS, 'competitor', db)).toBe(false);
     });
 
     it('excludes a pending tombstone for a personal override (nothing to retract)', async () => {

@@ -57,12 +57,23 @@ export interface ToolCallDiffLoadResult {
 
 export interface TranscriptViewMessage {
   id: number;
+  /** Matches the canonical event's ephemeral runtime store generation. */
+  transcriptGeneration?: number;
   sequence: number;
   createdAt: Date;
   type: TranscriptEventType;
   text?: string;
   mode?: 'agent' | 'planning' | 'auto';
   attachments?: UserMessagePayload['attachments'];
+  /** user_message only: who sent the prompt, when the raw row recorded it. */
+  promptActor?: UserMessagePayload['promptActor'];
+  /** user_message only: automated origin such as `interactive-question`. */
+  promptOrigin?: string;
+  /**
+   * user_message only: shown before main persisted it. A send that then fails
+   * leaves this row behind, so it must not close open questions.
+   */
+  optimistic?: boolean;
   toolCall?: {
     toolName: string;
     toolDisplayName: string;
@@ -227,6 +238,7 @@ function projectEvent(
 ): TranscriptViewMessage {
   const base: TranscriptViewMessage = {
     id: event.id,
+    ...(event.transcriptGeneration !== undefined ? { transcriptGeneration: event.transcriptGeneration } : {}),
     sequence: event.sequence,
     createdAt: event.createdAt,
     type: event.eventType,
@@ -241,6 +253,8 @@ function projectEvent(
       if (p.attachments) {
         base.attachments = p.attachments;
       }
+      if (p.promptActor) base.promptActor = p.promptActor;
+      if (p.promptOrigin) base.promptOrigin = p.promptOrigin;
       break;
     }
     case 'assistant_message': {

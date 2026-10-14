@@ -1,5 +1,11 @@
 // @vitest-environment jsdom
 import { describe, it, expect, afterEach, vi } from 'vitest';
+import { act } from 'react';
+import { DataStore, gatherGrouping } from '@revolist/revogrid';
+// RevoGrid does not export ColumnService publicly. This test intentionally
+// exercises the pinned runtime bundle that patch-package repairs.
+// @ts-expect-error Internal generated module has no public declaration.
+import { M as ColumnService } from '../../../../../node_modules/@revolist/revogrid/dist/esm/column.service-8pPNyrKn.js';
 import type { TrackerRecord } from '@nimbalyst/runtime/core/TrackerRecord';
 import { globalRegistry, type TrackerDataModel } from '@nimbalyst/runtime/plugins/TrackerPlugin/models';
 import { resolveColumnsForType } from '@nimbalyst/runtime/plugins/TrackerPlugin/components/trackerColumns';
@@ -11,6 +17,8 @@ import {
   ROW_ITEM_ID,
   ROW_ITEM_TYPE,
 } from '../grid/trackerGridColumns';
+import { createTrackerCellEditor } from '../grid/trackerGridEditors';
+import { filterTrackerFieldChoices } from '../grid/TrackerGridChoicePopover';
 
 const gridType = 'gridColumnSpec';
 
@@ -93,6 +101,79 @@ describe('buildGridColumns', () => {
     expect(readonly({ model: { [ROW_ITEM_ID]: 'locked' } })).toBe(true);
     // A row with no resolvable item id must never be editable.
     expect(readonly({ model: {} })).toBe(true);
+  });
+
+  it('keeps clipboard rows aligned when a group header is inside the paste range', () => {
+    registerType();
+    const titleColumns = columnsFor(['title']);
+    const sourceColumns = columnsFor(['title', 'state']);
+    const source = buildGridSource([
+      record('1', { title: 'Old 1', state: 'open' }),
+      record('2', { title: 'Old 2', state: 'open' }),
+      record('3', { title: 'Old 3', state: 'closed' }),
+      record('4', { title: 'Old 4', state: 'closed' }),
+    ], sourceColumns);
+    const { sourceWithGroups } = gatherGrouping(source, ['state'], { expandedAll: true });
+    const rows = new DataStore('rgRow');
+    rows.updateData(sourceWithGroups);
+    const columns = new DataStore('rgCol');
+    columns.updateData(buildGridColumns(titleColumns, {
+      trackerType: gridType,
+      isRowEditable: () => true,
+    }));
+    const service = new ColumnService(rows.store, columns.store);
+    const firstItemRow = sourceWithGroups.findIndex(row => row[ROW_ITEM_ID] === '1');
+
+    const { changed } = service.getTransformedDataToApply(
+      { x: 0, y: firstItemRow },
+      [['First'], ['Second'], ['Third'], ['Fourth']],
+    );
+    const writes = Object.entries(changed).map(([rowIndex, values]) => [
+      sourceWithGroups[Number(rowIndex)][ROW_ITEM_ID],
+      (values as Record<string, unknown>).title,
+    ]);
+
+    expect(writes).toEqual([
+      ['1', 'First'],
+      ['2', 'Second'],
+      ['3', 'Third'],
+      ['4', 'Fourth'],
+    ]);
+    service.destroy();
+  });
+
+  it('does not shift clipboard rows past a locked tracker record', () => {
+    registerType();
+    const titleColumns = columnsFor(['title']);
+    const source = buildGridSource([
+      record('1', { title: 'Old 1' }),
+      record('2', { title: 'Locked' }),
+      record('3', { title: 'Old 3' }),
+      record('4', { title: 'Old 4' }),
+    ], titleColumns);
+    const rows = new DataStore('rgRow');
+    rows.updateData(source);
+    const columns = new DataStore('rgCol');
+    columns.updateData(buildGridColumns(titleColumns, {
+      trackerType: gridType,
+      isRowEditable: id => id !== '2',
+    }));
+    const service = new ColumnService(rows.store, columns.store);
+
+    const { changed } = service.getTransformedDataToApply(
+      { x: 0, y: 0 },
+      [['First'], ['For locked row'], ['Third']],
+    );
+    const writes = Object.entries(changed).map(([rowIndex, values]) => [
+      source[Number(rowIndex)][ROW_ITEM_ID],
+      (values as Record<string, unknown>).title,
+    ]);
+
+    expect(writes).toEqual([
+      ['1', 'First'],
+      ['3', 'Third'],
+    ]);
+    service.destroy();
   });
 
   it('honors persisted column width overrides', () => {
@@ -318,6 +399,28 @@ describe('buildGridColumns', () => {
       link.props.onClick({ preventDefault: vi.fn(), stopPropagation: vi.fn() });
       expect(onOpenDetail).toHaveBeenCalledWith('gcs_1');
     });
+
+    it('opens from the title only where the host asks, so tracker grids keep click-to-select', () => {
+      const titleCell = (keyLink: Parameters<typeof buildGridColumns>[1]['keyLink']) => {
+        registerType();
+        const [column] = buildGridColumns(columnsFor(['title']), {
+          trackerType: gridType,
+          isRowEditable: () => true,
+          keyLink,
+        });
+        return (column.cellTemplate as any)(h, {
+          model: { title: 'Roadmap', [ROW_ITEM_ID]: 'gcs_1' },
+        });
+      };
+      const onOpenDetail = vi.fn();
+
+      expect(titleCell({ onOpenDetail }).props.class).toBe('tracker-grid-cell-text');
+
+      const [link] = titleCell({ onOpenDetail, titleOpens: true }).children;
+      expect(link.children).toBe('Roadmap');
+      link.props.onClick({ preventDefault: vi.fn(), stopPropagation: vi.fn() });
+      expect(onOpenDetail).toHaveBeenCalledWith('gcs_1');
+    });
   });
 });
 
@@ -362,5 +465,53 @@ describe('buildGridColumns cellCompare', () => {
     // An emptied cell is stored as '' -- it must bucket with the blanks, not sort first.
     expect(compare('', new Date('2026-05-20T12:00:00Z'))).toBeGreaterThan(0);
     expect(compare('', undefined)).toBe(0);
+  });
+});
+
+describe('user cell editor', () => {
+  const h = (tag: string) => ({ tag });
+  const members = [{ email: 'ada@example.com', name: 'Ada' }, { email: 'bo@example.com', name: 'Bo' }];
+  async function open(teamMembers: { email: string; name?: string }[], editCell: { val: string; value?: string }) {
+    const save = vi.fn();
+    const editor = (createTrackerCellEditor({ kind: 'user' }, { teamMembers: () => teamMembers }) as any)({ prop: 'owner' }, save, vi.fn());
+    editor.editCell = editCell;
+    const tag = editor.render(h).tag as string;
+    editor.element = document.body.appendChild(document.createElement('div'));
+    await act(async () => { editor.componentDidRender(); });
+    const labels = () => Array.from(document.querySelectorAll('[data-testid="tracker-grid-choice-popover"] .tracker-field-choice-label')).map(label => label.textContent);
+    const press = (key: string) => act(async () => {
+      document.querySelector('.tracker-grid-choice-filter')!.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
+    });
+    return { tag, editor, save, labels, press };
+  }
+  afterEach(() => { document.body.innerHTML = ''; });
+
+  it('opens the chip choice list of members, keeps a non-member value, and commits the email', async () => {
+    const { tag, editor, save, labels } = await open(members, { val: 'old-name' });
+    expect(tag).toBe('div');
+    expect(labels()).toEqual(['None', 'old-name', 'Ada', 'Bo']);
+    const ada = document.querySelectorAll<HTMLButtonElement>('[data-testid="tracker-grid-choice-popover"] [role="option"]')[2];
+    await act(async () => { ada.click(); });
+    expect(save).toHaveBeenCalledWith('ada@example.com', false);
+    await act(async () => { editor.disconnectedCallback(); await Promise.resolve(); });
+    expect(document.querySelector('[data-testid="tracker-grid-choice-popover"]')).toBeNull();
+  });
+
+  it('filters by the key that started the edit, and Enter picks the match', async () => {
+    const { save, labels, press } = await open(members, { value: 'ada@example.com', val: 'b' });
+    expect(labels()).toEqual(['Bo']);
+    // The filter must hold focus, or every key after the first goes back to the grid.
+    expect(document.activeElement?.className).toBe('tracker-grid-choice-filter');
+    await press('Enter');
+    expect(save).toHaveBeenCalledWith('bo@example.com', false);
+  });
+
+  it('ranks a name match ahead of an email-only match', () => {
+    const choices = [{ value: 'kim@gmail.com', label: 'Kim' }, { value: 'greg@example.com', label: 'Greg' }];
+    expect(filterTrackerFieldChoices(choices, 'g').map(choice => choice.label)).toEqual(['Greg', 'Kim']);
+  });
+
+  it('stays free text when there is no team', async () => {
+    expect((await open([], { val: 'someone' })).tag).toBe('input');
   });
 });

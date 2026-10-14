@@ -10,6 +10,7 @@ const { getProviders, lifecycleOptions, lifecycleState, navigateToTrackerReferen
   // capturing them is how a test gets to drive it.
   lifecycleOptions: {
     current: null as null | {
+      applyContent: (content: string) => void;
       onDiffRequested: (config: DiffConfig) => void;
       onSave: () => Promise<void>;
     },
@@ -29,7 +30,10 @@ vi.mock('@revolist/react-datagrid', async () => {
           if (element) {
             Object.assign(element, {
               getProviders,
-              getSource: vi.fn(async () => []),
+              getSource: vi.fn(async (section: string) => {
+                const grid = element as HTMLElement & { source?: object[]; pinnedTopSource?: object[] };
+                return (section === 'rowPinStart' ? grid.pinnedTopSource : grid.source) ?? [];
+              }),
               getSelectedRange: vi.fn(async () => null),
               setDataAt: vi.fn(),
               setCellsFocus: vi.fn(),
@@ -91,15 +95,29 @@ describe('SpreadsheetEditor history lifecycle', () => {
     getProviders.mockClear();
   });
 
-  it('preserves one undo plugin when the host prop is recreated', async () => {
+  it('does not reapply the loaded snapshot when the grid wrapper cycles its ref on a render', async () => {
+    const host = createHost();
+    const { container, rerender } = render(<SpreadsheetEditor host={host} />);
+    await act(async () => { lifecycleOptions.current!.applyContent('Name,Value\nAlpha,1'); });
+    const grid = container.querySelector('revo-grid') as HTMLElement & { source: Record<string, unknown>[] };
+    await waitFor(() => expect(grid.source[0].A).toBe('Alpha'));
+    grid.source[0].B = '9';
+    rerender(<SpreadsheetEditor host={{ ...host }} />);
+    await act(async () => { await Promise.resolve(); });
+    expect(grid.source[0].B).toBe('9');
+  });
+
+  it('keeps one command executor (and its undo history) when the host prop is recreated', async () => {
     const host = createHost();
     const { rerender } = render(<SpreadsheetEditor host={host} />);
-
-    await waitFor(() => expect(getProviders).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(host.registerEditorAPI).toHaveBeenCalledTimes(1));
+    const api = vi.mocked(host.registerEditorAPI).mock.calls[0][0];
 
     rerender(<SpreadsheetEditor host={{ ...host }} />);
+    await act(async () => { await Promise.resolve(); });
 
-    await waitFor(() => expect(getProviders).toHaveBeenCalledTimes(1));
+    expect(host.registerEditorAPI).toHaveBeenCalledTimes(1);
+    expect(api).not.toBeNull();
   });
 });
 
@@ -193,7 +211,7 @@ describe('SpreadsheetEditor diff review', () => {
   it('makes the formula bar read-only while a diff is under review', async () => {
     const { container } = await renderInDiffMode();
 
-    const input = container.querySelector<HTMLInputElement>('.csv-formula-bar input');
+    const input = container.querySelector<HTMLInputElement>('.csv-formula-bar-input');
     expect(input?.readOnly).toBe(true);
   });
 
@@ -206,6 +224,22 @@ describe('SpreadsheetEditor diff review', () => {
 
     // Saving here would write the phantom deleted rows back out as real ones.
     expect(host.saveContent).not.toHaveBeenCalled();
+  });
+});
+
+describe('SpreadsheetEditor delimiter', () => {
+  // The delimiter used to be frozen to whatever parsing '' produced at mount,
+  // so every TSV file was rewritten comma-separated on its first save.
+  it('saves a loaded TSV file tab-separated', async () => {
+    const host = createHost();
+    render(<SpreadsheetEditor host={host} />);
+    await waitFor(() => expect(lifecycleOptions.current).not.toBeNull());
+    await act(async () => { lifecycleOptions.current!.applyContent('Name\tValue\nAlpha\t1'); });
+
+    await act(async () => { await lifecycleOptions.current!.onSave(); });
+
+    const saved = (host.saveContent as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    expect(saved.split('\n').slice(-2)).toEqual(['Name\tValue', 'Alpha\t1']);
   });
 });
 

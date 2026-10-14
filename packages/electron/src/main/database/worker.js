@@ -22,6 +22,8 @@ const inspector = require('node:inspector');
 const { performance } = require('node:perf_hooks');
 const { serializeWorkerError } = require('./workerErrorSerialization');
 const { planInitFailureResponse } = require('./pgliteInitRecovery');
+const { runTransactionStatements } = require('./transactionStatements');
+const { LEGACY_SESSION_TYPES_SQL } = require('./legacySessionTypes');
 
 /**
  * The install's database root, or null when the spawner did not supply one.
@@ -1593,6 +1595,18 @@ class PGLiteWorker {
       throw error;
     }
 
+    await this.db.exec(`
+      CREATE TABLE IF NOT EXISTS tracker_creation_receipts (
+        item_id TEXT PRIMARY KEY REFERENCES tracker_items(id) ON DELETE CASCADE,
+        workspace TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        publication_status TEXT NOT NULL,
+        error TEXT,
+        updated TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_tracker_creation_workspace ON tracker_creation_receipts(workspace, publication_status);
+    `);
+
     // Offline transaction queue. Linear's four-state model (D6):
     //   created -> queued -> executing -> persistedEnqueue.
     // Phase 3 (client engine) reads/writes this; the renderer never
@@ -2351,19 +2365,7 @@ class PGLiteWorker {
     // The old values were redundant with provider + mode columns.
     // New values describe what the session IS in the hierarchy.
     try {
-      await this.db.exec(`
-        -- Step 1: Mark workstream parents (sessions that have children pointing to them)
-        -- but only if they aren't already 'blitz' or 'voice'
-        UPDATE ai_sessions
-        SET session_type = 'workstream'
-        WHERE session_type NOT IN ('blitz', 'voice')
-          AND id IN (SELECT DISTINCT parent_session_id FROM ai_sessions WHERE parent_session_id IS NOT NULL);
-
-        -- Step 2: Everything else that isn't blitz, workstream, or voice becomes 'session'
-        UPDATE ai_sessions
-        SET session_type = 'session'
-        WHERE session_type NOT IN ('blitz', 'workstream', 'voice');
-      `);
+      await this.db.exec(LEGACY_SESSION_TYPES_SQL);
       console.log('[PGLite Worker] Migrated session_type to structural types (session/workstream/blitz)');
     } catch (error) {
       console.error('[PGLite Worker] Failed to migrate session_type:', error);
@@ -2377,45 +2379,8 @@ class PGLiteWorker {
       // Non-fatal
     }
 
-    // Remove accidental worktree workstreams: a worktree IS the workstream — the
-    // `worktrees` row is the container, and every session inside it is a flat
-    // sibling keyed by worktree_id. Older /launch-new-session and convert-to-
-    // workstream paths incorrectly created `session_type='workstream'` rows
-    // either inside a worktree (worktree_id set on the workstream) or as a
-    // hidden parent of worktree-resident children. These containers carry no
-    // user content (no messages of their own) — they exist only as a side
-    // effect of the bug — so we delete them outright rather than try to
-    // preserve them as flat sessions. The FK on parent_session_id is
-    // ON DELETE SET NULL, so children get auto-unparented (their worktree_id
-    // is unchanged), and the renderer's worktreeGroupsData re-groups them
-    // flat under the worktree.
-    //
-    // Safety guard: skip any workstream that somehow has its own messages.
-    // The bug should never have created one with messages, but a per-row
-    // check costs almost nothing and prevents accidental content loss on
-    // a stranger's database.
-    try {
-      await this.db.exec(`
-        DELETE FROM ai_sessions
-        WHERE session_type = 'workstream'
-          AND NOT EXISTS (
-            SELECT 1 FROM ai_agent_messages m WHERE m.session_id = ai_sessions.id
-          )
-          AND (
-            worktree_id IS NOT NULL
-            OR id IN (
-              SELECT DISTINCT parent_session_id
-              FROM ai_sessions
-              WHERE parent_session_id IS NOT NULL
-                AND worktree_id IS NOT NULL
-            )
-          );
-      `);
-      console.log('[PGLite Worker] Deleted accidental worktree workstreams (children auto-unparented via FK SET NULL)');
-    } catch (error) {
-      console.error('[PGLite Worker] Failed to delete worktree workstreams:', error);
-      // Non-fatal - bug only affects left-pane grouping, not data integrity
-    }
+    // Tree migration preserves every row. A worktree session may now have
+    // children, so the old empty-workstream deletion heuristic is retired.
 
     // Migration: Add file_timestamp column to ai_tool_call_file_edits
     try {
@@ -2658,6 +2623,10 @@ class PGLiteWorker {
           source_updated_at     TIMESTAMPTZ,
           metadata              JSONB NOT NULL DEFAULT '{}'::jsonb
         );
+        -- Mirror of SQLite 0048: the edge's qualifier bag and the field's
+        -- predicate id. NULL on rows indexed before this; a rebuild fills them.
+        ALTER TABLE tracker_relationship_index ADD COLUMN IF NOT EXISTS qualifiers JSONB;
+        ALTER TABLE tracker_relationship_index ADD COLUMN IF NOT EXISTS predicate TEXT;
         CREATE UNIQUE INDEX IF NOT EXISTS idx_tracker_rel_index_unique
           ON tracker_relationship_index (workspace, source_item_id, source_field_id, target_item_id);
         CREATE INDEX IF NOT EXISTS idx_tracker_rel_index_source
@@ -2671,6 +2640,191 @@ class PGLiteWorker {
     } catch (error) {
       console.error('[PGLite Worker] Failed to create tracker_relationship_index table:', error);
       throw error;
+    }
+
+    // Migration: append-only tracker item revision log (knowledge-scopes
+    // contract 4.2). Revision identity is a UUID; the only sequential number
+    // (`server_revision`) is assigned by the room on sync, never locally.
+    // Mirror of SQLite migration
+    // schemas/0045_tracker_item_revisions.sql and 0047_tracker_item_revision_scope.sql -- keep them in sync,
+    // including the publication CASE and the actor COALESCE order.
+    //
+    // A trigger rather than a hook in TrackerPGLiteStore because the store is
+    // one of a dozen writers of tracker_items; the native publish path is one
+    // of the others. See the SQLite migration's header for the full rationale.
+    //
+    // This runs after the sync_status/sync_id ALTERs above, which the trigger
+    // reads. A failure here logs and continues: SQLite is the primary backend
+    // now and no existing feature depends on this table, so bricking startup
+    // for a legacy install would be the worse outcome.
+    try {
+      await this.db.exec(`
+        CREATE TABLE IF NOT EXISTS tracker_item_revisions (
+          revision_id        TEXT PRIMARY KEY,
+          item_id            TEXT NOT NULL,
+          parent_revision_id TEXT,
+          server_revision    INTEGER,
+          workspace          TEXT NOT NULL,
+          data               JSONB NOT NULL,
+          actor              JSONB,
+          published          BOOLEAN,
+          sync_status        TEXT,
+          sync_id            INTEGER,
+          deleted_at         TIMESTAMPTZ,
+          recorded_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        ALTER TABLE tracker_item_revisions ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+        CREATE INDEX IF NOT EXISTS idx_tracker_item_revisions_item
+          ON tracker_item_revisions (workspace, item_id, recorded_at);
+        CREATE INDEX IF NOT EXISTS idx_tracker_item_revisions_item_parent
+          ON tracker_item_revisions (item_id, parent_revision_id);
+        CREATE INDEX IF NOT EXISTS idx_tracker_item_revisions_parent
+          ON tracker_item_revisions (parent_revision_id) WHERE parent_revision_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_tracker_item_revisions_server
+          ON tracker_item_revisions (item_id, server_revision) WHERE server_revision IS NOT NULL;
+
+        -- History is recorded only for these (knowledge) types. Everything else
+        -- gets a revision only when something cites it (pinItemRevision).
+        CREATE TABLE IF NOT EXISTS tracker_revision_types (type TEXT PRIMARY KEY);
+        INSERT INTO tracker_revision_types (type) VALUES
+          ('source'), ('capture'), ('citation'),
+          ('entity'), ('claim'), ('question'), ('finding'), ('investigation')
+        ON CONFLICT (type) DO NOTHING;
+
+        CREATE OR REPLACE FUNCTION tracker_items_record_revision() RETURNS trigger AS $fn$
+        DECLARE
+          prev_id   TEXT;
+          prev_data JSONB;
+          prev_deleted_at TIMESTAMPTZ;
+        BEGIN
+          IF NOT EXISTS (SELECT 1 FROM tracker_revision_types t WHERE t.type = NEW.type) THEN
+            RETURN NULL;
+          END IF;
+          -- The tip is the revision nothing else claims as parent. Not
+          -- ORDER BY recorded_at: two writes inside one millisecond share a
+          -- timestamp and the tie-break would invert real history. Mirrors the
+          -- SQLite trigger.
+          SELECT revision_id, data, deleted_at INTO prev_id, prev_data, prev_deleted_at
+            FROM tracker_item_revisions r
+            WHERE r.item_id = NEW.id
+              AND NOT EXISTS (
+                SELECT 1 FROM tracker_item_revisions p
+                WHERE p.item_id = NEW.id AND p.parent_revision_id = r.revision_id
+              )
+            LIMIT 1;
+          -- An insert that reproduces the latest recorded revision (same data,
+          -- same deleted/live state) records nothing. Over a tombstone tip a
+          -- live insert is a resurrection and is recorded. Mirrors the WHEN
+          -- guard on the SQLite insert trigger.
+          IF TG_OP = 'INSERT'
+             AND prev_id IS NOT NULL
+             AND prev_data IS NOT DISTINCT FROM NEW.data
+             AND (prev_deleted_at IS NULL) = (NEW.deleted_at IS NULL) THEN
+            RETURN NULL;
+          END IF;
+          INSERT INTO tracker_item_revisions (
+            revision_id, item_id, parent_revision_id, workspace, data, actor, published, sync_status, sync_id, deleted_at
+          ) VALUES (
+            gen_random_uuid()::text,
+            NEW.id,
+            prev_id,
+            NEW.workspace,
+            NEW.data,
+            COALESCE(
+              NEW.data->'lastModifiedBy',
+              NEW.data->'customFields'->'lastModifiedBy',
+              NEW.data->'authorIdentity',
+              NEW.data->'customFields'->'authorIdentity'
+            ),
+            CASE
+              WHEN NEW.data->>'shared' = 'true'
+                OR NEW.data->'share'->>'status' = 'team'
+                OR NEW.data->'share'->>'body' = 'team'
+                OR NEW.data->'customFields'->'share'->>'status' = 'team'
+                OR NEW.data->'customFields'->'share'->>'body' = 'team' THEN TRUE
+              WHEN NEW.data->>'shared' = 'false'
+                OR NEW.data->'share'->>'status' = 'private'
+                OR NEW.data->'share'->>'body' = 'private'
+                OR NEW.data->'customFields'->'share'->>'status' = 'private'
+                OR NEW.data->'customFields'->'share'->>'body' = 'private' THEN FALSE
+              WHEN NEW.sync_status IN ('synced', 'pending') THEN TRUE
+              ELSE NULL
+            END,
+            NEW.sync_status,
+            NEW.sync_id,
+            NEW.deleted_at
+          );
+          RETURN NULL;
+        END;
+        $fn$ LANGUAGE plpgsql;
+
+        CREATE OR REPLACE FUNCTION tracker_items_record_delete_revision() RETURNS trigger AS $fn$
+        DECLARE
+          prev_id TEXT;
+        BEGIN
+          IF NOT EXISTS (SELECT 1 FROM tracker_revision_types t WHERE t.type = OLD.type) THEN
+            RETURN NULL;
+          END IF;
+          SELECT revision_id INTO prev_id
+            FROM tracker_item_revisions r
+            WHERE r.item_id = OLD.id
+              AND NOT EXISTS (
+                SELECT 1 FROM tracker_item_revisions p
+                WHERE p.item_id = OLD.id AND p.parent_revision_id = r.revision_id
+              )
+            LIMIT 1;
+          INSERT INTO tracker_item_revisions (
+            revision_id, item_id, parent_revision_id, workspace, data, actor,
+            published, sync_status, sync_id, deleted_at
+          ) VALUES (
+            gen_random_uuid()::text,
+            OLD.id,
+            prev_id,
+            OLD.workspace,
+            OLD.data,
+            -- The row names its last editor, not whoever deleted it.
+            NULL,
+            CASE
+              WHEN OLD.data->>'shared' = 'true'
+                OR OLD.data->'share'->>'status' = 'team'
+                OR OLD.data->'share'->>'body' = 'team'
+                OR OLD.data->'customFields'->'share'->>'status' = 'team'
+                OR OLD.data->'customFields'->'share'->>'body' = 'team' THEN TRUE
+              WHEN OLD.data->>'shared' = 'false'
+                OR OLD.data->'share'->>'status' = 'private'
+                OR OLD.data->'share'->>'body' = 'private'
+                OR OLD.data->'customFields'->'share'->>'status' = 'private'
+                OR OLD.data->'customFields'->'share'->>'body' = 'private' THEN FALSE
+              WHEN OLD.sync_status IN ('synced', 'pending') THEN TRUE
+              ELSE NULL
+            END,
+            OLD.sync_status,
+            OLD.sync_id,
+            NOW()
+          );
+          RETURN NULL;
+        END;
+        $fn$ LANGUAGE plpgsql;
+
+        DROP TRIGGER IF EXISTS tracker_items_ai_revision ON tracker_items;
+        DROP TRIGGER IF EXISTS tracker_items_au_revision ON tracker_items;
+        DROP TRIGGER IF EXISTS tracker_items_ad_revision ON tracker_items;
+
+        CREATE TRIGGER tracker_items_ai_revision AFTER INSERT ON tracker_items
+          FOR EACH ROW EXECUTE FUNCTION tracker_items_record_revision();
+
+        CREATE TRIGGER tracker_items_au_revision AFTER UPDATE OF data, deleted_at ON tracker_items
+          FOR EACH ROW WHEN (
+            NEW.data IS DISTINCT FROM OLD.data OR NEW.deleted_at IS DISTINCT FROM OLD.deleted_at
+          )
+          EXECUTE FUNCTION tracker_items_record_revision();
+
+        CREATE TRIGGER tracker_items_ad_revision AFTER DELETE ON tracker_items
+          FOR EACH ROW EXECUTE FUNCTION tracker_items_record_delete_revision();
+      `);
+      console.log('[PGLite Worker] tracker_item_revisions table created successfully');
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to create tracker_item_revisions table; revision history is unavailable on this install:', error);
     }
 
     // Migration: Ensure ai_tool_call_file_edits FK points to ai_agent_messages (not ai_transcript_events).
@@ -2995,6 +3149,125 @@ class PGLiteWorker {
       throw error;
     }
 
+    // Migration: personal pages (schema version 49).
+    // Mirror of SQLite migration 0049_personal_pages.sql -- keep in sync.
+    try {
+      await this.db.exec(`
+        CREATE TABLE IF NOT EXISTS personal_page_folders (
+          workspace_path   TEXT NOT NULL,
+          folder_id        TEXT NOT NULL,
+          parent_folder_id TEXT,
+          name             TEXT NOT NULL,
+          sort_order       DOUBLE PRECISION NOT NULL DEFAULT 0,
+          created_at       TIMESTAMPTZ NOT NULL,
+          updated_at       TIMESTAMPTZ NOT NULL,
+          PRIMARY KEY (workspace_path, folder_id)
+        );
+        CREATE TABLE IF NOT EXISTS personal_page_documents (
+          workspace_path     TEXT NOT NULL,
+          document_id        TEXT NOT NULL,
+          title              TEXT NOT NULL,
+          document_type      TEXT NOT NULL,
+          editor_id          TEXT,
+          file_extension     TEXT,
+          metadata_version   INTEGER,
+          parent_folder_id   TEXT,
+          body               TEXT NOT NULL DEFAULT '',
+          body_version       INTEGER NOT NULL DEFAULT 0,
+          publication_status TEXT NOT NULL DEFAULT 'local',
+          created_at         TIMESTAMPTZ NOT NULL,
+          updated_at         TIMESTAMPTZ NOT NULL,
+          trashed_at         TIMESTAMPTZ,
+          PRIMARY KEY (workspace_path, document_id)
+        );
+        CREATE TABLE IF NOT EXISTS personal_page_type_placements (
+          workspace_path   TEXT NOT NULL,
+          type_id          TEXT NOT NULL,
+          parent_folder_id TEXT,
+          sort_order       DOUBLE PRECISION NOT NULL DEFAULT 0,
+          created_at       TIMESTAMPTZ NOT NULL,
+          updated_at       TIMESTAMPTZ NOT NULL,
+          PRIMARY KEY (workspace_path, type_id)
+        );
+      `);
+      console.log('[PGLite Worker] personal pages tables created successfully');
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to create personal pages tables:', error);
+      throw error;
+    }
+
+    // Migration: personal pages become one page tree (schema version 50).
+    // Mirror of SQLite migration 0050_personal_pages_one_tree.sql -- keep in sync.
+    // Runs every launch: only folders without `converted_at` are converted, so
+    // a folder becomes a page once and a deleted page is never resurrected.
+    // The folder rows stay as the record of the old tree. One exec is one
+    // implicit transaction, so the pages and the marks land together.
+    try {
+      await this.db.exec(`
+        CREATE TABLE IF NOT EXISTS personal_page_item_placements (
+          workspace_path TEXT NOT NULL,
+          item_id        TEXT NOT NULL,
+          parent_id      TEXT,
+          sort_order     DOUBLE PRECISION NOT NULL DEFAULT 0,
+          created_at     TIMESTAMPTZ NOT NULL,
+          updated_at     TIMESTAMPTZ NOT NULL,
+          PRIMARY KEY (workspace_path, item_id)
+        );
+        ALTER TABLE personal_page_folders ADD COLUMN IF NOT EXISTS converted_at TIMESTAMPTZ;
+        INSERT INTO personal_page_documents
+          (workspace_path, document_id, title, document_type, editor_id, file_extension,
+           metadata_version, parent_folder_id, body, body_version, publication_status,
+           created_at, updated_at)
+        SELECT workspace_path, folder_id, name, 'markdown', NULL, NULL,
+               NULL, parent_folder_id, '', 0, 'local',
+               created_at, updated_at
+        FROM personal_page_folders
+        WHERE converted_at IS NULL
+        ON CONFLICT (workspace_path, document_id) DO NOTHING;
+        UPDATE personal_page_folders
+        SET converted_at = NOW()
+        WHERE converted_at IS NULL
+          AND EXISTS (
+            SELECT 1 FROM personal_page_documents d
+            WHERE d.workspace_path = personal_page_folders.workspace_path
+              AND d.document_id = personal_page_folders.folder_id
+          );
+      `);
+      console.log('[PGLite Worker] personal pages one-tree migration applied');
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to apply the personal pages one-tree migration:', error);
+      throw error;
+    }
+
+    // Migration: typed pages as parents and one sibling order (schema version 51).
+    // Mirror of SQLite migration 0051_personal_pages_parents_and_order.sql -- keep in sync.
+    // Columns only, each IF NOT EXISTS, so rerunning it every launch is safe.
+    try {
+      await this.db.exec(`
+        ALTER TABLE personal_page_documents ADD COLUMN IF NOT EXISTS sort_order DOUBLE PRECISION;
+        ALTER TABLE personal_page_documents ADD COLUMN IF NOT EXISTS parent_kind TEXT NOT NULL DEFAULT 'page';
+        ALTER TABLE personal_page_type_placements ADD COLUMN IF NOT EXISTS parent_kind TEXT NOT NULL DEFAULT 'page';
+        ALTER TABLE personal_page_item_placements ADD COLUMN IF NOT EXISTS parent_kind TEXT NOT NULL DEFAULT 'page';
+      `);
+      console.log('[PGLite Worker] personal pages parents-and-order migration applied');
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to apply the personal pages parents-and-order migration:', error);
+      throw error;
+    }
+
+    // Migration: a plain page's own fields (schema version 52).
+    // Mirror of SQLite migration 0052_personal_pages_fields.sql -- keep in sync.
+    // One column, IF NOT EXISTS, so rerunning it every launch is safe.
+    try {
+      await this.db.exec(`
+        ALTER TABLE personal_page_documents ADD COLUMN IF NOT EXISTS fields TEXT;
+      `);
+      console.log('[PGLite Worker] personal pages fields migration applied');
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to apply the personal pages fields migration:', error);
+      throw error;
+    }
+
     // Migration: team-shared tracker saved views (schema version 28).
     // Mirror of SQLite migration 0028_tracker_shared_saved_views.sql.
     // Payload is stored as TEXT (not JSONB) so the row round-trips byte-for-byte
@@ -3279,6 +3552,15 @@ class PGLiteWorker {
       throw error;
     }
 
+    await this.db.exec(`CREATE TABLE IF NOT EXISTS document_feedback_index_cache (
+  workspace_path TEXT NOT NULL,
+  org_id TEXT NOT NULL,
+  viewer_user_id TEXT NOT NULL,
+  data JSONB NOT NULL,
+  PRIMARY KEY (workspace_path, org_id, viewer_user_id)
+);
+`);
+
     // Migration: pure GitHub issues cache (schema version 35).
     // Mirror of SQLite 0035_github_issues.sql, using native JSONB.
     try {
@@ -3342,6 +3624,29 @@ class PGLiteWorker {
       console.error('[PGLite Worker] Failed to create github issues cache:', error);
       throw error;
     }
+
+    // External session persistence migration.
+    // Keep aligned with SQLite migration 0044; cursor JSON is TEXT on both engines.
+    await this.db.exec(`
+      -- Nonunique: historical sessions may share a resume handle. Lookup rejects ambiguity.
+      CREATE INDEX IF NOT EXISTS idx_ai_sessions_provider_session
+        ON ai_sessions (provider, provider_session_id, workspace_id);
+      CREATE INDEX IF NOT EXISTS idx_ai_agent_messages_provider_identity
+        ON ai_agent_messages (session_id, source, direction, provider_message_id)
+        WHERE provider_message_id IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS external_session_cursors (
+        provider TEXT NOT NULL,
+        external_id TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        workspace_path TEXT NOT NULL,
+        session_id TEXT NOT NULL REFERENCES ai_sessions(id) ON DELETE CASCADE,
+        cursor TEXT,
+        PRIMARY KEY (provider, external_id, file_path)
+      );
+      CREATE INDEX IF NOT EXISTS idx_external_session_cursors_session
+        ON external_session_cursors (session_id);
+    `);
   }
 
   async query(message) {
@@ -3391,12 +3696,7 @@ class PGLiteWorker {
     try {
       const execStart = performance.now();
       await this.db.transaction(async (tx) => {
-        for (const statement of statements) {
-          if (!statement || typeof statement.sql !== 'string') {
-            throw new Error('transaction statement sql must be a string');
-          }
-          await tx.query(statement.sql, statement.params);
-        }
+        await runTransactionStatements(tx, statements);
       });
       return {
         id: message.id,

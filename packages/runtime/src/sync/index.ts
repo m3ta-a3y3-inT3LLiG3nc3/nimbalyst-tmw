@@ -53,6 +53,9 @@ export type {
   SyncedAvailableModel,
   SyncedTrackerPersonalStateChange,
   EncryptedTrackerPersonalStatePayload,
+  SessionIndexData,
+  PushChangeOutcome,
+  IndexPublishOutcome,
 } from './types';
 export {
   filterSessionsForPersonalSync,
@@ -60,6 +63,10 @@ export {
 } from './types';
 
 export { createCollabV3Sync } from './CollabV3Sync';
+export { repairSessionProjection, type ProjectionRepairCheckpoints } from './repairSessionProjection';
+export { createPersonalSyncWriteGate, describePersonalSyncWriteGate } from './personalSyncWriteGate';
+export type { PersonalSyncWriteGateSnapshot, PersonalSyncWriteGateState, PersonalSyncBlockReason } from './personalSyncWriteGate';
+export { IndexEntryDecryptionError, isIndexEntryDecryptionError } from './indexEntryDecryptionError';
 export { createExtensionAwarenessBridge } from './extensionAwarenessBridge';
 export type {
   ExtensionAwarenessBridge,
@@ -67,8 +74,11 @@ export type {
   ExtensionAwarenessUser,
 } from './extensionAwarenessBridge';
 export { deriveTrackerPersonalStateKey } from './trackerPersonalStateKey';
+export { deriveEncryptionKey, personalSyncEncryptionSalt } from './encryptionKey';
 export { setSyncImageCompressor } from './syncContentTruncator';
 export type { SyncImageCompressor } from './syncContentTruncator';
+export { setSyncLocalImageLoader } from './syncDisplayImages';
+export type { SyncLocalImageLoader } from './syncDisplayImages';
 
 export {
   setSyncClientInfo,
@@ -261,41 +271,41 @@ export type {
   TrackerTransactionRow,
   TrackerItemRow,
   TrackerBodyCacheRow,
-} from './trackerProtocol';
+} from '@nimbalyst/tracker-engine';
 
 export {
   buildTrackerRoomId,
   stripLocalOnlyFields,
   LOCAL_ONLY_PAYLOAD_FIELDS,
   SYNC_ID_INITIAL,
-} from './trackerProtocol';
+} from '@nimbalyst/tracker-engine';
 
 export {
   decodeTrackerSavedViewEnvelopePlaintext,
-} from './trackerEnvelopeCodec';
+} from '@nimbalyst/tracker-engine';
 
 export {
   IndexedDbTrackerPersistence,
   InMemoryTrackerPersistence,
-} from './trackerPersistence';
+} from '@nimbalyst/tracker-engine';
 
 export type {
   IndexedDbTrackerSavedViewRow,
   StoredTrackerItem,
   TrackerPersistence,
   TrackerRowSnapshot,
-} from './trackerPersistence';
+} from '@nimbalyst/tracker-engine';
 
 export {
   applyLabelDiff,
   mergeLabelMaps,
   normalizeLegacyLabelValues,
   projectLabelsToValues,
-} from './trackerLabels';
+} from '@nimbalyst/tracker-engine';
 
 export type {
   LabelsMap,
-} from './trackerLabels';
+} from '@nimbalyst/tracker-engine';
 
 // `CollabLexicalProvider`, `HeadlessLexicalYDoc`, and
 // `MarkdownCollabContentAdapter` are deliberately NOT re-exported here -- they
@@ -309,7 +319,7 @@ export {
 
 export {
   TrackerSyncEngine,
-} from './TrackerSyncEngine';
+} from '@nimbalyst/tracker-engine';
 
 export type {
   TrackerSyncEngineConfig,
@@ -320,7 +330,7 @@ export type {
   RejectedTrackerMutation,
   TrackerNavigationSyncHooks,
   TrackerSchemaSyncHooks,
-} from './TrackerSyncEngine';
+} from '@nimbalyst/tracker-engine';
 
 export {
   isTrackerNavigationEntry,
@@ -344,6 +354,7 @@ export type {
   TeamState,
   MemberInfo as TeamMemberInfo,
   DocIndexEntry as TeamDocIndexEntry,
+  DocumentPlacementOptions as TeamDocumentPlacementOptions,
   FolderNode,
 } from './teamSyncTypes';
 
@@ -356,4 +367,5 @@ export type {
   ProjectSyncFileUpdate,
   ProjectSyncManifestFile,
   ProjectSyncResponse,
+  ProjectFilePushOutcome,
 } from './ProjectSyncProvider';
